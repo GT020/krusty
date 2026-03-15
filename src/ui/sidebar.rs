@@ -1,5 +1,5 @@
 use iced::{Element, Length};
-use iced::widget::{button, column, container, text};
+use iced::widget::{button, column, container, scrollable, text};
 use crate::app::{Message, Route};
 
 pub fn view(current_route: &Route) -> Element<Message> {
@@ -16,9 +16,13 @@ pub fn view(current_route: &Route) -> Element<Message> {
         make_btn("Pods".to_string(), Route::Pods, *current_route == Route::Pods),
         make_btn("Nodes".to_string(), Route::Nodes, *current_route == Route::Nodes),
         make_btn("Deployments".to_string(), Route::Deployments, *current_route == Route::Deployments),
+        make_btn("Secrets".to_string(), Route::Secrets, *current_route == Route::Secrets),
+        make_btn("Events".to_string(), Route::Events, *current_route == Route::Events),
+        make_btn("Services".to_string(), Route::Services, *current_route == Route::Services),
+        make_btn("Ingress".to_string(), Route::Ingress, *current_route == Route::Ingress),
     ].spacing(10);
 
-    container(col)
+    container(scrollable(col))
         .width(Length::Fixed(200.0))
         .height(Length::Fill)
         .padding(20)
