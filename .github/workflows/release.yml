@@ -2,152 +2,109 @@ name: Release
 
 on:
   push:
+    tags:
+      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-release:
+  ########################################
+  # CREATE RELEASE
+  ########################################
+
+  release:
     runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.release.outputs.upload_url }}
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set Release Tag
-        run: echo "RELEASE_TAG=${GITHUB_REF#refs/tags/}" >> $GITHUB_ENV
-
-      - name: Create Release
-        if: startsWith(github.ref, 'refs/tags/')
-        id: create_release
+      - name: Create GitHub Release
+        id: release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref }}
-          name: Krusty ${{ env.RELEASE_TAG }}
-          draft: true
-          prerelease: false
+          draft: false
           generate_release_notes: true
 
-  build-flatpak:
+  ########################################
+  # BUILD FLATPAK
+  ########################################
+
+  flatpak:
+    needs: release
     runs-on: ubuntu-latest
-    needs: build-release
+
     container:
       image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
       options: --privileged
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build
-        run: cargo build --release
-
-      - name: Create Flatpak Bundle
+      - name: Build Flatpak Bundle
         uses: flatpak/flatpak-github-actions/flatpak-builder@v6
         with:
-          bundle: krusty-${{ github.ref_name }}-amd64.flatpak
-          manifest-path: flatpak/dev.krusty.Krusty.yml
+          manifest-path: build/dev.krusty.Krusty.yml
+          bundle: krusty-${{ github.ref_name }}-x86_64.flatpak
           cache-key: flatpak-builder-${{ github.sha }}
 
       - name: Upload Flatpak
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/github-script@v7
+        uses: softprops/action-gh-release@v2
         with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const filePath = path.join(process.cwd(), 'krusty-${{ github.ref_name }}-amd64.flatpak');
-            
-            await github.rest.repos.uploadReleaseAsset({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: ${{ needs.build-release.outputs.id }},
-              name: 'krusty-${{ github.ref_name }}-amd64.flatpak',
-              data: fs.readFileSync(filePath)
-            });
+          files: krusty-${{ github.ref_name }}-x86_64.flatpak
 
-  build-dmg:
+  ########################################
+  # BUILD MACOS DMG
+  ########################################
+
+  macos:
+    needs: release
     runs-on: macos-14
-    needs: build-release
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
 
-      - name: Cache
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Build
+      - name: Build release
         run: cargo build --release
 
       - name: Create App Bundle
         run: |
           mkdir -p Krusty.app/Contents/MacOS
           cp target/release/krusty Krusty.app/Contents/MacOS/
-          
+
           mkdir -p Krusty.app/Contents/Resources
-          cat > Krusty.app/Contents/Info.plist << 'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0">
-          <dict>
-              <key>CFBundleExecutable</key>
-              <string>krusty</string>
-              <key>CFBundleIdentifier</key>
-              <string>dev.krusty.Krusty</string>
-              <key>CFBundleName</key>
-              <string>Krusty</string>
-              <key>CFBundleVersion</key>
-              <string>1</string>
-              <key>CFBundleShortVersionString</key>
-              <string>${{ github.ref_name }}</string>
-              <key>CFBundlePackageType</key>
-              <string>APPL</string>
-              <key>LSMinimumSystemVersion</key>
-              <string>11.0</string>
-              <key>NSHighResolutionCapable</key>
-              <true/>
-          </dict>
-          </plist>
-          EOF
+
+          sed "s/VERSION_STRING/${{ github.ref_name }}/g" build/Info.plist > Krusty.app/Contents/Info.plist
+
+      - name: Install DMG tool
+        run: brew install create-dmg
 
       - name: Create DMG
         run: |
-          brew install create-dmg
           create-dmg \
             --volname "Krusty" \
             --window-pos 200 120 \
             --window-size 600 400 \
             --app-drop-link 425 178 \
-            "Krusty-${{ github.ref_name }}-arm64.dmg" \
-            Krusty.app/
+            Krusty-${{ github.ref_name }}-arm64.dmg \
+            Krusty.app
 
       - name: Upload DMG
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: actions/github-script@v7
+        uses: softprops/action-gh-release@v2
         with:
-          script: |
-            const fs = require('fs');
-            const path = require('path');
-            const filePath = path.join(process.cwd(), 'Krusty-${{ github.ref_name }}-arm64.dmg');
-            
-            await github.rest.repos.uploadReleaseAsset({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              release_id: ${{ needs.build-release.outputs.id }},
-              name: 'krusty-${{ github.ref_name }}-arm64.dmg',
-              data: fs.readFileSync(filePath)
-            });
+          files: Krusty-${{ github.ref_name }}-arm64.dmg
