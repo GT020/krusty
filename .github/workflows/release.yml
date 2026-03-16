@@ -55,7 +55,7 @@ jobs:
 
       - name: Create Flatpak Bundle
         run: |
-          flatpak-builder --user --force-clean --build-dir=build-dir flatpak/dev.krusty.Krusty.yml
+          flatpak-builder --user --force-clean build-dir flatpak/dev.krusty.Krusty.yml
           flatpak build-bundle ~/.local/share/flatpak/repo build-dir krusty-${{ github.ref_name }}-amd64.flatpak
 
       - name: Upload Flatpak
@@ -131,7 +131,6 @@ jobs:
             --volname "Krusty" \
             --window-pos 200 120 \
             --window-size 600 400 \
-            --app-icon-link "/Applications" \
             --app-drop-link 425 178 \
             Krusty.app/ "Krusty-${{ github.ref_name }}-arm64.dmg"
 
