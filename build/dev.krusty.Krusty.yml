@@ -34,8 +34,8 @@ modules:
     buildsystem: simple
 
     build-commands:
-      - cargo --offline fetch
-      - cargo --offline build --release
+      - cargo fetch
+      - cargo build --release
       - install -Dm755 target/release/krusty /app/bin/krusty
 
     sources:
