@@ -6,7 +6,7 @@ use crate::repos::event::EventRepo;
 
 #[derive(Clone, Debug)]
 pub enum Message {
-    Load,
+    Load(Option<String>),
     Loaded(Result<Vec<EventModel>, Arc<kube::Error>>),
     Select(usize),
     Delete,
@@ -27,11 +27,12 @@ impl EventViewModel {
 
     pub fn update(&mut self, message: Message, client: Option<Arc<Client>>) -> Task<Message> {
         match message {
-            Message::Load => {
+            Message::Load(namespace) => {
                 self.loading = true; self.error = None;
                 if let Some(c) = client {
+                    let ns = namespace.clone();
                     Task::perform(
-                        async move { EventRepo::list(&c, None).await.map(|items| items.into_iter().map(Into::into).collect()) },
+                        async move { EventRepo::list(&c, ns.as_deref()).await.map(|items| items.into_iter().map(Into::into).collect()) },
                         |res| Message::Loaded(res.map_err(Arc::new))
                     )
                 } else { Task::none() }
@@ -57,7 +58,7 @@ impl EventViewModel {
                 }
                 Task::none()
             }
-            Message::Deleted(Ok(_)) => { self.selected_index = None; Task::perform(async {}, |_| Message::Load) }
+            Message::Deleted(Ok(_)) => { self.selected_index = None; Task::perform(async {}, |_| Message::Load(None)) }
             Message::Deleted(Err(e)) => { self.error = Some(format!("Delete failed: {}", e)); Task::none() }
         }
     }
