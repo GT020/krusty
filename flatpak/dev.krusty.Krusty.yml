@@ -1,0 +1,27 @@
+app-id: dev.krusty.Krusty
+runtime: org.freedesktop.Platform
+runtime-version: '24.08'
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: krusty
+finish-args:
+  - --share=ipc
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --device=dri
+  - --share=network
+  - --talk-name=org.freedesktop.Notifications
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/krusty/cargo
+modules:
+  - name: krusty
+    buildsystem: simple
+    build-commands:
+      - cargo build --release
+      - install -Dm755 target/release/krusty /app/bin/krusty
+    sources:
+      - type: dir
+        path: .

@@ -3,13 +3,13 @@ use kube::Client;
 use std::sync::Arc;
 
 use crate::view_models::{
-    pod::{PodViewModel, Message as PodMessage},
-    node::{NodeViewModel, Message as NodeMessage},
     deployment::{DeploymentViewModel, Message as DeploymentMessage},
-    secret::{SecretViewModel, Message as SecretMessage},
     event::{EventViewModel, Message as EventMessage},
-    service::{ServiceViewModel, Message as ServiceMessage},
     ingress::{IngressViewModel, Message as IngressMessage},
+    node::{Message as NodeMessage, NodeViewModel},
+    pod::{Message as PodMessage, PodViewModel},
+    secret::{Message as SecretMessage, SecretViewModel},
+    service::{Message as ServiceMessage, ServiceViewModel},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub enum Route {
 pub struct KrustyApp {
     pub client: Option<Arc<Client>>,
     pub route: Route,
+    pub namespace: Option<String>,
+    pub namespaces: Vec<String>,
     pub pod_vm: PodViewModel,
     pub node_vm: NodeViewModel,
     pub deployment_vm: DeploymentViewModel,
@@ -40,6 +42,8 @@ pub struct KrustyApp {
 pub enum Message {
     ClientReady(Result<Client, Arc<kube::Error>>),
     RouteChanged(Route),
+    NamespaceChanged(Option<String>),
+    NamespacesLoaded(Result<Vec<String>, Arc<kube::Error>>),
     RefreshRequested,
     Pod(PodMessage),
     Node(NodeMessage),
@@ -56,6 +60,9 @@ impl std::fmt::Debug for Message {
             Self::ClientReady(Ok(_)) => write!(f, "ClientReady(Ok(Client))"),
             Self::ClientReady(Err(e)) => write!(f, "ClientReady(Err({:?}))", e),
             Self::RouteChanged(r) => f.debug_tuple("RouteChanged").field(r).finish(),
+            Self::NamespaceChanged(ns) => f.debug_tuple("NamespaceChanged").field(ns).finish(),
+            Self::NamespacesLoaded(Ok(ns)) => f.debug_tuple("NamespacesLoaded").field(ns).finish(),
+            Self::NamespacesLoaded(Err(e)) => f.debug_tuple("NamespacesLoaded").field(e).finish(),
             Self::RefreshRequested => write!(f, "RefreshRequested"),
             Self::Pod(msg) => f.debug_tuple("Pod").field(msg).finish(),
             Self::Node(msg) => f.debug_tuple("Node").field(msg).finish(),
@@ -74,6 +81,8 @@ impl KrustyApp {
             Self {
                 client: None,
                 route: Route::Pods,
+                namespace: None,
+                namespaces: vec!["default".to_string()],
                 pod_vm: PodViewModel::new(),
                 node_vm: NodeViewModel::new(),
                 deployment_vm: DeploymentViewModel::new(),
@@ -83,30 +92,66 @@ impl KrustyApp {
                 ingress_vm: IngressViewModel::new(),
                 error: None,
             },
-            Task::perform(
-                kube::Client::try_default(),
-                |res| Message::ClientReady(res.map_err(Arc::new))
-            )
+            Task::perform(kube::Client::try_default(), |res| {
+                Message::ClientReady(res.map_err(Arc::new))
+            }),
         )
     }
 
     fn fetch_current_route(&mut self) -> Task<Message> {
         let client = self.client.clone();
+        let namespace = self.namespace.clone();
         match self.route {
-            Route::Pods => self.pod_vm.update(PodMessage::Load, client).map(Message::Pod),
-            Route::Nodes => self.node_vm.update(NodeMessage::Load, client).map(Message::Node),
-            Route::Deployments => self.deployment_vm.update(DeploymentMessage::Load, client).map(Message::Deployment),
-            Route::Secrets => self.secret_vm.update(SecretMessage::Load, client).map(Message::Secret),
-            Route::Events => self.event_vm.update(EventMessage::Load, client).map(Message::Event),
-            Route::Services => self.service_vm.update(ServiceMessage::Load, client).map(Message::Service),
-            Route::Ingress => self.ingress_vm.update(IngressMessage::Load, client).map(Message::Ingress),
+            Route::Pods => self
+                .pod_vm
+                .update(PodMessage::Load(namespace), client)
+                .map(Message::Pod),
+            Route::Nodes => self
+                .node_vm
+                .update(NodeMessage::Load, client)
+                .map(Message::Node),
+            Route::Deployments => self
+                .deployment_vm
+                .update(DeploymentMessage::Load(namespace.clone()), client)
+                .map(Message::Deployment),
+            Route::Secrets => self
+                .secret_vm
+                .update(SecretMessage::Load(namespace.clone()), client)
+                .map(Message::Secret),
+            Route::Events => self
+                .event_vm
+                .update(EventMessage::Load(namespace.clone()), client)
+                .map(Message::Event),
+            Route::Services => self
+                .service_vm
+                .update(ServiceMessage::Load(namespace.clone()), client)
+                .map(Message::Service),
+            Route::Ingress => self
+                .ingress_vm
+                .update(IngressMessage::Load(namespace.clone()), client)
+                .map(Message::Ingress),
+        }
+    }
+
+    fn load_namespaces(&self) -> Task<Message> {
+        if self.client.is_some() {
+            Task::perform(
+                async move {
+                    let c = kube::Client::try_default().await?;
+                    let api: kube::Api<k8s_openapi::api::core::v1::Namespace> = kube::Api::all(c);
+                    let list = api.list(&kube::api::ListParams::default()).await?;
+                    Ok(list.items.into_iter().filter_map(|ns| ns.metadata.name).collect())
+                },
+                |res| Message::NamespacesLoaded(res.map_err(Arc::new))
+            )
+        } else {
+            Task::none()
         }
     }
 
     pub fn subscription(&self) -> iced::Subscription<Message> {
         if self.client.is_some() {
-            iced::time::every(std::time::Duration::from_secs(5))
-                .map(|_| Message::RefreshRequested)
+            iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::RefreshRequested)
         } else {
             iced::Subscription::none()
         }
@@ -118,7 +163,8 @@ pub fn update(app: &mut KrustyApp, message: Message) -> Task<Message> {
         Message::ClientReady(Ok(client)) => {
             app.client = Some(Arc::new(client));
             app.error = None;
-            return app.fetch_current_route();
+            let load_namespaces = app.load_namespaces();
+            return Task::batch([app.fetch_current_route(), load_namespaces]);
         }
         Message::ClientReady(Err(e)) => {
             app.error = Some(format!("Failed to connect to Kubernetes: {}", e));
@@ -127,6 +173,16 @@ pub fn update(app: &mut KrustyApp, message: Message) -> Task<Message> {
             app.route = route;
             return app.fetch_current_route();
         }
+        Message::NamespaceChanged(ns) => {
+            app.namespace = ns;
+            return app.fetch_current_route();
+        }
+        Message::NamespacesLoaded(Ok(namespaces)) => {
+            app.namespaces = namespaces;
+        }
+        Message::NamespacesLoaded(Err(e)) => {
+            app.error = Some(format!("Failed to load namespaces: {}", e));
+        }
         Message::RefreshRequested => {
             return app.fetch_current_route();
         }
@@ -134,28 +190,68 @@ pub fn update(app: &mut KrustyApp, message: Message) -> Task<Message> {
             return app.pod_vm.update(msg, app.client.clone()).map(Message::Pod);
         }
         Message::Node(msg) => {
-            return app.node_vm.update(msg, app.client.clone()).map(Message::Node);
+            return app
+                .node_vm
+                .update(msg, app.client.clone())
+                .map(Message::Node);
         }
         Message::Deployment(msg) => {
-            return app.deployment_vm.update(msg, app.client.clone()).map(Message::Deployment);
+            return app
+                .deployment_vm
+                .update(msg, app.client.clone())
+                .map(Message::Deployment);
         }
         Message::Secret(msg) => {
-            return app.secret_vm.update(msg, app.client.clone()).map(Message::Secret);
+            return app
+                .secret_vm
+                .update(msg, app.client.clone())
+                .map(Message::Secret);
         }
         Message::Event(msg) => {
-            return app.event_vm.update(msg, app.client.clone()).map(Message::Event);
+            return app
+                .event_vm
+                .update(msg, app.client.clone())
+                .map(Message::Event);
         }
         Message::Service(msg) => {
-            return app.service_vm.update(msg, app.client.clone()).map(Message::Service);
+            return app
+                .service_vm
+                .update(msg, app.client.clone())
+                .map(Message::Service);
         }
         Message::Ingress(msg) => {
-            return app.ingress_vm.update(msg, app.client.clone()).map(Message::Ingress);
+            return app
+                .ingress_vm
+                .update(msg, app.client.clone())
+                .map(Message::Ingress);
         }
     }
     Task::none()
 }
 
 pub fn view(app: &KrustyApp) -> Element<Message> {
+    let title = match app.route {
+        Route::Pods => "Pods",
+        Route::Nodes => "Nodes",
+        Route::Deployments => "Deployments",
+        Route::Secrets => "Secrets",
+        Route::Events => "Events",
+        Route::Services => "Services",
+        Route::Ingress => "Ingress",
+    };
+
+    let is_loading = match app.route {
+        Route::Pods => app.pod_vm.loading,
+        Route::Nodes => app.node_vm.loading,
+        Route::Deployments => app.deployment_vm.loading,
+        Route::Secrets => app.secret_vm.loading,
+        Route::Events => app.event_vm.loading,
+        Route::Services => app.service_vm.loading,
+        Route::Ingress => app.ingress_vm.loading,
+    };
+
+    let header = crate::ui::header::view(title, &app.namespace, &app.namespaces, is_loading);
+
     let content: Element<Message> = if let Some(err) = &app.error {
         iced::widget::container(iced::widget::text(err).size(16))
             .width(iced::Length::Fill)
@@ -167,21 +263,27 @@ pub fn view(app: &KrustyApp) -> Element<Message> {
         match app.route {
             Route::Pods => crate::ui::views::pod::view(&app.pod_vm).map(Message::Pod),
             Route::Nodes => crate::ui::views::node::view(&app.node_vm).map(Message::Node),
-            Route::Deployments => crate::ui::views::deployment::view(&app.deployment_vm).map(Message::Deployment),
+            Route::Deployments => {
+                crate::ui::views::deployment::view(&app.deployment_vm).map(Message::Deployment)
+            }
             Route::Secrets => crate::ui::views::secret::view(&app.secret_vm).map(Message::Secret),
             Route::Events => crate::ui::views::event::view(&app.event_vm).map(Message::Event),
-            Route::Services => crate::ui::views::service::view(&app.service_vm).map(Message::Service),
-            Route::Ingress => crate::ui::views::ingress::view(&app.ingress_vm).map(Message::Ingress),
+            Route::Services => {
+                crate::ui::views::service::view(&app.service_vm).map(Message::Service)
+            }
+            Route::Ingress => {
+                crate::ui::views::ingress::view(&app.ingress_vm).map(Message::Ingress)
+            }
         }
     };
-    
-    let main_area = iced::widget::container(content)
+
+    let main_area = iced::widget::container(
+        iced::widget::column![header, content]
+            .spacing(10)
+    )
         .width(iced::Length::Fill)
         .height(iced::Length::Fill)
         .padding(20);
-    
-    iced::widget::row![
-        crate::ui::sidebar::view(&app.route),
-        main_area,
-    ].into()
+
+    iced::widget::row![crate::ui::sidebar::view(&app.route), main_area,].into()
 }
