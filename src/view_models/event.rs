@@ -67,9 +67,8 @@ impl EventViewModel {
             }
             Message::Loaded(Ok(items)) => {
                 self.loading = false;
-                if self.items != items {
-                    self.items = items;
-                }
+                self.items = items;
+                self.items.sort_by(|a, b| b.age.cmp(&a.age));
                 if let Some(idx) = self.selected_index { if idx >= self.items.len() { self.selected_index = None; } }
                 Task::none()
             }
@@ -95,16 +94,17 @@ impl EventViewModel {
             Message::WatchEvent(evt) => {
                 match evt {
                     crate::kubernetes::KubeWatchEvent::Added(item) | crate::kubernetes::KubeWatchEvent::Modified(item) => {
-                        if let Some(pos) = self.items.iter().position(|i| i.name == item.name) {
+                        if let Some(pos) = self.items.iter().position(|i| i.name == item.name && i.namespace == item.namespace) {
                             if self.items[pos] != item { self.items[pos] = item; }
                         } else {
                             self.items.push(item);
                         }
                     }
                     crate::kubernetes::KubeWatchEvent::Deleted(item) => {
-                        self.items.retain(|i| i.name != item.name);
+                        self.items.retain(|i| !(i.name == item.name && i.namespace == item.namespace));
                     }
                 }
+                self.items.sort_by(|a, b| b.age.cmp(&a.age));
                 Task::none()
             }
         }

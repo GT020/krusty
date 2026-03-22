@@ -65,9 +65,8 @@ impl NodeViewModel {
             }
             Message::Loaded(Ok(items)) => {
                 self.loading = false;
-                if self.items != items {
-                    self.items = items;
-                }
+                self.items = items;
+                self.items.sort_by(|a, b| a.name.cmp(&b.name));
                 if let Some(idx) = self.selected_index { if idx >= self.items.len() { self.selected_index = None; } }
                 Task::none()
             }
@@ -103,6 +102,7 @@ impl NodeViewModel {
                         self.items.retain(|i| i.name != item.name);
                     }
                 }
+                self.items.sort_by(|a, b| a.name.cmp(&b.name));
                 Task::none()
             }
         }

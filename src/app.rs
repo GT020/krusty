@@ -56,6 +56,7 @@ pub enum Message {
     Service(ServiceMessage),
     Ingress(IngressMessage),
     Settings(SettingsMessage),
+    NamespaceWatchEvent(crate::kubernetes::KubeWatchEvent<k8s_openapi::api::core::v1::Namespace>),
 }
 
 impl std::fmt::Debug for Message {
@@ -76,6 +77,7 @@ impl std::fmt::Debug for Message {
             Self::Service(msg) => f.debug_tuple("Service").field(msg).finish(),
             Self::Ingress(msg) => f.debug_tuple("Ingress").field(msg).finish(),
             Self::Settings(msg) => f.debug_tuple("Settings").field(msg).finish(),
+            Self::NamespaceWatchEvent(_) => write!(f, "NamespaceWatchEvent"),
         }
     }
 }
@@ -164,7 +166,7 @@ impl KrustyApp {
         let ns = self.namespace.clone();
         let client = self.client.clone().unwrap();
         
-        match self.route {
+        let route_sub = match self.route {
             Route::Pods => self.pod_vm.subscription(settings, ns, client.clone()).map(Message::Pod),
             Route::Nodes => self.node_vm.subscription(settings, ns, client.clone()).map(Message::Node),
             Route::Deployments => self.deployment_vm.subscription(settings, ns, client.clone()).map(Message::Deployment),
@@ -173,7 +175,15 @@ impl KrustyApp {
             Route::Services => self.service_vm.subscription(settings, ns, client.clone()).map(Message::Service),
             Route::Ingress => self.ingress_vm.subscription(settings, ns, client.clone()).map(Message::Ingress),
             Route::Settings => iced::Subscription::none(),
-        }
+        };
+
+        let ns_sub = crate::kubernetes::watch_cluster_resource::<k8s_openapi::api::core::v1::Namespace, _, _>(
+            "app_namespaces_watch",
+            client,
+            |evt| Message::NamespaceWatchEvent(evt)
+        );
+
+        iced::Subscription::batch([route_sub, ns_sub])
     }
 }
 
@@ -270,6 +280,28 @@ pub fn update(app: &mut KrustyApp, message: Message) -> Task<Message> {
         }
         Message::Settings(msg) => {
             return app.settings_vm.update(msg).map(Message::Settings);
+        }
+        Message::NamespaceWatchEvent(evt) => {
+            match evt {
+                crate::kubernetes::KubeWatchEvent::Added(ns) | crate::kubernetes::KubeWatchEvent::Modified(ns) => {
+                    if let Some(name) = ns.metadata.name {
+                        if !app.namespaces.contains(&name) {
+                            app.namespaces.push(name);
+                            app.namespaces.sort();
+                        }
+                    }
+                }
+                crate::kubernetes::KubeWatchEvent::Deleted(ns) => {
+                    if let Some(name) = ns.metadata.name {
+                        app.namespaces.retain(|n| n != &name);
+                        if app.namespace.as_deref() == Some(name.as_str()) {
+                            app.namespace = None;
+                            return app.fetch_current_route();
+                        }
+                    }
+                }
+            }
+            return Task::none();
         }
     }
     Task::none()
