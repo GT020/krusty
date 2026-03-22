@@ -3,6 +3,7 @@ pub mod models;
 pub mod repos;
 pub mod ui;
 pub mod view_models;
+pub mod kubernetes;
 
 fn main() {
     let _ = iced::application("Krusty - Kubernetes Desktop Client", app::update, app::view)

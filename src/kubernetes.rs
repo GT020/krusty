@@ -1,7 +1,16 @@
-use kube::{api::{Api, DynamicObject}, Client};
-use kube::api::ListParams;
+use kube::{api::{Api, DynamicObject, ListParams, WatchParams, WatchEvent}, Client, Resource};
 use k8s_openapi::api::core::v1::{Event, Node, Pod, Secret, Service};
 use k8s_openapi::api::apps::v1::Deployment;
+use futures::{StreamExt, SinkExt};
+use iced;
+use tokio;
+
+#[derive(Debug, Clone)]
+pub enum KubeWatchEvent<T> {
+    Added(T),
+    Modified(T),
+    Deleted(T),
+}
 
 pub async fn create_client() -> Result<Client, kube::Error> {
     Client::try_default().await
@@ -73,4 +82,80 @@ pub async fn fetch_ingressroutes(client: &Client, namespace: Option<&str>) -> Re
     };
     let list = api.list(&ListParams::default()).await?;
     Ok(list.items)
+}
+
+pub fn watch_namespaced_resource<K, M, F>(
+    id: impl std::hash::Hash + 'static + Send + Clone,
+    client: std::sync::Arc<Client>,
+    namespace: Option<String>,
+    on_event: F
+) -> iced::Subscription<M>
+where
+    K: Resource<Scope = kube::core::NamespaceResourceScope> + Clone + serde::de::DeserializeOwned + std::fmt::Debug + Send + Sync + 'static,
+    K::DynamicType: Default + std::cmp::Eq + std::hash::Hash + Clone,
+    M: 'static + Send + Clone,
+    F: Fn(KubeWatchEvent<K>) -> M + Send + Sync + 'static + Clone,
+{
+    iced::Subscription::run_with_id(
+        id,
+        iced::stream::channel(100, move |mut output| async move {
+            let api: Api<K> = match namespace {
+                Some(ref ns) => Api::namespaced((*client).clone(), ns),
+                None => Api::all((*client).clone()),
+            };
+            let wp = WatchParams::default();
+            loop {
+                match api.watch(&wp, "0").await {
+                    Ok(stream) => {
+                        let mut pinned_stream = std::pin::pin!(stream);
+                        while let Some(event) = pinned_stream.next().await {
+                            match event {
+                                Ok(WatchEvent::Added(item)) => { let _ = output.send(on_event(KubeWatchEvent::Added(item))).await; }
+                                Ok(WatchEvent::Modified(item)) => { let _ = output.send(on_event(KubeWatchEvent::Modified(item))).await; }
+                                Ok(WatchEvent::Deleted(item)) => { let _ = output.send(on_event(KubeWatchEvent::Deleted(item))).await; }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(_) => { tokio::time::sleep(std::time::Duration::from_secs(2)).await; }
+                }
+            }
+        })
+    )
+}
+
+pub fn watch_cluster_resource<K, M, F>(
+    id: impl std::hash::Hash + 'static + Send + Clone,
+    client: std::sync::Arc<Client>,
+    on_event: F
+) -> iced::Subscription<M>
+where
+    K: Resource<Scope = kube::core::ClusterResourceScope> + Clone + serde::de::DeserializeOwned + std::fmt::Debug + Send + Sync + 'static,
+    K::DynamicType: Default + std::cmp::Eq + std::hash::Hash + Clone,
+    M: 'static + Send + Clone,
+    F: Fn(KubeWatchEvent<K>) -> M + Send + Sync + 'static + Clone,
+{
+    iced::Subscription::run_with_id(
+        id,
+        iced::stream::channel(100, move |mut output| async move {
+            let api: Api<K> = Api::all((*client).clone());
+            let wp = WatchParams::default();
+            loop {
+                match api.watch(&wp, "0").await {
+                    Ok(stream) => {
+                        let mut pinned_stream = std::pin::pin!(stream);
+                        while let Some(event) = pinned_stream.next().await {
+                            match event {
+                                Ok(WatchEvent::Added(item)) => { let _ = output.send(on_event(KubeWatchEvent::Added(item))).await; }
+                                Ok(WatchEvent::Modified(item)) => { let _ = output.send(on_event(KubeWatchEvent::Modified(item))).await; }
+                                Ok(WatchEvent::Deleted(item)) => { let _ = output.send(on_event(KubeWatchEvent::Deleted(item))).await; }
+                                _ => {}
+                            }
+                        }
+                    }
+                    Err(_) => { tokio::time::sleep(std::time::Duration::from_secs(2)).await; }
+                }
+            }
+        })
+    )
 }

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use kube::Client;
-use iced::Task;
+use iced::{Task, Subscription};
 use crate::models::ingress::IngressModel;
 use crate::repos::ingress::IngressRepo;
+use crate::models::settings::{SettingsModel, FetchMode};
 
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -11,6 +12,7 @@ pub enum Message {
     Select(usize),
     Delete,
     Deleted(Result<(), Arc<kube::Error>>),
+    Tick,
 }
 
 pub struct IngressViewModel {
@@ -23,6 +25,20 @@ pub struct IngressViewModel {
 impl IngressViewModel {
     pub fn new() -> Self {
         Self { items: Vec::new(), selected_index: None, loading: false, error: None }
+    }
+
+    pub fn subscription(&self, settings: &SettingsModel, _namespace: Option<String>, _client: std::sync::Arc<Client>) -> Subscription<Message> {
+        let mode = settings.get_fetch_mode("Ingress");
+        match mode {
+            FetchMode::Polling => {
+                iced::time::every(std::time::Duration::from_secs(settings.refresh_interval))
+                    .map(|_| Message::Tick)
+            }
+            FetchMode::Watcher => {
+                iced::time::every(std::time::Duration::from_millis(1500))
+                    .map(|_| Message::Tick)
+            }
+        }
     }
 
     pub fn update(&mut self, message: Message, client: Option<Arc<Client>>) -> Task<Message> {
@@ -38,7 +54,10 @@ impl IngressViewModel {
                 } else { Task::none() }
             }
             Message::Loaded(Ok(items)) => {
-                self.loading = false; self.items = items;
+                self.loading = false;
+                if self.items != items {
+                    self.items = items;
+                }
                 if let Some(idx) = self.selected_index { if idx >= self.items.len() { self.selected_index = None; } }
                 Task::none()
             }
@@ -60,6 +79,7 @@ impl IngressViewModel {
             }
             Message::Deleted(Ok(_)) => { self.selected_index = None; Task::perform(async {}, |_| Message::Load(None)) }
             Message::Deleted(Err(e)) => { self.error = Some(format!("Delete failed: {}", e)); Task::none() }
+            Message::Tick => Task::none(),
         }
     }
 }

@@ -1,8 +1,9 @@
 use std::sync::Arc;
 use kube::Client;
-use iced::Task;
+use iced::{Task, Subscription};
 use crate::models::node::NodeModel;
 use crate::repos::node::NodeRepo;
+use crate::models::settings::{SettingsModel, FetchMode};
 
 #[derive(Clone, Debug)]
 pub enum Message {
@@ -11,6 +12,8 @@ pub enum Message {
     Select(usize),
     Delete,
     Deleted(Result<(), Arc<kube::Error>>),
+    Tick,
+    WatchEvent(crate::kubernetes::KubeWatchEvent<NodeModel>),
 }
 
 pub struct NodeViewModel {
@@ -25,6 +28,30 @@ impl NodeViewModel {
         Self { items: Vec::new(), selected_index: None, loading: false, error: None }
     }
 
+    pub fn subscription(&self, settings: &SettingsModel, _namespace: Option<String>, client: std::sync::Arc<Client>) -> Subscription<Message> {
+        let mode = settings.get_fetch_mode("Nodes");
+        match mode {
+            FetchMode::Polling => {
+                iced::time::every(std::time::Duration::from_secs(settings.refresh_interval))
+                    .map(|_| Message::Tick)
+            }
+            FetchMode::Watcher => {
+                crate::kubernetes::watch_cluster_resource::<k8s_openapi::api::core::v1::Node, _, _>(
+                    ("nodes_watch", _namespace.clone()),
+                    client,
+                    |evt| {
+                        let m = match evt {
+                            crate::kubernetes::KubeWatchEvent::Added(i) => crate::kubernetes::KubeWatchEvent::Added(i.into()),
+                            crate::kubernetes::KubeWatchEvent::Modified(i) => crate::kubernetes::KubeWatchEvent::Modified(i.into()),
+                            crate::kubernetes::KubeWatchEvent::Deleted(i) => crate::kubernetes::KubeWatchEvent::Deleted(i.into()),
+                        };
+                        Message::WatchEvent(m)
+                    }
+                )
+            }
+        }
+    }
+
     pub fn update(&mut self, message: Message, client: Option<Arc<Client>>) -> Task<Message> {
         match message {
             Message::Load => {
@@ -37,7 +64,10 @@ impl NodeViewModel {
                 } else { Task::none() }
             }
             Message::Loaded(Ok(items)) => {
-                self.loading = false; self.items = items;
+                self.loading = false;
+                if self.items != items {
+                    self.items = items;
+                }
                 if let Some(idx) = self.selected_index { if idx >= self.items.len() { self.selected_index = None; } }
                 Task::none()
             }
@@ -59,6 +89,22 @@ impl NodeViewModel {
             }
             Message::Deleted(Ok(_)) => { self.selected_index = None; Task::perform(async {}, |_| Message::Load) }
             Message::Deleted(Err(e)) => { self.error = Some(format!("Delete failed: {}", e)); Task::none() }
+            Message::Tick => Task::none(),
+            Message::WatchEvent(evt) => {
+                match evt {
+                    crate::kubernetes::KubeWatchEvent::Added(item) | crate::kubernetes::KubeWatchEvent::Modified(item) => {
+                        if let Some(pos) = self.items.iter().position(|i| i.name == item.name) {
+                            if self.items[pos] != item { self.items[pos] = item; }
+                        } else {
+                            self.items.push(item);
+                        }
+                    }
+                    crate::kubernetes::KubeWatchEvent::Deleted(item) => {
+                        self.items.retain(|i| i.name != item.name);
+                    }
+                }
+                Task::none()
+            }
         }
     }
 }

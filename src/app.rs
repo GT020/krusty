@@ -10,6 +10,7 @@ use crate::view_models::{
     pod::{Message as PodMessage, PodViewModel},
     secret::{Message as SecretMessage, SecretViewModel},
     service::{Message as ServiceMessage, ServiceViewModel},
+    settings::{Message as SettingsMessage, SettingsViewModel},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,6 +22,7 @@ pub enum Route {
     Events,
     Services,
     Ingress,
+    Settings,
 }
 
 pub struct KrustyApp {
@@ -35,6 +37,7 @@ pub struct KrustyApp {
     pub event_vm: EventViewModel,
     pub service_vm: ServiceViewModel,
     pub ingress_vm: IngressViewModel,
+    pub settings_vm: SettingsViewModel,
     pub error: Option<String>,
 }
 
@@ -52,6 +55,7 @@ pub enum Message {
     Event(EventMessage),
     Service(ServiceMessage),
     Ingress(IngressMessage),
+    Settings(SettingsMessage),
 }
 
 impl std::fmt::Debug for Message {
@@ -71,6 +75,7 @@ impl std::fmt::Debug for Message {
             Self::Event(msg) => f.debug_tuple("Event").field(msg).finish(),
             Self::Service(msg) => f.debug_tuple("Service").field(msg).finish(),
             Self::Ingress(msg) => f.debug_tuple("Ingress").field(msg).finish(),
+            Self::Settings(msg) => f.debug_tuple("Settings").field(msg).finish(),
         }
     }
 }
@@ -90,6 +95,7 @@ impl KrustyApp {
                 event_vm: EventViewModel::new(),
                 service_vm: ServiceViewModel::new(),
                 ingress_vm: IngressViewModel::new(),
+                settings_vm: SettingsViewModel::new(),
                 error: None,
             },
             Task::perform(kube::Client::try_default(), |res| {
@@ -130,6 +136,7 @@ impl KrustyApp {
                 .ingress_vm
                 .update(IngressMessage::Load(namespace.clone()), client)
                 .map(Message::Ingress),
+            Route::Settings => Task::none(),
         }
     }
 
@@ -150,10 +157,22 @@ impl KrustyApp {
     }
 
     pub fn subscription(&self) -> iced::Subscription<Message> {
-        if self.client.is_some() {
-            iced::time::every(std::time::Duration::from_secs(5)).map(|_| Message::RefreshRequested)
-        } else {
-            iced::Subscription::none()
+        if self.client.is_none() {
+            return iced::Subscription::none();
+        }
+        let settings = &self.settings_vm.settings;
+        let ns = self.namespace.clone();
+        let client = self.client.clone().unwrap();
+        
+        match self.route {
+            Route::Pods => self.pod_vm.subscription(settings, ns, client.clone()).map(Message::Pod),
+            Route::Nodes => self.node_vm.subscription(settings, ns, client.clone()).map(Message::Node),
+            Route::Deployments => self.deployment_vm.subscription(settings, ns, client.clone()).map(Message::Deployment),
+            Route::Secrets => self.secret_vm.subscription(settings, ns, client.clone()).map(Message::Secret),
+            Route::Events => self.event_vm.subscription(settings, ns, client.clone()).map(Message::Event),
+            Route::Services => self.service_vm.subscription(settings, ns, client.clone()).map(Message::Service),
+            Route::Ingress => self.ingress_vm.subscription(settings, ns, client.clone()).map(Message::Ingress),
+            Route::Settings => iced::Subscription::none(),
         }
     }
 }
@@ -187,7 +206,11 @@ pub fn update(app: &mut KrustyApp, message: Message) -> Task<Message> {
             return app.fetch_current_route();
         }
         Message::Pod(msg) => {
-            return app.pod_vm.update(msg, app.client.clone()).map(Message::Pod);
+            let m = match msg {
+                PodMessage::Tick => PodMessage::Load(app.namespace.clone()),
+                _ => msg,
+            };
+            return app.pod_vm.update(m, app.client.clone()).map(Message::Pod);
         }
         Message::Node(msg) => {
             return app
@@ -196,34 +219,57 @@ pub fn update(app: &mut KrustyApp, message: Message) -> Task<Message> {
                 .map(Message::Node);
         }
         Message::Deployment(msg) => {
+            let m = match msg {
+                DeploymentMessage::Tick => DeploymentMessage::Load(app.namespace.clone()),
+                _ => msg,
+            };
             return app
                 .deployment_vm
-                .update(msg, app.client.clone())
+                .update(m, app.client.clone())
                 .map(Message::Deployment);
         }
         Message::Secret(msg) => {
+            let m = match msg {
+                SecretMessage::Tick => SecretMessage::Load(app.namespace.clone()),
+                _ => msg,
+            };
             return app
                 .secret_vm
-                .update(msg, app.client.clone())
+                .update(m, app.client.clone())
                 .map(Message::Secret);
         }
         Message::Event(msg) => {
+            let m = match msg {
+                EventMessage::Tick => EventMessage::Load(app.namespace.clone()),
+                _ => msg,
+            };
             return app
                 .event_vm
-                .update(msg, app.client.clone())
+                .update(m, app.client.clone())
                 .map(Message::Event);
         }
         Message::Service(msg) => {
+            let m = match msg {
+                ServiceMessage::Tick => ServiceMessage::Load(app.namespace.clone()),
+                _ => msg,
+            };
             return app
                 .service_vm
-                .update(msg, app.client.clone())
+                .update(m, app.client.clone())
                 .map(Message::Service);
         }
         Message::Ingress(msg) => {
+            let m = match msg {
+                IngressMessage::Tick => IngressMessage::Load(app.namespace.clone()),
+                _ => msg,
+            };
             return app
                 .ingress_vm
-                .update(msg, app.client.clone())
+                .update(m, app.client.clone())
                 .map(Message::Ingress);
+        }
+        Message::Settings(msg) => {
+            return app.settings_vm.update(msg).map(Message::Settings);
         }
     }
     Task::none()
@@ -238,6 +284,7 @@ pub fn view(app: &KrustyApp) -> Element<Message> {
         Route::Events => "Events",
         Route::Services => "Services",
         Route::Ingress => "Ingress",
+        Route::Settings => "Settings",
     };
 
     let is_loading = match app.route {
@@ -248,6 +295,7 @@ pub fn view(app: &KrustyApp) -> Element<Message> {
         Route::Events => app.event_vm.loading,
         Route::Services => app.service_vm.loading,
         Route::Ingress => app.ingress_vm.loading,
+        Route::Settings => false,
     };
 
     let header = crate::ui::header::view(title, &app.namespace, &app.namespaces, is_loading);
@@ -274,6 +322,9 @@ pub fn view(app: &KrustyApp) -> Element<Message> {
             Route::Ingress => {
                 crate::ui::views::ingress::view(&app.ingress_vm).map(Message::Ingress)
             }
+            Route::Settings => {
+                crate::ui::views::settings::view(&app.settings_vm, &app.namespaces).map(Message::Settings)
+            }
         }
     };
 
@@ -283,7 +334,13 @@ pub fn view(app: &KrustyApp) -> Element<Message> {
     )
         .width(iced::Length::Fill)
         .height(iced::Length::Fill)
-        .padding(20);
+        .padding(20)
+        .style(|_| iced::widget::container::Style {
+            // #F2EAE0
+            background: Some(iced::Background::Color(iced::Color::from_rgb8(242, 234, 224))),
+            text_color: Some(iced::Color::BLACK),
+            ..Default::default()
+        });
 
     iced::widget::row![crate::ui::sidebar::view(&app.route), main_area,].into()
 }

@@ -5,3 +5,4 @@ pub mod node;
 pub mod pod;
 pub mod secret;
 pub mod service;
+pub mod settings;
