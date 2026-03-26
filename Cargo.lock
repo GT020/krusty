@@ -2011,12 +2011,13 @@ checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
 name = "krusty"
-version = "0.1.0"
+version = "0.0.1"
 dependencies = [
  "futures",
  "iced",
  "k8s-openapi",
  "kube",
+ "rand",
  "serde",
  "serde_json",
  "tokio",

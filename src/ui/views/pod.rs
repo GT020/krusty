@@ -1,3 +1,4 @@
+use crate::ui::widgets::graph_widget::{cpu_usage_graph_widget, memory_usage_graph_widget};
 use crate::view_models::pod::{Message, PodViewModel};
 use iced::widget::{button, column, container, row, scrollable, text};
 use iced::{Element, Length};
@@ -52,6 +53,40 @@ pub fn view(vm: &PodViewModel) -> Element<Message> {
                 scrollable(text(&item.raw).size(14)).height(Length::Fill)
             };
 
+            // CPU and Memory usage graphs
+            let cpu_graph = if !vm.cpu_metrics.is_empty() {
+                let widget = cpu_usage_graph_widget(vm.cpu_metrics.clone());
+                let element = widget.view().map(|_| Message::Tick);
+                container(element)
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(2))
+            } else {
+                container(text("No CPU data available").size(12))
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(2))
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+            };
+
+            let memory_graph = if !vm.memory_metrics.is_empty() {
+                let widget = memory_usage_graph_widget(vm.memory_metrics.clone());
+                let element = widget.view().map(|_| Message::Tick);
+                container(element)
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(2))
+            } else {
+                container(text("No memory data available").size(12))
+                    .width(Length::Fill)
+                    .height(Length::FillPortion(2))
+                    .center_x(Length::Fill)
+                    .center_y(Length::Fill)
+            };
+
+            let graphs = column![text("Resource Usage").size(16), cpu_graph, memory_graph]
+                .spacing(10)
+                .width(Length::Fill)
+                .height(Length::FillPortion(2));
+
             let action_btns = if vm.logs.is_some() {
                 row![delete_btn, logs_btn, clear_logs_btn].spacing(10)
             } else {
@@ -61,7 +96,8 @@ pub fn view(vm: &PodViewModel) -> Element<Message> {
             column![
                 text(format!("Details for {}", item.name)).size(20),
                 action_btns,
-                details
+                details,
+                graphs
             ]
             .spacing(20)
             .width(Length::FillPortion(3))

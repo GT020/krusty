@@ -26,11 +26,22 @@ pub struct PodViewModel {
     pub error: Option<String>,
     pub logs: Option<String>,
     pub logs_loading: bool,
+    pub cpu_metrics: Vec<f32>, // Simulated CPU usage data for graph
+    pub memory_metrics: Vec<f32>, // Simulated memory usage data for graph
 }
 
 impl PodViewModel {
     pub fn new() -> Self {
-        Self { items: Vec::new(), selected_index: None, loading: false, error: None, logs: None, logs_loading: false }
+        Self { 
+            items: Vec::new(), 
+            selected_index: None, 
+            loading: false, 
+            error: None, 
+            logs: None, 
+            logs_loading: false,
+            cpu_metrics: Vec::new(),
+            memory_metrics: Vec::new(),
+        }
     }
 
     pub fn subscription(&self, settings: &SettingsModel, _namespace: Option<String>, client: std::sync::Arc<Client>) -> Subscription<Message> {
@@ -74,6 +85,14 @@ impl PodViewModel {
                 self.loading = false;
                 self.items = items;
                 self.items.sort_by(|a, b| a.name.cmp(&b.name));
+                
+                // Simulate CPU and memory metrics for demonstration
+                // In a real implementation, these would come from metrics API
+                use rand::Rng;
+                let mut rng = rand::thread_rng();
+                self.cpu_metrics = (0..10).map(|_| rng.gen_range(0.0..100.0)).collect();
+                self.memory_metrics = (0..10).map(|_| rng.gen_range(0.0..1024.0)).collect();
+                
                 if let Some(idx) = self.selected_index { if idx >= self.items.len() { self.selected_index = None; } }
                 Task::none()
             }
