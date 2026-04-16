@@ -26,9 +26,9 @@ modules:
     buildsystem: simple
 
     build-commands:
-      - flatpak install -y flathub org.freedesktop.Sdk.Extension.xorg//24.08 || true
+      - flatpak install -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
       - cargo fetch
-      - cargo build --release
+      - cargo build --release --features web
       - install -Dm755 target/release/krusty /app/bin/krusty
 
     sources:
