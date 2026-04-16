@@ -11,7 +11,7 @@ sdk-extensions:
 build-options:
   append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin:/usr/bin
   prepend-ld-library-path: /usr/lib/sdk/rust-stable/lib
-  append-ld-library-path: /usr/lib/sdk/llvm18/lib
+  append-ld-library-path: /usr/lib
   build-args:
     - --share=network
   env:
@@ -20,7 +20,7 @@ build-options:
     CARGO_PROFILE_RELEASE_LTO: "true"
     CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
     CARGO_PROFILE_RELEASE_STRIP: "true"
-    LIBXDO_LIBS: "-lxdo -lx11 -lxkbfile"
+    PKG_CONFIG_PATH: /usr/lib/pkgconfig
 
 modules:
   - name: krusty
@@ -29,7 +29,6 @@ modules:
 
     build-commands:
       - cargo fetch
-      - export LIBRARY_PATH=/usr/lib/x86_64-linux-gnu:$LIBRARY_PATH
       - cargo build --release
       - install -Dm755 target/release/krusty /app/bin/krusty
 
