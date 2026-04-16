@@ -1,8 +1,8 @@
 app-id: dev.krusty.Krusty
 
 runtime: org.gnome.Platform
-runtime-version: "48"
-sdk: org.gnome.Sdk
+runtime-version: "24.08"
+sdk: org.freedesktop.Sdk
 
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
@@ -26,7 +26,6 @@ modules:
     buildsystem: simple
 
     build-commands:
-      - flatpak install -y flathub org.freedesktop.Platform//24.08 org.freedesktop.Sdk//24.08
       - cargo fetch
       - cargo build --release --features web
       - install -Dm755 target/release/krusty /app/bin/krusty
