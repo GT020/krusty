@@ -1,26 +1,16 @@
 app-id: dev.krusty.Krusty
 
 runtime: org.gnome.Platform
-runtime-version: "48"
-sdk: org.gnome.Sdk
+runtime-version: "46"
+sdk: org.freedesktop.Sdk
 
 sdk-extensions:
   - org.freedesktop.Sdk.Extension.rust-stable
   - org.freedesktop.Sdk.Extension.llvm18
 
-command: krusty
-
-finish-args:
-  - --share=ipc
-  - --socket=wayland
-  - --socket=fallback-x11
-  - --device=dri
-  - --share=network
-  - --talk-name=org.freedesktop.Notifications
-
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin
-  prepend-ld-library-path: /usr/lib/sdk/rust-stable/lib
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin:/usr/bin
+  prepend-ld-library-path: /usr/lib/x86_64-linux-gnu:/usr/lib/sdk/rust-stable/lib
   build-args:
     - --share=network
   env:
@@ -37,9 +27,19 @@ modules:
 
     build-commands:
       - cargo fetch
-      - cargo build --release
+      - cargo build --release --features web
       - install -Dm755 target/release/krusty /app/bin/krusty
 
     sources:
       - type: dir
         path: ..
+
+command: krusty
+
+finish-args:
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --share=network
+  - --talk-name=org.freedesktop.Notifications
