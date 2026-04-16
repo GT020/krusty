@@ -9,11 +9,9 @@ sdk-extensions:
   - org.freedesktop.Sdk.Extension.llvm18
 
 build-options:
-  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin
+  append-path: /usr/lib/sdk/rust-stable/bin:/usr/lib/sdk/llvm18/bin:/usr/bin
   prepend-ld-library-path: /usr/lib/sdk/rust-stable/lib
-  append-path: /usr/lib/sdk/llvm18/bin
   append-ld-library-path: /usr/lib/sdk/llvm18/lib
-  append-path: /usr/bin
   build-args:
     - --share=network
   env:
