@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  ########################################
+  # CREATE RELEASE
+  ########################################
+
+  release:
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.release.outputs.upload_url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release
+        id: release
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: false
+          generate_release_notes: true
+
+  ########################################
+  # BUILD FLATPAK
+  ########################################
+
+  flatpak:
+    needs: release
+    runs-on: ubuntu-latest
+
+    container:
+      image: ghcr.io/flathub-infra/flatpak-github-actions:gnome-48
+      options: --privileged
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build Flatpak Bundle
+        uses: flatpak/flatpak-github-actions/flatpak-builder@v6
+        with:
+          manifest-path: build/dev.krusty.Krusty.yml
+          bundle: krusty-${{ github.ref_name }}-x86_64.flatpak
+          arch: x86_64
+          cache-key: flatpak-builder-${{ github.ref_name }}
+
+      - name: Upload Flatpak
+        uses: softprops/action-gh-release@v2
+        with:
+          files: krusty-${{ github.ref_name }}-x86_64.flatpak
+
+  ########################################
+  # BUILD MACOS DMG
+  ########################################
+
+  macos:
+    needs: release
+    runs-on: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-cargo-${{ hashFiles('**/Cargo.lock') }}-${{ runner.os }}
+
+      - name: Build release
+        run: |
+          cargo fetch
+          cargo build --release --target aarch64-apple-darwin
+          cargo build --release --target x86_64-apple-darwin
+
+      - name: Create universal binary
+        run: |
+          lipo -create -output target/release/krusty-universal \
+            target/aarch64-apple-darwin/release/krusty \
+            target/x86_64-apple-darwin/release/krusty
+
+      - name: Create App Bundle
+        run: |
+          mkdir -p Krusty.app/Contents/MacOS
+          cp target/release/krusty-universal Krusty.app/Contents/MacOS/
+
+          mkdir -p Krusty.app/Contents/Resources
+
+          sed "s/VERSION_STRING/${{ github.ref_name }}/g" build/Info.plist > Krusty.app/Contents/Info.plist
+
+      - name: Install DMG tool
+        run: brew install create-dmg
+
+      - name: Create DMG
+        run: |
+          create-dmg \
+            --format ULFO \
+            --volname "Krusty" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --app-drop-link 425 178 \
+            Krusty-${{ github.ref_name }}-universal.dmg \
+            Krusty.app
+
+      - name: Upload DMG
+        uses: softprops/action-gh-release@v2
+        with:
+          files: Krusty-${{ github.ref_name }}-universal.dmg
