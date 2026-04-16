@@ -28,6 +28,7 @@ jobs:
         with:
           draft: false
           generate_release_notes: true
+          target_commitish: ${{ github.sha }}
 
   ########################################
   # BUILD FLATPAK
