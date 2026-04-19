@@ -1,6 +1,6 @@
 use crate::components::{ResourceDetail, ResourceTable};
 use crate::k8s::client::{self, K8sResource};
-use crate::k8s::context::{use_is_connected, CURRENT_NAMESPACE};
+use crate::k8s::context::{use_is_connected, set_connected, CURRENT_NAMESPACE};
 use crate::views::resource_list::ResourcePageHeader;
 use dioxus::prelude::*;
 use futures::StreamExt;
@@ -35,6 +35,7 @@ pub fn PodsPage() -> Element {
                     }
                     WatchEvent::Error(e) => {
                         tracing::error!("Watch error: {:?}", e);
+                        set_connected(false);
                     }
                     WatchEvent::Bookmark(_) => {}
                 }

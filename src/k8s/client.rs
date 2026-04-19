@@ -1,4 +1,4 @@
-use futures::{Stream, StreamExt};
+use futures::{Stream, StreamExt, TryStreamExt};
 use kube::Client;
 use kube::Api;
 use kube::api::{ResourceExt, WatchEvent};
@@ -218,6 +218,8 @@ impl From<Endpoints> for K8sResource {
     }
 }
 
+use crate::k8s::context::set_connected;
+
 pub async fn create_client() -> Result<Client, kube::Error> {
     let context = crate::k8s::context::get_current_context();
     let options = KubeConfigOptions {
@@ -228,7 +230,17 @@ pub async fn create_client() -> Result<Client, kube::Error> {
         Ok(config) => Client::try_from(config),
         Err(e) => {
             tracing::error!("Failed to load kubeconfig: {}", e);
-            Client::try_default().await
+            match Client::try_default().await {
+                Ok(client) => {
+                    set_connected(true);
+                    Ok(client)
+                }
+                Err(e) => {
+                    tracing::error!("Failed to connect to cluster: {}", e);
+                    set_connected(false);
+                    Err(e)
+                }
+            }
         }
     }
 }
@@ -378,152 +390,271 @@ pub async fn list_endpoints(ns: Option<&str>) -> Result<Vec<K8sResource>, Box<dy
 }
 
 pub async fn watch_pods(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<Pod>> + Send>> {
-    let client = create_client().await.unwrap();
+    let client = match create_client().await {
+        Ok(c) => c,
+        Err(_) => return futures::stream::iter(std::iter::empty()).boxed(),
+    };
     let api: Api<Pod> = match ns {
         Some(namespace) => Api::namespaced(client, namespace),
         None => Api::all(client),
     };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match api.watch(&Default::default(), "").await {
+        Ok(stream) => Box::pin(stream.filter_map(|r| async move { r.ok() })),
+        Err(e) => {
+            tracing::error!("Watch failed: {}", e);
+            futures::stream::iter(std::iter::empty()).boxed()
+        }
+    }
 }
 
 pub async fn watch_namespaces() -> Pin<Box<dyn Stream<Item = WatchEvent<Namespace>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<Namespace> = Api::all(client);
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<Namespace> = Api::all(client);
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(e) => {
+                    tracing::error!("Watch failed: {}", e);
+                    set_connected(false);
+                    futures::stream::iter(std::iter::empty()).boxed()
+                }
+            }
+        }
+        Err(e) => {
+            tracing::error!("Failed to create client: {}", e);
+            set_connected(false);
+            futures::stream::iter(std::iter::empty()).boxed()
+        }
+    }
 }
 
 pub async fn watch_deployments(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<Deployment>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<Deployment> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<Deployment> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_services(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<Service>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<Service> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<Service> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_configmaps(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<ConfigMap>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<ConfigMap> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<ConfigMap> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_secrets(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<Secret>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<Secret> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<Secret> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_persistentvolumeclaims(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<PersistentVolumeClaim>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<PersistentVolumeClaim> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<PersistentVolumeClaim> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_statefulsets(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<StatefulSet>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<StatefulSet> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<StatefulSet> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_daemonsets(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<DaemonSet>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<DaemonSet> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<DaemonSet> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_ingresses(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<Ingress>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<Ingress> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<Ingress> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_jobs(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<Job>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<Job> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<Job> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_cronjobs(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<CronJob>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<CronJob> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<CronJob> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_serviceaccounts(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<ServiceAccount>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<ServiceAccount> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<ServiceAccount> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
 
 pub async fn watch_endpoints(ns: Option<&str>) -> Pin<Box<dyn Stream<Item = WatchEvent<Endpoints>> + Send>> {
-    let client = create_client().await.unwrap();
-    let api: Api<Endpoints> = match ns {
-        Some(namespace) => Api::namespaced(client, namespace),
-        None => Api::all(client),
-    };
-    api.watch(&Default::default(), "").await.unwrap()
-        .filter_map(|r| async move { r.ok() })
-        .boxed()
+    match create_client().await {
+        Ok(client) => {
+            let api: Api<Endpoints> = match ns {
+                Some(namespace) => Api::namespaced(client, namespace),
+                None => Api::all(client),
+            };
+            match api.watch(&Default::default(), "").await {
+                Ok(stream) => stream
+                    .into_stream()
+                    .filter_map(|r| async move { r.ok() })
+                    .boxed(),
+                Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+            }
+        }
+        Err(_) => futures::stream::iter(std::iter::empty()).boxed()
+    }
 }
