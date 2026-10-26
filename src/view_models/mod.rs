@@ -1,30 +1,14 @@
 //! ViewModel layer: GPUI entities owning presentation state, bound to models.
 
-pub mod config_maps;
-pub mod daemon_sets;
-pub mod deployments;
-pub mod ingresses;
-pub mod jobs;
-pub mod node;
-pub mod persistent_volume_claims;
-pub mod persistent_volumes;
-pub mod pod;
-pub mod secrets;
-pub mod services;
+pub mod resources;
 
-pub use config_maps::ConfigMapsViewModel;
-pub use daemon_sets::DaemonSetsViewModel;
-pub use deployments::DeploymentsViewModel;
-pub use ingresses::IngressesViewModel;
-pub use jobs::JobsViewModel;
-pub use node::NodesViewModel;
-pub use persistent_volume_claims::PersistentVolumeClaimsViewModel;
-pub use persistent_volumes::PersistentVolumesViewModel;
-pub use pod::PodsViewModel;
-pub use secrets::SecretsViewModel;
-pub use services::ServicesViewModel;
+pub use resources::{
+    ConfigMapsViewModel, DaemonSetsViewModel, DeploymentsViewModel, IngressesViewModel, JobsViewModel,
+    NodesViewModel, PersistentVolumeClaimsViewModel, PersistentVolumesViewModel, PodsViewModel,
+    SecretsViewModel, ServicesViewModel,
+};
 
-use gpui_kit::component::table::DataTable;
+use gpui_kit::component::table::{DataTable, TableEvent};
 use gpui_kit::{App, AppContext as _, Context, Entity, IntoElement, Subscription, Window};
 use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
 
@@ -72,6 +56,119 @@ impl ResourceViewModel {
             Self::ConfigMaps(vm) => cx.observe(vm, move |this, _, cx| on_notify(this, cx)),
             Self::Secrets(vm) => cx.observe(vm, move |this, _, cx| on_notify(this, cx)),
             Self::Nodes(vm) => cx.observe(vm, move |this, _, cx| on_notify(this, cx)),
+        }
+    }
+
+    pub fn item_at(&self, row: usize, cx: &App) -> Option<crate::models::Item> {
+        match self {
+            Self::Pods(vm) => vm.read(cx).item_at(row, cx),
+            Self::Deployments(vm) => vm.read(cx).item_at(row, cx),
+            Self::DaemonSets(vm) => vm.read(cx).item_at(row, cx),
+            Self::Jobs(vm) => vm.read(cx).item_at(row, cx),
+            Self::Services(vm) => vm.read(cx).item_at(row, cx),
+            Self::Ingresses(vm) => vm.read(cx).item_at(row, cx),
+            Self::PersistentVolumes(vm) => vm.read(cx).item_at(row, cx),
+            Self::PersistentVolumeClaims(vm) => vm.read(cx).item_at(row, cx),
+            Self::ConfigMaps(vm) => vm.read(cx).item_at(row, cx),
+            Self::Secrets(vm) => vm.read(cx).item_at(row, cx),
+            Self::Nodes(vm) => vm.read(cx).item_at(row, cx),
+        }
+    }
+
+    pub fn observe_row_selected<V: 'static>(
+        &self,
+        cx: &mut Context<V>,
+        mut on_select: impl FnMut(&mut V, usize, &mut Context<V>) + 'static,
+    ) -> Subscription {
+        match self {
+            Self::Pods(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
+            Self::Deployments(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
+            Self::DaemonSets(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
+            Self::Jobs(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
+            Self::Services(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
+            Self::Ingresses(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
+            Self::PersistentVolumes(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
+            Self::PersistentVolumeClaims(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
+            Self::ConfigMaps(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
+            Self::Secrets(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
+            Self::Nodes(vm) => {
+                let table = vm.read(cx).table().clone();
+                cx.subscribe(&table, move |this, _, event: &TableEvent, cx| {
+                    if let TableEvent::SelectRow(row) = event {
+                        on_select(this, *row, cx);
+                    }
+                })
+            }
         }
     }
 

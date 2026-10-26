@@ -5,6 +5,24 @@ mod repository;
 mod ui;
 mod view_models;
 
+fn window_options() -> gpui_kit::WindowOptions {
+    let mut options = gpui_kit::component::TitleBar::window_options();
+    options.icon = window_icon();
+    options.app_id = Some("krusty".to_string());
+    options
+}
+
+fn window_icon() -> Option<std::sync::Arc<image::RgbaImage>> {
+    let bytes = include_bytes!("../assets/app-icon.png");
+    let image = image::load_from_memory(bytes).ok()?.into_rgba8();
+    Some(std::sync::Arc::new(image::imageops::resize(
+        &image,
+        256,
+        256,
+        image::imageops::FilterType::Lanczos3,
+    )))
+}
+
 fn main() {
     logging::init();
     let started = std::time::Instant::now();
@@ -29,7 +47,7 @@ fn main() {
                 "krusty: gpui_kit initialized"
             );
 
-            ui::theme::init(cx);
+            ui::settings::theme::init(cx);
             repository::init(cx);
             let cluster_started = std::time::Instant::now();
             cluster::init(cx);
@@ -39,11 +57,9 @@ fn main() {
             );
 
             use gpui_kit::AppContext as _;
-            match gpui_kit::open_window(
-                gpui_kit::component::TitleBar::window_options(),
-                cx,
-                |window, cx| cx.new(|cx| ui::Workspace::new(window, cx)),
-            ) {
+            match gpui_kit::open_window(window_options(), cx, |window, cx| {
+                cx.new(|cx| ui::Workspace::new(window, cx))
+            }) {
                 Ok(_window) => {
                     tracing::info!("krusty: main window opened");
                 }
