@@ -1,0 +1,7 @@
+/target
+docs/PLAN.md
+*PLAN*.md
+*plan*.md
+__pycache__/
+*.pyc
+*.bak
