@@ -12,7 +12,10 @@ use gpui_kit::component::{
 };
 use gpui_kit::{Context, FontWeight, IntoElement, ParentElement as _, Styled as _, div, px};
 
-pub fn render_settings(cx: &Context<crate::ui::Workspace>) -> impl IntoElement {
+pub fn render_settings(
+    cx: &Context<crate::ui::Workspace>,
+    custom: gpui_kit::Entity<custom_resources::CustomResourcesView>,
+) -> impl IntoElement {
     let preference = cx.global::<AppearanceState>().preference();
     let selected = ThemePreference::ALL
         .iter()
@@ -103,11 +106,11 @@ pub fn render_settings(cx: &Context<crate::ui::Workspace>) -> impl IntoElement {
                                         .text_xs()
                                         .text_color(cx.theme().muted_foreground)
                                         .child(
-                                            "Add a resource kind served by a CRD so it appears \
-                                             in the sidebar.",
+                                            "Scan the cluster for CRDs or add a resource kind \
+                                             manually. Selected resources appear in the sidebar.",
                                         ),
                                 )
-                                .child(custom_resources::render_add_button(cx)),
+                                .child(custom),
                         ),
                 ),
             ),
