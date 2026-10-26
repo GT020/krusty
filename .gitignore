@@ -1,4 +1,9 @@
 /target
+/dist
+/.flatpak-builder
+/repo
+/build-dir
+/packaging/flatpak/cargo-sources.json
 __pycache__/
 *.pyc
 *.bak

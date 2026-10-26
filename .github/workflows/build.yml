@@ -1,0 +1,182 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+
+jobs:
+  linux:
+    name: Linux binary (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            pkg-config \
+            libfontconfig1-dev \
+            libfreetype6-dev \
+            libwayland-dev \
+            libx11-xcb-dev \
+            libxcb1-dev \
+            libxcb-render0-dev \
+            libxcb-shape0-dev \
+            libxcb-xfixes0-dev \
+            libxcb-randr0-dev \
+            libxcb-composite0-dev \
+            libxcb-damage0-dev \
+            libxcb-present-dev \
+            libxcb-xkb-dev \
+            libxkbcommon-dev \
+            libxkbcommon-x11-dev
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: ./scripts/package-linux.sh
+
+      - name: Upload Linux artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: krusty-linux-${{ matrix.arch }}
+          path: |
+            dist/*.tar.gz
+            dist/krusty-linux-${{ matrix.arch }}
+          if-no-files-found: error
+
+  flatpak:
+    name: Flatpak (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: x86_64
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Flatpak tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y flatpak flatpak-builder python3-venv
+
+      - name: Add Flathub
+        run: |
+          flatpak remote-add --user --if-not-exists flathub \
+            https://dl.flathub.org/repo/flathub.flatpakrepo
+
+      - name: Generate Cargo sources
+        run: |
+          python3 -m venv /tmp/flatpak-cargo
+          /tmp/flatpak-cargo/bin/pip install --quiet \
+            "aiohttp<4.0.0,>=3.9.5" \
+            "PyYAML<7.0.0,>=6.0.2" \
+            "tomlkit>=0.13.3,<1.0"
+          curl -fsSL \
+            https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py \
+            -o /tmp/flatpak-cargo-generator.py
+          /tmp/flatpak-cargo/bin/python /tmp/flatpak-cargo-generator.py Cargo.lock \
+            -o packaging/flatpak/cargo-sources.json
+
+      - name: Build Flatpak
+        run: |
+          VERSION="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n1)"
+          flatpak-builder --user --force-clean --disable-rofiles-fuse \
+            --install-deps-from=flathub \
+            --repo=repo --state-dir=.flatpak-builder build-dir \
+            packaging/flatpak/io.github.GT020.Krusty.yml
+          mkdir -p dist
+          flatpak build-bundle repo \
+            "dist/krusty-${VERSION}-linux-${{ matrix.arch }}.flatpak" \
+            io.github.GT020.Krusty
+
+      - name: Upload Flatpak
+        uses: actions/upload-artifact@v4
+        with:
+          name: krusty-flatpak-${{ matrix.arch }}
+          path: dist/*.flatpak
+          if-no-files-found: error
+
+  macos:
+    name: macOS DMG (arm64)
+    runs-on: macos-15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: arm64
+
+      - name: Build
+        run: cargo build --release --locked
+
+      - name: Package
+        run: ./scripts/package-macos.sh
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: krusty-macos-arm64
+          path: dist/*.dmg
+          if-no-files-found: error
+
+  release:
+    name: Upload release assets
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [linux, flatpak, macos]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          fail_on_unmatched_files: true
+          generate_release_notes: true
