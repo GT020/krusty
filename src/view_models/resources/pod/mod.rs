@@ -1,5 +1,8 @@
 //! ViewModel for Pods: subscription pump, table columns, and detail selection.
 
+pub mod exec;
+pub mod logs;
+
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 

@@ -2,10 +2,12 @@
 
 use std::collections::BTreeMap;
 
+use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, button::Button};
 use gpui_kit::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _, div,
+    AnyElement, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _,
+    Styled as _, div, px,
 };
 
 use crate::models::resources::pod::detail::{
@@ -16,6 +18,10 @@ use crate::ui::components::detail::{
     raw_manifest, section, usage_section,
 };
 use crate::ui::resources::pod::PodsView;
+use crate::ui::resources::pod::exec::PodExecView;
+use crate::ui::resources::pod::logs::PodLogsView;
+use crate::view_models::resources::pod::exec::PodExecViewModel;
+use crate::view_models::resources::pod::logs::PodLogsViewModel;
 
 pub fn render_detail(
     state: PodDetailState,
@@ -65,6 +71,7 @@ pub fn render_detail(
             let mut body = v_flex()
                 .gap_6()
                 .p_4()
+                .child(actions(&detail))
                 .child(overview(&detail, cx))
                 .child(usage_section(&usage, usage_error.as_deref(), "", cx))
                 .child(containers("Containers", &detail.containers, cx))
@@ -84,6 +91,93 @@ pub fn render_detail(
     };
 
     detail_shell(header, body, compact, cx)
+}
+
+fn actions(detail: &PodDetail) -> AnyElement {
+    let containers: Vec<String> = detail
+        .containers
+        .iter()
+        .map(|container| container.name.clone())
+        .collect();
+    let namespace = detail.namespace.clone();
+    let name = detail.name.clone();
+
+    let logs_namespace = namespace.clone();
+    let logs_name = name.clone();
+    let logs_containers = containers.clone();
+    let logs = Button::new("pod-open-logs")
+        .outline()
+        .small()
+        .icon(IconName::ScrollText)
+        .label("Logs")
+        .tooltip("Stream container logs")
+        .on_click(move |_, window, cx| {
+            let vm = cx.new(|cx| {
+                PodLogsViewModel::new(
+                    logs_namespace.clone(),
+                    logs_name.clone(),
+                    logs_containers.clone(),
+                    cx,
+                )
+            });
+            let sheet_vm = vm.clone();
+            let view = cx.new(|cx| PodLogsView::new(vm, cx));
+            let title = format!("Logs · {}", logs_name);
+            window.open_sheet(cx, move |sheet, _, _| {
+                let close_vm = sheet_vm.clone();
+                sheet
+                    .title(div().child(title.clone()))
+                    .size(px(820.))
+                    .on_close(move |_, _, cx| {
+                        close_vm.update(cx, |vm, _| vm.shutdown());
+                    })
+                    .child(view.clone())
+            });
+        });
+
+    let exec_namespace = namespace;
+    let exec_name = name.clone();
+    let exec_containers = containers;
+    let exec = Button::new("pod-open-exec")
+        .outline()
+        .small()
+        .icon(IconName::Terminal)
+        .label("Exec")
+        .tooltip("Open a shell in a container")
+        .on_click(move |_, window, cx| {
+            let container = exec_containers.first().cloned().unwrap_or_default();
+            let vm = cx.new(|cx| {
+                PodExecViewModel::new(
+                    exec_namespace.clone(),
+                    exec_name.clone(),
+                    exec_containers.clone(),
+                    container,
+                    "sh".to_string(),
+                    window,
+                    cx,
+                )
+            });
+            let sheet_vm = vm.clone();
+            let view = cx.new(|cx| PodExecView::new(vm, window, cx));
+            let title = format!("Exec · {}", exec_name);
+            window.open_sheet(cx, move |sheet, _, _| {
+                let close_vm = sheet_vm.clone();
+                sheet
+                    .title(div().child(title.clone()))
+                    .size(px(820.))
+                    .on_close(move |_, _, cx| {
+                        close_vm.update(cx, |vm, _| vm.shutdown());
+                    })
+                    .child(view.clone())
+            });
+        });
+
+    h_flex()
+        .gap_2()
+        .items_center()
+        .child(logs)
+        .child(exec)
+        .into_any_element()
 }
 
 fn overview(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {

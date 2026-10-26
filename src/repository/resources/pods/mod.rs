@@ -3,12 +3,14 @@
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
+use futures::{AsyncBufReadExt, SinkExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
     Container, ContainerState, ContainerStatus, EnvVar, Pod, PodStatus, Toleration, Volume,
 };
-use kube::api::{Api, DynamicObject};
+use kube::api::{Api, AttachParams, DynamicObject, LogParams, TerminalSize};
 use kube::core::{ApiResource, GroupVersionKind};
 use kube::{Client, ResourceExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
 use crate::cluster::ClusterState;
@@ -48,6 +50,320 @@ impl PodDetailSubscription {
 impl Drop for PodDetailSubscription {
     fn drop(&mut self) {
         let _ = self.cancel.send(true);
+    }
+}
+
+/// A live log stream for one pod container. Dropping it cancels the stream.
+pub struct PodLogStream {
+    updates: mpsc::UnboundedReceiver<Result<String, String>>,
+    cancel: watch::Sender<bool>,
+}
+
+impl PodLogStream {
+    pub async fn next(&mut self) -> Option<Result<String, String>> {
+        self.updates.recv().await
+    }
+
+    pub fn cancel_handle(&self) -> watch::Sender<bool> {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for PodLogStream {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
+/// Stream logs for a pod container. `follow` keeps streaming new lines.
+pub fn subscribe_logs(
+    cx: &mut App,
+    namespace: &str,
+    name: &str,
+    container: &str,
+    follow: bool,
+) -> Result<PodLogStream, String> {
+    if container.is_empty() {
+        return Err("This pod has no containers to read logs from.".to_string());
+    }
+    let state = cx.global::<ClusterState>();
+    let client = state.client().ok_or_else(|| "not connected".to_string())?;
+    let tokio = state.tokio();
+    let (updates_tx, updates) = mpsc::unbounded_channel();
+    let (cancel, cancel_rx) = watch::channel(false);
+    tokio.spawn(watch_logs(
+        client,
+        namespace.to_string(),
+        name.to_string(),
+        container.to_string(),
+        follow,
+        updates_tx,
+        cancel_rx,
+    ));
+    Ok(PodLogStream { updates, cancel })
+}
+
+async fn watch_logs(
+    client: Client,
+    namespace: String,
+    name: String,
+    container: String,
+    follow: bool,
+    updates: mpsc::UnboundedSender<Result<String, String>>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let api: Api<Pod> = Api::namespaced(client, &namespace);
+    let params = LogParams {
+        container: Some(container),
+        follow,
+        tail_lines: Some(2_000),
+        ..LogParams::default()
+    };
+    let stream = tokio::select! {
+        _ = cancel.changed() => return,
+        result = api.log_stream(&name, &params) => result,
+    };
+    let stream = match stream {
+        Ok(stream) => stream,
+        Err(error) => {
+            let _ = updates.send(Err(format!("Could not stream logs: {error}")));
+            return;
+        }
+    };
+    let mut lines = stream.lines();
+    loop {
+        tokio::select! {
+            _ = cancel.changed() => return,
+            line = lines.try_next() => {
+                match line {
+                    Ok(Some(line)) => {
+                        if updates.send(Ok(line.trim_end_matches('\r').to_string())).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(None) => return,
+                    Err(error) => {
+                        let _ = updates.send(Err(format!("Log stream error: {error}")));
+                        return;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// An interactive TTY exec session for one pod container.
+pub struct PodExecSession {
+    updates: mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
+    input: mpsc::UnboundedSender<Vec<u8>>,
+    resize: mpsc::UnboundedSender<(u16, u16)>,
+    cancel: watch::Sender<bool>,
+}
+
+impl PodExecSession {
+    pub async fn next(&mut self) -> Option<Result<Vec<u8>, String>> {
+        self.updates.recv().await
+    }
+
+    /// Clone the input channel so the UI can keep sending after the session
+    /// itself has been moved into a background task.
+    pub fn input_handle(&self) -> mpsc::UnboundedSender<Vec<u8>> {
+        self.input.clone()
+    }
+
+    /// Notify the remote TTY about a new size in columns and rows.
+    pub fn resize_handle(&self) -> mpsc::UnboundedSender<(u16, u16)> {
+        self.resize.clone()
+    }
+
+    pub fn cancel_handle(&self) -> watch::Sender<bool> {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for PodExecSession {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
+/// Start an interactive TTY shell in a running pod container.
+pub fn exec_shell(
+    cx: &mut App,
+    namespace: &str,
+    name: &str,
+    container: &str,
+    shell: &str,
+) -> Result<PodExecSession, String> {
+    if container.is_empty() {
+        return Err("This pod has no containers to exec into.".to_string());
+    }
+    let state = cx.global::<ClusterState>();
+    let client = state.client().ok_or_else(|| "not connected".to_string())?;
+    let tokio = state.tokio();
+    let (updates_tx, updates) = mpsc::unbounded_channel();
+    let (input_tx, input_rx) = mpsc::unbounded_channel();
+    let (resize_tx, resize_rx) = mpsc::unbounded_channel();
+    let (cancel, cancel_rx) = watch::channel(false);
+    tokio.spawn(run_exec(
+        client,
+        namespace.to_string(),
+        name.to_string(),
+        container.to_string(),
+        shell.to_string(),
+        updates_tx,
+        input_rx,
+        resize_rx,
+        cancel_rx,
+    ));
+    Ok(PodExecSession {
+        updates,
+        input: input_tx,
+        resize: resize_tx,
+        cancel,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_exec(
+    client: Client,
+    namespace: String,
+    name: String,
+    container: String,
+    shell: String,
+    updates: mpsc::UnboundedSender<Result<Vec<u8>, String>>,
+    mut input: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut resize: mpsc::UnboundedReceiver<(u16, u16)>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let api: Api<Pod> = Api::namespaced(client, &namespace);
+    let params = AttachParams {
+        container: Some(container.clone()),
+        stdin: true,
+        stdout: true,
+        stderr: false,
+        tty: true,
+        ..AttachParams::default()
+    };
+    tracing::debug!(
+        namespace = %namespace,
+        pod = %name,
+        container = %container,
+        shell = %shell,
+        "pod exec: connecting"
+    );
+    let mut process = match api.exec(&name, [shell.as_str()], &params).await {
+        Ok(process) => process,
+        Err(error) => {
+            tracing::warn!(%error, pod = %name, container = %container, "pod exec: connect failed");
+            let _ = updates.send(Err(format!("Could not start exec session: {error}")));
+            return;
+        }
+    };
+    tracing::debug!(pod = %name, container = %container, "pod exec: connected");
+    let Some(mut stdin) = process.stdin() else {
+        let _ = updates.send(Err("Exec session has no stdin channel.".to_string()));
+        process.abort();
+        return;
+    };
+    let Some(stdout) = process.stdout() else {
+        let _ = updates.send(Err("Exec session has no stdout channel.".to_string()));
+        process.abort();
+        return;
+    };
+    let stderr = process.stderr();
+
+    let writer = tokio::spawn(async move {
+        while let Some(bytes) = input.recv().await {
+            if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
+                break;
+            }
+        }
+    });
+    let stdout_task = tokio::spawn(read_exec_output(stdout, updates.clone()));
+    let stderr_task = stderr.map(|stderr| tokio::spawn(read_exec_output(stderr, updates.clone())));
+
+    let mut resize_task = process.terminal_size().map(|size_sender| {
+        tokio::spawn(async move {
+            let mut size_sender = size_sender;
+            while let Some((cols, rows)) = resize.recv().await {
+                let size = TerminalSize {
+                    width: cols,
+                    height: rows,
+                };
+                if size_sender.send(size).await.is_err() {
+                    break;
+                }
+            }
+        })
+    });
+
+    let mut status_future = process.take_status();
+    let status = tokio::select! {
+        _ = cancel.changed() => {
+            process.abort();
+            writer.abort();
+            stdout_task.abort();
+            if let Some(task) = stderr_task { task.abort(); }
+            if let Some(task) = resize_task.take() { task.abort(); }
+            return;
+        }
+        status = async {
+            match status_future.take() {
+                Some(status) => status.await,
+                None => None,
+            }
+        } => status,
+    };
+    process.abort();
+    writer.abort();
+    stdout_task.abort();
+    if let Some(task) = stderr_task {
+        task.abort();
+    }
+    if let Some(task) = resize_task.take() {
+        task.abort();
+    }
+    match status {
+        Some(status) if status.status.as_deref() == Some("Success") => {
+            tracing::debug!(pod = %name, container = %container, "pod exec: session ended");
+            let _ = updates.send(Ok(b"\r\n[session ended]\r\n".to_vec()));
+        }
+        Some(status) => {
+            let message = status
+                .message
+                .as_deref()
+                .filter(|message| !message.is_empty())
+                .map(|message| format!("Exec session ended: {message}"))
+                .unwrap_or_else(|| "Exec session ended".to_string());
+            tracing::warn!(%message, pod = %name, container = %container, "pod exec: session failed");
+            let _ = updates.send(Err(message));
+        }
+        None => {
+            tracing::debug!(pod = %name, container = %container, "pod exec: session closed");
+            let _ = updates.send(Ok(b"\r\n[session closed]\r\n".to_vec()));
+        }
+    }
+}
+
+async fn read_exec_output<R>(mut reader: R, updates: mpsc::UnboundedSender<Result<Vec<u8>, String>>)
+where
+    R: AsyncRead + Unpin,
+{
+    let mut buffer = [0u8; 8192];
+    loop {
+        match reader.read(&mut buffer).await {
+            Ok(0) => return,
+            Ok(read) => {
+                if updates.send(Ok(buffer[..read].to_vec())).is_err() {
+                    return;
+                }
+            }
+            Err(error) => {
+                let _ = updates.send(Err(format!("Exec stream error: {error}")));
+                return;
+            }
+        }
     }
 }
 

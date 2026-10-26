@@ -1,6 +1,8 @@
 //! Pod workspace: list plus a detail pane that opens on row selection.
 
 mod detail;
+mod exec;
+mod logs;
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
