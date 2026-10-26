@@ -1,0 +1,6 @@
+[build]
+rustflags = ["-C", "link-arg=-L/home/gt/.local/lib"]
+
+[alias]
+# Auto-rebuild + restart on source changes (needs cargo-watch).
+dev = "watch -w src -w Cargo.toml -w Cargo.lock -w .cargo -x run"
