@@ -2,7 +2,7 @@
 
 A native Kubernetes desktop client written in Rust with [GPUI Kit](https://gpui-kit.com).
 
-![krusty showing the Nodes list with the node detail panel open](assets/screenshot-node-detail.png)
+![krusty showing the live Pods list](assets/screenshot-pods.png)
 
 ## What it does
 
