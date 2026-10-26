@@ -5,12 +5,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::px;
-use gpui_kit::{App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Styled as _, Window, div};
+use gpui_kit::{
+    App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Styled as _, Window,
+    div,
+};
 use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
-use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase};
 use crate::models::resources::persistent_volumes::PersistentVolumesModel;
+use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase};
 use crate::repository;
 
 pub struct PersistentVolumesViewModel {
@@ -33,7 +36,13 @@ impl PersistentVolumesViewModel {
         let active = Arc::new(AtomicBool::new(true));
         let model = cx.new(|_| PersistentVolumesModel::new());
         let table_model = model.clone();
-        let table = cx.new(|cx| TableState::new(PersistentVolumesViewModelTable { model: table_model }, _window, cx));
+        let table = cx.new(|cx| {
+            TableState::new(
+                PersistentVolumesViewModelTable { model: table_model },
+                _window,
+                cx,
+            )
+        });
         let cluster_sub = cx.observe_global::<ClusterState>(|this, cx| {
             let (scope, epoch) = {
                 let state = cx.global::<ClusterState>();
@@ -152,7 +161,9 @@ impl PersistentVolumesViewModel {
                     _ = cancel_rx.changed() => break,
                     snapshot = pump.next() => snapshot,
                 };
-                let Some(snapshot) = snapshot else { break; };
+                let Some(snapshot) = snapshot else {
+                    break;
+                };
                 let should_notify = active.load(Ordering::Relaxed);
                 let applied = model.update(cx, |model, cx| {
                     model.apply_snapshot(snapshot);
@@ -178,28 +189,33 @@ pub struct PersistentVolumesViewModelTable {
 
 fn columns() -> Vec<Column> {
     vec![
-        Column::new("name",     "Name").width(px(280.)),
-        Column::new("capacity", "Capacity").width(px(120.)).text_right(),
-        Column::new("status",   "Status").width(px(130.)),
-        Column::new("age",      "Age").width(px(90.)).text_right(),
+        Column::new("name", "Name").width(px(280.)),
+        Column::new("capacity", "Capacity")
+            .width(px(120.))
+            .text_right(),
+        Column::new("status", "Status").width(px(130.)),
+        Column::new("age", "Age").width(px(90.)).text_right(),
     ]
 }
 
 fn column_key(col_ix: usize) -> gpui_kit::SharedString {
-    columns().get(col_ix).map(|c| c.key.clone()).unwrap_or_default()
+    columns()
+        .get(col_ix)
+        .map(|c| c.key.clone())
+        .unwrap_or_default()
 }
 
 fn cell(item: &Item, key: &str) -> String {
     match key {
-        "name"      => item.name.clone(),
+        "name" => item.name.clone(),
         "namespace" => item.namespace.clone(),
-        "ready"     => item.ready.clone(),
-        "restarts"  => item.restarts.to_string(),
-        "capacity"  => item.capacity.clone(),
-        "version"   => item.version.clone(),
-        "status"    => item.status.clone(),
-        "age"       => item.age(),
-        _           => String::new(),
+        "ready" => item.ready.clone(),
+        "restarts" => item.restarts.to_string(),
+        "capacity" => item.capacity.clone(),
+        "version" => item.version.clone(),
+        "status" => item.status.clone(),
+        "age" => item.age(),
+        _ => String::new(),
     }
 }
 
@@ -213,7 +229,10 @@ impl TableDelegate for PersistentVolumesViewModelTable {
     }
 
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        columns().get(col_ix).cloned().unwrap_or_else(|| Column::new("empty", ""))
+        columns()
+            .get(col_ix)
+            .cloned()
+            .unwrap_or_else(|| Column::new("empty", ""))
     }
 
     fn render_td(

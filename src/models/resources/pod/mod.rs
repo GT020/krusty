@@ -129,8 +129,8 @@ impl Default for PodsModel {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use self::detail::{PodDetail, PodDetailUpdate, PodUsage};
+    use super::*;
 
     fn usage(at: i64) -> PodUsage {
         PodUsage {

@@ -193,20 +193,21 @@ impl PodsViewModel {
             model.begin_detail(namespace.clone(), name.clone());
             cx.notify();
         });
-        let mut detail_sub = match repository::resources::pods::subscribe_detail(cx, &namespace, &name) {
-            Ok(subscription) => subscription,
-            Err(error) => {
-                self.model.update(cx, |model, cx| {
-                    model.apply_update(PodDetailUpdate::Detail {
-                        namespace,
-                        name,
-                        result: Err(format!("Could not open pod details: {error}")),
+        let mut detail_sub =
+            match repository::resources::pods::subscribe_detail(cx, &namespace, &name) {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    self.model.update(cx, |model, cx| {
+                        model.apply_update(PodDetailUpdate::Detail {
+                            namespace,
+                            name,
+                            result: Err(format!("Could not open pod details: {error}")),
+                        });
+                        cx.notify();
                     });
-                    cx.notify();
-                });
-                return;
-            }
-        };
+                    return;
+                }
+            };
         self.detail_cancel = Some(detail_sub.cancel_handle());
         let model = self.model.downgrade();
         cx.spawn(async move |_, cx: &mut gpui_kit::AsyncApp| {

@@ -1,7 +1,7 @@
 //! Model for JobsModel: holds the latest immutable snapshot.
 
-use std::sync::Arc;
 use crate::models::{ResourceKind, ResourceSnapshot, SnapshotPhase};
+use std::sync::Arc;
 
 pub struct JobsModel {
     snapshot: Arc<ResourceSnapshot>,

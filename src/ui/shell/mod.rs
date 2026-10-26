@@ -6,14 +6,14 @@ pub mod status_bar;
 
 use crate::cluster::ClusterState;
 use crate::models::{NamespaceScope, ResourceKind};
-use crate::ui::shell::nav::NavTarget;
+use crate::ui::resources::list::ResourceListView;
 use crate::ui::resources::node::NodesView;
 use crate::ui::resources::pod::PodsView;
-use crate::ui::resources::list::ResourceListView;
 use crate::ui::settings::render_settings;
+use crate::ui::settings::theme::{self, AppearanceState};
+use crate::ui::shell::nav::NavTarget;
 use crate::ui::shell::sidebar::render_sidebar;
 use crate::ui::shell::status_bar::render_status_bar;
-use crate::ui::settings::theme::{self, AppearanceState};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
 use gpui_kit::component::{
@@ -35,6 +35,7 @@ pub struct Workspace {
     _appearance_subscription: gpui_kit::Subscription,
     _activation_subscription: gpui_kit::Subscription,
     _preference_subscription: gpui_kit::Subscription,
+    _custom_resources_subscription: gpui_kit::Subscription,
 }
 
 impl Workspace {
@@ -52,6 +53,10 @@ impl Workspace {
             }
         });
         let preference_subscription = cx.observe_global::<AppearanceState>(|_, cx| cx.notify());
+        let custom_resources_subscription =
+            cx.observe_global::<crate::ui::settings::custom_resources::CustomResourcesState>(
+                |_, cx| cx.notify(),
+            );
         let panels = BTreeMap::new();
         let pods = Some(cx.new(|cx| PodsView::new(window, cx)));
         tracing::info!(
@@ -67,6 +72,7 @@ impl Workspace {
             _appearance_subscription: appearance_subscription,
             _activation_subscription: activation_subscription,
             _preference_subscription: preference_subscription,
+            _custom_resources_subscription: custom_resources_subscription,
         }
     }
 

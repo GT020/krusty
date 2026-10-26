@@ -1,17 +1,34 @@
 //! Repository streams for Kubernetes resources.
 
+pub mod cluster_roles;
 pub mod config_maps;
+pub mod cron_jobs;
 pub mod daemon_sets;
 pub mod deployments;
 pub mod detail;
+pub mod endpoint_slices;
+pub mod endpoints;
+pub mod events;
+pub mod horizontal_pod_autoscalers;
 pub mod ingresses;
 pub mod jobs;
+pub mod leases;
+pub mod namespaces;
+pub mod network_policies;
 pub mod nodes;
 pub mod persistent_volume_claims;
 pub mod persistent_volumes;
+pub mod pod_disruption_budgets;
 pub mod pods;
+pub mod replica_sets;
+pub mod replication_controllers;
+pub mod role_bindings;
+pub mod roles;
 pub mod secrets;
+pub mod service_accounts;
 pub mod services;
+pub mod stateful_sets;
+pub mod storage_classes;
 pub mod watcher;
 
 pub use watcher::namespace_names;

@@ -191,10 +191,12 @@ impl NodesViewModel {
             Ok(subscription) => subscription,
             Err(error) => {
                 self.model.update(cx, |model, cx| {
-                    model.apply_update(crate::models::resources::node::detail::NodeDetailUpdate::Detail {
-                        node,
-                        result: Err(format!("Could not open node details: {error}")),
-                    });
+                    model.apply_update(
+                        crate::models::resources::node::detail::NodeDetailUpdate::Detail {
+                            node,
+                            result: Err(format!("Could not open node details: {error}")),
+                        },
+                    );
                     cx.notify();
                 });
                 return;

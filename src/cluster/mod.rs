@@ -1,12 +1,12 @@
 pub mod kubeconfig;
 
 use crate::models::NamespaceScope;
+use futures::TryStreamExt as _;
 use gpui_kit::{App, BorrowAppContext as _, Global};
 use k8s_openapi::api::core::v1::Namespace;
-use futures::TryStreamExt as _;
 use kube::api::{ListParams, WatchEvent, WatchParams};
-use tokio::sync::watch;
 use kube::{Api, Client, Config};
+use tokio::sync::watch;
 
 /// One selectable cluster context: a kubectl context or a cluster added to krusty.
 #[derive(Clone)]
