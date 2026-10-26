@@ -1,14 +1,8 @@
-//! UI layer: declarative views + shell composition. No domain logic.
+//! UI layer: declarative views, shared components, and shell composition.
 
-pub mod detail;
-pub mod nav;
-pub mod pod;
-pub mod node;
-pub mod resource_list;
+pub mod components;
+pub mod resources;
 pub mod settings;
 pub mod shell;
-pub mod sidebar;
-pub mod status_bar;
-pub mod theme;
 
 pub use shell::Workspace;

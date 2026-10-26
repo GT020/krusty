@@ -1,20 +1,9 @@
 //! Repository layer: owns Kubernetes list/watch I/O and publishes immutable
 //! snapshots. UI threads never perform network I/O or mutate the store.
 
-pub mod config_maps;
-pub mod daemon_sets;
-pub mod deployments;
-pub mod ingresses;
-pub mod jobs;
-pub mod nodes;
-pub mod persistent_volume_claims;
-pub mod persistent_volumes;
-pub mod pods;
-pub mod secrets;
-pub mod services;
-mod watcher;
+pub mod resources;
 
-pub use watcher::namespace_names;
+pub use resources::namespace_names;
 
 use std::collections::HashMap;
 use std::sync::{Arc, Weak};
@@ -126,7 +115,7 @@ pub(crate) fn subscribe_kind(
             _cancel: cancel,
             refresh,
         });
-        let watch_task = watcher::run(client, kind, scope, snapshots, cancel_rx, refresh_rx);
+        let watch_task = resources::watcher::run(client, kind, scope, snapshots, cancel_rx, refresh_rx);
         tokio.spawn(watch_task);
         repository.entries.insert(key, Arc::downgrade(&entry));
         Subscription { rx, _entry: entry }
