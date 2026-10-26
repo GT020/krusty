@@ -168,14 +168,13 @@ impl ResourceKind {
                 ],
             ),
         ];
-        let custom = custom_resources();
+        let custom = custom_resource_entries();
         if !custom.is_empty() {
             groups.push((
                 "Custom",
                 custom
-                    .iter()
-                    .enumerate()
-                    .map(|(index, _)| ResourceKind::Custom(index as u16))
+                    .into_iter()
+                    .map(|(index, _)| ResourceKind::Custom(index))
                     .collect(),
             ));
         }
@@ -206,16 +205,31 @@ pub struct CustomResourceDef {
     pub namespaced: bool,
 }
 
-static CUSTOM_RESOURCES: OnceLock<Mutex<Vec<&'static CustomResourceDef>>> = OnceLock::new();
+/// Deleted definitions leave an empty slot so existing `ResourceKind::Custom`
+/// indices remain stable for the lifetime of the process.
+static CUSTOM_RESOURCES: OnceLock<Mutex<Vec<Option<&'static CustomResourceDef>>>> = OnceLock::new();
 
-fn registry() -> &'static Mutex<Vec<&'static CustomResourceDef>> {
+fn registry() -> &'static Mutex<Vec<Option<&'static CustomResourceDef>>> {
     CUSTOM_RESOURCES.get_or_init(|| Mutex::new(Vec::new()))
 }
 
 pub fn custom_resources() -> Vec<&'static CustomResourceDef> {
     registry()
         .lock()
-        .map(|defs| defs.clone())
+        .map(|defs| defs.iter().copied().flatten().collect())
+        .unwrap_or_default()
+}
+
+/// Definitions paired with their stable index, excluding deleted entries.
+pub fn custom_resource_entries() -> Vec<(u16, &'static CustomResourceDef)> {
+    registry()
+        .lock()
+        .map(|defs| {
+            defs.iter()
+                .enumerate()
+                .filter_map(|(index, def)| def.map(|def| (index as u16, def)))
+                .collect()
+        })
         .unwrap_or_default()
 }
 
@@ -223,7 +237,31 @@ pub fn custom_def(index: u16) -> Option<&'static CustomResourceDef> {
     registry()
         .lock()
         .ok()
-        .and_then(|defs| defs.get(index as usize).copied())
+        .and_then(|defs| defs.get(index as usize).copied().flatten())
+}
+
+/// Replace a previously registered custom resource definition in place while
+/// keeping its `ResourceKind::Custom` index stable.
+pub fn update_custom_resource(index: u16, def: CustomResourceDef) -> Option<ResourceKind> {
+    let mut defs = registry().lock().ok()?;
+    defs.get(index as usize).and_then(|def| *def)?;
+    let def: &'static CustomResourceDef = Box::leak(Box::new(def));
+    defs[index as usize] = Some(def);
+    Some(ResourceKind::Custom(index))
+}
+
+/// Remove a definition while keeping its index reserved.
+pub fn delete_custom_resource(index: u16) -> bool {
+    let Ok(mut defs) = registry().lock() else {
+        return false;
+    };
+    match defs.get_mut(index as usize) {
+        Some(slot @ Some(_)) => {
+            *slot = None;
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Register a custom resource definition. Definitions are kept in insertion
@@ -234,13 +272,15 @@ pub fn add_custom_resource(def: CustomResourceDef) -> ResourceKind {
         return ResourceKind::Custom(0);
     };
     if let Some(index) = defs.iter().position(|existing| {
-        existing.group == def.group
-            && existing.version == def.version
-            && existing.plural == def.plural
+        existing.is_some_and(|existing| {
+            existing.group == def.group
+                && existing.version == def.version
+                && existing.plural == def.plural
+        })
     }) {
         return ResourceKind::Custom(index as u16);
     }
     let def: &'static CustomResourceDef = Box::leak(Box::new(def));
-    defs.push(def);
+    defs.push(Some(def));
     ResourceKind::Custom((defs.len() - 1) as u16)
 }

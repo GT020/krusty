@@ -9,6 +9,7 @@ use crate::models::{NamespaceScope, ResourceKind};
 use crate::ui::resources::list::ResourceListView;
 use crate::ui::resources::node::NodesView;
 use crate::ui::resources::pod::PodsView;
+use crate::ui::settings::custom_resources::CustomResourcesView;
 use crate::ui::settings::render_settings;
 use crate::ui::settings::theme::{self, AppearanceState};
 use crate::ui::shell::nav::NavTarget;
@@ -31,6 +32,7 @@ pub struct Workspace {
     panels: BTreeMap<ResourceKind, Entity<ResourceListView>>,
     pods: Option<Entity<PodsView>>,
     nodes: Option<Entity<NodesView>>,
+    custom_resources: Entity<CustomResourcesView>,
     _cluster_subscription: gpui_kit::Subscription,
     _appearance_subscription: gpui_kit::Subscription,
     _activation_subscription: gpui_kit::Subscription,
@@ -53,9 +55,14 @@ impl Workspace {
             }
         });
         let preference_subscription = cx.observe_global::<AppearanceState>(|_, cx| cx.notify());
+        let custom_resources = cx.new(|_| CustomResourcesView::new());
         let custom_resources_subscription =
             cx.observe_global::<crate::ui::settings::custom_resources::CustomResourcesState>(
-                |_, cx| cx.notify(),
+                |this, cx| {
+                    this.panels
+                        .retain(|kind, _| !matches!(kind, ResourceKind::Custom(_)));
+                    cx.notify();
+                },
             );
         let panels = BTreeMap::new();
         let pods = Some(cx.new(|cx| PodsView::new(window, cx)));
@@ -68,6 +75,7 @@ impl Workspace {
             panels,
             pods,
             nodes: None,
+            custom_resources,
             _cluster_subscription: cluster_subscription,
             _appearance_subscription: appearance_subscription,
             _activation_subscription: activation_subscription,
@@ -148,7 +156,9 @@ impl Workspace {
                 .cloned()
                 .expect("selected panel exists")
                 .into_any_element(),
-            NavTarget::Settings => render_settings(cx).into_any_element(),
+            NavTarget::Settings => {
+                render_settings(cx, self.custom_resources.clone()).into_any_element()
+            }
         }
     }
 }
