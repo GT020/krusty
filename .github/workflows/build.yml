@@ -115,16 +115,8 @@ jobs:
           if-no-files-found: error
 
   macos:
-    name: macOS DMG (${{ matrix.arch }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            arch: arm64
-          - runner: macos-15-intel
-            arch: x86_64
+    name: macOS DMG (arm64)
+    runs-on: macos-15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -135,7 +127,7 @@ jobs:
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
         with:
-          key: ${{ matrix.arch }}
+          key: arm64
 
       - name: Build
         run: cargo build --release --locked
@@ -146,7 +138,7 @@ jobs:
       - name: Upload DMG
         uses: actions/upload-artifact@v4
         with:
-          name: krusty-macos-${{ matrix.arch }}
+          name: krusty-macos-arm64
           path: dist/*.dmg
           if-no-files-found: error
 
