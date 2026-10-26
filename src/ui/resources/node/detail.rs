@@ -6,7 +6,9 @@ use gpui_kit::{
     AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _, div,
 };
 
-use crate::models::resources::node::detail::{NodeDetail, NodeDetailState, UsageHistory};
+use crate::models::resources::node::detail::{
+    NodeCondition, NodeDetail, NodeDetailState, UsageHistory,
+};
 use crate::ui::components::detail::{
     age, detail_header, detail_shell, empty_row, error_body, field, key_values, loading_body,
     raw_manifest, section, usage_section, value_pair,
@@ -85,7 +87,16 @@ fn overview(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
     let mut body = v_flex();
     body = body
         .child(field("Name", &detail.name, cx))
-        .child(field("Status", detail.status_label(), cx))
+        .child(colored_field(
+            "Status",
+            detail.status_label(),
+            if detail.is_ready() {
+                cx.theme().success
+            } else {
+                cx.theme().danger
+            },
+            cx,
+        ))
         .child(field("Roles", &detail.roles_label(), cx))
         .child(field("Age", &age(detail.created_at), cx))
         .child(field("UID", &detail.uid, cx))
@@ -151,11 +162,7 @@ fn conditions(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
         body = body.child(empty_row("No conditions reported", cx));
     }
     for condition in &detail.conditions {
-        let status_color = if condition.status == "True" {
-            cx.theme().success
-        } else {
-            cx.theme().muted_foreground
-        };
+        let status_color = condition_color(condition, cx);
         let mut block = v_flex()
             .w_full()
             .min_w_0()
@@ -214,6 +221,52 @@ fn conditions(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
         body = body.child(block);
     }
     section("Conditions", body, cx)
+}
+
+fn condition_color(condition: &NodeCondition, cx: &Context<NodesView>) -> gpui_kit::Hsla {
+    let negative = matches!(
+        condition.type_.as_str(),
+        "MemoryPressure" | "DiskPressure" | "PIDPressure" | "NetworkUnavailable"
+    );
+    match condition.status.as_str() {
+        "True" if negative => cx.theme().danger,
+        "True" => cx.theme().success,
+        "False" if condition.type_ == "Ready" => cx.theme().danger,
+        "False" if negative => cx.theme().success,
+        "Unknown" => cx.theme().warning,
+        _ => cx.theme().muted_foreground,
+    }
+}
+
+fn colored_field<T: 'static>(
+    label: &str,
+    value: &str,
+    color: gpui_kit::Hsla,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    v_flex()
+        .w_full()
+        .min_w_0()
+        .gap_1()
+        .py_1()
+        .border_b_1()
+        .border_color(cx.theme().border)
+        .child(
+            div()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(label.to_string()),
+        )
+        .child(
+            div()
+                .w_full()
+                .min_w_0()
+                .text_xs()
+                .whitespace_normal()
+                .text_color(color)
+                .child(value.to_string()),
+        )
+        .into_any_element()
 }
 
 fn system(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {

@@ -30,9 +30,6 @@ pub fn render_detail<T: 'static>(
     cx: &mut Context<T>,
 ) -> AnyElement {
     match kind {
-        ResourceKind::Deployments => {
-            deployments::detail::render(state, view, compact, close, cx)
-        }
         ResourceKind::DaemonSets => {
             daemon_sets::detail::render(state, view, compact, close, cx)
         }
