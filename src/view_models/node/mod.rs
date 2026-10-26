@@ -1,16 +1,20 @@
-//! ViewModel for Nodes: subscription pump + column definitions.
+//! ViewModel for Nodes: subscription pump, table columns, and detail selection.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use gpui_kit::component::table::{Column, TableDelegate, TableState};
+use gpui_kit::component::table::{Column, TableDelegate, TableEvent, TableState};
 use gpui_kit::px;
-use gpui_kit::{App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Styled as _, Window, div};
+use gpui_kit::{
+    App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Styled as _, Window,
+    div,
+};
 use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
+use crate::models::node::NodesModel;
+use crate::models::node::detail::{NodeDetailState, UsageHistory};
 use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase};
-use crate::models::nodes::NodesModel;
 use crate::repository;
 
 pub struct NodesViewModel {
@@ -21,8 +25,11 @@ pub struct NodesViewModel {
     table: Entity<TableState<NodesViewModelTable>>,
     subscription: Option<repository::Subscription>,
     pump_cancel: Option<watch::Sender<()>>,
+    detail_cancel: Option<watch::Sender<bool>>,
     #[allow(dead_code)] // held for its Drop side-effect: cancels the GPUI observer
     cluster_sub: gpui_kit::Subscription,
+    #[allow(dead_code)] // held for its Drop side-effect: unsubscribes the table events
+    table_sub: gpui_kit::Subscription,
 }
 
 impl NodesViewModel {
@@ -33,7 +40,15 @@ impl NodesViewModel {
         let active = Arc::new(AtomicBool::new(true));
         let model = cx.new(|_| NodesModel::new());
         let table_model = model.clone();
-        let table = cx.new(|cx| TableState::new(NodesViewModelTable { model: table_model }, _window, cx));
+        let table = cx.new(|cx| {
+            TableState::new(NodesViewModelTable { model: table_model }, _window, cx)
+                .row_selectable(true)
+        });
+        let table_sub = cx.subscribe(&table, |this, _, event: &TableEvent, cx| {
+            if let TableEvent::SelectRow(row) = event {
+                this.open_row(*row, cx);
+            }
+        });
         let cluster_sub = cx.observe_global::<ClusterState>(|this, cx| {
             let (scope, epoch) = {
                 let state = cx.global::<ClusterState>();
@@ -54,7 +69,9 @@ impl NodesViewModel {
             table,
             subscription: None,
             pump_cancel: None,
+            detail_cancel: None,
             cluster_sub,
+            table_sub,
         };
         this.subscribe(cx);
         this
@@ -81,6 +98,18 @@ impl NodesViewModel {
         self.model.read(cx).item_count()
     }
 
+    pub fn detail(&self, cx: &App) -> NodeDetailState {
+        self.model.read(cx).detail().clone()
+    }
+
+    pub fn usage(&self, cx: &App) -> UsageHistory {
+        self.model.read(cx).usage().clone()
+    }
+
+    pub fn usage_error(&self, cx: &App) -> Option<String> {
+        self.model.read(cx).usage_error().map(str::to_string)
+    }
+
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         let was_active = self.active.swap(active, Ordering::Relaxed);
         if was_active == active {
@@ -104,6 +133,79 @@ impl NodesViewModel {
         } else {
             self.subscribe(cx);
         }
+        if let Some(node) = self.current_detail_node(cx) {
+            self.start_detail(node, cx);
+        }
+    }
+
+    pub fn close_detail(&mut self, cx: &mut Context<Self>) {
+        self.cancel_detail();
+        self.model.update(cx, |model, cx| {
+            model.close_detail();
+            cx.notify();
+        });
+    }
+
+    fn current_detail_node(&self, cx: &App) -> Option<String> {
+        self.model.read(cx).detail().node().map(str::to_string)
+    }
+
+    fn cancel_detail(&mut self) {
+        if let Some(cancel) = self.detail_cancel.take() {
+            let _ = cancel.send(true);
+        }
+    }
+
+    fn open_row(&mut self, row: usize, cx: &mut Context<Self>) {
+        let name = {
+            let model = self.model.read(cx);
+            model
+                .snapshot()
+                .items()
+                .get(row)
+                .map(|item| item.name.clone())
+        };
+        let Some(name) = name else { return };
+        if self.current_detail_node(cx).as_deref() == Some(name.as_str()) {
+            return;
+        }
+        self.start_detail(name, cx);
+    }
+
+    fn start_detail(&mut self, node: String, cx: &mut Context<Self>) {
+        self.cancel_detail();
+        self.model.update(cx, |model, cx| {
+            model.begin_detail(node.clone());
+            cx.notify();
+        });
+        let mut detail_sub = match repository::nodes::subscribe_detail(cx, &node) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                self.model.update(cx, |model, cx| {
+                    model.apply_update(crate::models::node::detail::NodeDetailUpdate::Detail {
+                        node,
+                        result: Err(format!("Could not open node details: {error}")),
+                    });
+                    cx.notify();
+                });
+                return;
+            }
+        };
+        self.detail_cancel = Some(detail_sub.cancel_handle());
+        let model = self.model.downgrade();
+        cx.spawn(async move |_, cx| {
+            while let Some(update) = detail_sub.next().await {
+                let applied = model.update(cx, |model, cx| {
+                    if model.apply_update(update) {
+                        cx.notify();
+                    }
+                });
+                if applied.is_err() {
+                    break;
+                }
+            }
+        })
+        .detach();
     }
 
     fn cancel_pump(&mut self) {
@@ -113,6 +215,8 @@ impl NodesViewModel {
 
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
+        self.cancel_detail();
+        self.model.update(cx, |model, _| model.close_detail());
         let subscription = match repository::nodes::subscribe(cx) {
             Ok(s) => s,
             Err(error) => {
@@ -143,7 +247,9 @@ impl NodesViewModel {
                     _ = cancel_rx.changed() => break,
                     snapshot = pump.next() => snapshot,
                 };
-                let Some(snapshot) = snapshot else { break; };
+                let Some(snapshot) = snapshot else {
+                    break;
+                };
                 let should_notify = active.load(Ordering::Relaxed);
                 let applied = model.update(cx, |model, cx| {
                     model.apply_snapshot(snapshot);
@@ -169,29 +275,32 @@ pub struct NodesViewModelTable {
 
 fn columns() -> Vec<Column> {
     vec![
-        Column::new("name",     "Name").width(px(220.)),
-        Column::new("status",   "Status").width(px(110.)),
-        Column::new("version",  "Version").width(px(130.)),
+        Column::new("name", "Name").width(px(220.)),
+        Column::new("status", "Status").width(px(110.)),
+        Column::new("version", "Version").width(px(130.)),
         Column::new("capacity", "CPU").width(px(90.)).text_right(),
-        Column::new("age",      "Age").width(px(90.)).text_right(),
+        Column::new("age", "Age").width(px(90.)).text_right(),
     ]
 }
 
 fn column_key(col_ix: usize) -> gpui_kit::SharedString {
-    columns().get(col_ix).map(|c| c.key.clone()).unwrap_or_default()
+    columns()
+        .get(col_ix)
+        .map(|c| c.key.clone())
+        .unwrap_or_default()
 }
 
 fn cell(item: &Item, key: &str) -> String {
     match key {
-        "name"      => item.name.clone(),
+        "name" => item.name.clone(),
         "namespace" => item.namespace.clone(),
-        "ready"     => item.ready.clone(),
-        "restarts"  => item.restarts.to_string(),
-        "capacity"  => item.capacity.clone(),
-        "version"   => item.version.clone(),
-        "status"    => item.status.clone(),
-        "age"       => item.age(),
-        _           => String::new(),
+        "ready" => item.ready.clone(),
+        "restarts" => item.restarts.to_string(),
+        "capacity" => item.capacity.clone(),
+        "version" => item.version.clone(),
+        "status" => item.status.clone(),
+        "age" => item.age(),
+        _ => String::new(),
     }
 }
 
@@ -205,7 +314,10 @@ impl TableDelegate for NodesViewModelTable {
     }
 
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        columns().get(col_ix).cloned().unwrap_or_else(|| Column::new("empty", ""))
+        columns()
+            .get(col_ix)
+            .cloned()
+            .unwrap_or_else(|| Column::new("empty", ""))
     }
 
     fn render_td(

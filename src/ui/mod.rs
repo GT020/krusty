@@ -1,6 +1,7 @@
 //! UI layer: declarative views + shell composition. No domain logic.
 
 pub mod nav;
+pub mod node;
 pub mod resource_list;
 pub mod settings;
 pub mod shell;

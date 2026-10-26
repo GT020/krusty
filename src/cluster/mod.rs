@@ -247,23 +247,23 @@ async fn run_namespace_watcher(
 
             match event {
                 Ok(Some(WatchEvent::Added(ns))) => {
-                    if let Some(name) = ns.metadata.name {
-                        if !names.contains(&name) {
-                            names.push(name);
-                            names.sort_unstable();
-                            let _ = tx.send(names.clone());
-                        }
+                    if let Some(name) = ns.metadata.name
+                        && !names.contains(&name)
+                    {
+                        names.push(name);
+                        names.sort_unstable();
+                        let _ = tx.send(names.clone());
                     }
                     if let Some(version) = ns.metadata.resource_version {
                         resource_version = version;
                     }
                 }
                 Ok(Some(WatchEvent::Deleted(ns))) => {
-                    if let Some(name) = ns.metadata.name {
-                        if let Some(idx) = names.iter().position(|n| n == &name) {
-                            names.remove(idx);
-                            let _ = tx.send(names.clone());
-                        }
+                    if let Some(name) = ns.metadata.name
+                        && let Some(idx) = names.iter().position(|n| n == &name)
+                    {
+                        names.remove(idx);
+                        let _ = tx.send(names.clone());
                     }
                     if let Some(version) = ns.metadata.resource_version {
                         resource_version = version;
@@ -316,10 +316,10 @@ pub fn refresh_namespaces(cx: &mut App) {
             cx.update_global::<ClusterState, _>(|state, _| {
                 state.namespaces = names.clone();
                 state.reachable = Some(true);
-                if let NamespaceScope::One(ref selected) = state.scope {
-                    if !names.contains(selected) {
-                        state.scope = NamespaceScope::All;
-                    }
+                if let NamespaceScope::One(ref selected) = state.scope
+                    && !names.contains(selected)
+                {
+                    state.scope = NamespaceScope::All;
                 }
             });
         }
