@@ -2,6 +2,7 @@
 
 use crate::models::{ResourceKind, SnapshotPhase};
 use crate::view_models::ResourceViewModel;
+use crate::view_models::resources::deployments::DeploymentsDetailViewModel;
 use crate::view_models::resources::detail::ResourceDetailViewModel;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
@@ -34,6 +35,7 @@ pub struct ResourceListView {
     title: SharedString,
     vm: ResourceViewModel,
     detail: gpui_kit::Entity<ResourceDetailViewModel>,
+    deployment_actions: gpui_kit::Entity<DeploymentsDetailViewModel>,
     _vm_sub: Subscription,
     _detail_sub: Subscription,
     _row_sub: Subscription,
@@ -44,6 +46,7 @@ impl ResourceListView {
         let vm = ResourceViewModel::new(kind, window, cx);
         let vm_sub = vm.observe(cx, |_, cx| cx.notify());
         let detail = cx.new(ResourceDetailViewModel::new);
+        let deployment_actions = cx.new(|_| DeploymentsDetailViewModel::new(detail.downgrade()));
         let detail_sub = cx.observe(&detail, |_, _, cx| cx.notify());
         let detail_handle = detail.clone();
         let row_sub = vm.observe_row_selected(cx, move |this, row, cx| {
@@ -59,6 +62,7 @@ impl ResourceListView {
             title: kind.label().into(),
             vm,
             detail,
+            deployment_actions,
             _vm_sub: vm_sub,
             _detail_sub: detail_sub,
             _row_sub: row_sub,
@@ -159,14 +163,25 @@ impl Render for ResourceListView {
 
         let viewport_width = window.viewport_size().width.as_f32();
         let split = viewport_width >= SPLIT_MIN_VIEWPORT_WIDTH;
-        let detail = crate::ui::resources::render_detail(
-            self.kind,
-            detail_state,
-            cx.entity().clone(),
-            !split,
-            ResourceListView::close_detail,
-            cx,
-        );
+        let detail = if self.kind == ResourceKind::Deployments {
+            crate::ui::resources::deployments::detail::render(
+                detail_state,
+                self.deployment_actions.clone(),
+                cx.entity().clone(),
+                !split,
+                ResourceListView::close_detail,
+                cx,
+            )
+        } else {
+            crate::ui::resources::render_detail(
+                self.kind,
+                detail_state,
+                cx.entity().clone(),
+                !split,
+                ResourceListView::close_detail,
+                cx,
+            )
+        };
 
         if !split {
             return v_flex()
