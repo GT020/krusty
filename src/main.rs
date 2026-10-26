@@ -48,6 +48,7 @@ fn main() {
             );
 
             ui::settings::theme::init(cx);
+            ui::settings::custom_resources::init(cx);
             repository::init(cx);
             let cluster_started = std::time::Instant::now();
             cluster::init(cx);

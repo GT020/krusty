@@ -9,14 +9,21 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::TryStreamExt as _;
-use k8s_openapi::api::apps::v1::{DaemonSet, Deployment};
-use k8s_openapi::api::batch::v1::Job;
+use k8s_openapi::api::apps::v1::{DaemonSet, Deployment, ReplicaSet, StatefulSet};
+use k8s_openapi::api::autoscaling::v2::HorizontalPodAutoscaler;
+use k8s_openapi::api::batch::v1::{CronJob, Job};
+use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{
-    ConfigMap, Namespace, Node, PersistentVolume, PersistentVolumeClaim, Pod, Secret, Service,
+    ConfigMap, Endpoints, Event, Namespace, Node, PersistentVolume, PersistentVolumeClaim, Pod,
+    ReplicationController, Secret, Service, ServiceAccount,
 };
-use k8s_openapi::api::networking::v1::Ingress;
-use kube::api::{Api, ListParams, ResourceExt, WatchEvent, WatchParams};
-use kube::core::NamespaceResourceScope;
+use k8s_openapi::api::discovery::v1::EndpointSlice;
+use k8s_openapi::api::networking::v1::{Ingress, NetworkPolicy};
+use k8s_openapi::api::policy::v1::PodDisruptionBudget;
+use k8s_openapi::api::rbac::v1::{ClusterRole, Role, RoleBinding};
+use k8s_openapi::api::storage::v1::StorageClass;
+use kube::api::{Api, DynamicObject, ListParams, ResourceExt, WatchEvent, WatchParams};
+use kube::core::{ApiResource, GroupVersionKind, NamespaceResourceScope};
 use kube::{Client, Resource};
 use serde::de::DeserializeOwned;
 use tokio::sync::watch;
@@ -52,15 +59,55 @@ pub async fn run(
             task.run_namespaced::<Deployment, _>(scope, deployment_item)
                 .await
         }
+        ResourceKind::StatefulSets => {
+            task.run_namespaced::<StatefulSet, _>(scope, stateful_set_item)
+                .await
+        }
+        ResourceKind::ReplicaSets => {
+            task.run_namespaced::<ReplicaSet, _>(scope, replica_set_item)
+                .await
+        }
+        ResourceKind::ReplicationControllers => {
+            task.run_namespaced::<ReplicationController, _>(scope, replication_controller_item)
+                .await
+        }
         ResourceKind::DaemonSets => {
             task.run_namespaced::<DaemonSet, _>(scope, daemon_set_item)
                 .await
         }
         ResourceKind::Jobs => task.run_namespaced::<Job, _>(scope, job_item).await,
+        ResourceKind::CronJobs => {
+            task.run_namespaced::<CronJob, _>(scope, cron_job_item)
+                .await
+        }
+        ResourceKind::HorizontalPodAutoscalers => {
+            task.run_namespaced::<HorizontalPodAutoscaler, _>(scope, horizontal_pod_autoscaler_item)
+                .await
+        }
+        ResourceKind::PodDisruptionBudgets => {
+            task.run_namespaced::<PodDisruptionBudget, _>(scope, pod_disruption_budget_item)
+                .await
+        }
         ResourceKind::Services => task.run_namespaced::<Service, _>(scope, service_item).await,
         ResourceKind::Ingresses => task.run_namespaced::<Ingress, _>(scope, ingress_item).await,
+        ResourceKind::Endpoints => {
+            task.run_namespaced::<Endpoints, _>(scope, endpoints_item)
+                .await
+        }
+        ResourceKind::EndpointSlices => {
+            task.run_namespaced::<EndpointSlice, _>(scope, endpoint_slice_item)
+                .await
+        }
+        ResourceKind::NetworkPolicies => {
+            task.run_namespaced::<NetworkPolicy, _>(scope, network_policy_item)
+                .await
+        }
         ResourceKind::PersistentVolumeClaims => {
             task.run_namespaced::<PersistentVolumeClaim, _>(scope, pvc_item)
+                .await
+        }
+        ResourceKind::StorageClasses => {
+            task.run_cluster::<StorageClass, _>(storage_class_item)
                 .await
         }
         ResourceKind::ConfigMaps => {
@@ -68,8 +115,30 @@ pub async fn run(
                 .await
         }
         ResourceKind::Secrets => task.run_namespaced::<Secret, _>(scope, secret_item).await,
+        ResourceKind::ServiceAccounts => {
+            task.run_namespaced::<ServiceAccount, _>(scope, service_account_item)
+                .await
+        }
         ResourceKind::PersistentVolumes => task.run_cluster::<PersistentVolume, _>(pv_item).await,
+        ResourceKind::Namespaces => task.run_cluster::<Namespace, _>(namespace_item).await,
         ResourceKind::Nodes => task.run_cluster::<Node, _>(node_item).await,
+        ResourceKind::Leases => task.run_namespaced::<Lease, _>(scope, lease_item).await,
+        ResourceKind::Events => task.run_namespaced::<Event, _>(scope, event_item).await,
+        ResourceKind::ClusterRoles => task.run_cluster::<ClusterRole, _>(cluster_role_item).await,
+        ResourceKind::Roles => task.run_namespaced::<Role, _>(scope, role_item).await,
+        ResourceKind::RoleBindings => {
+            task.run_namespaced::<RoleBinding, _>(scope, role_binding_item)
+                .await
+        }
+        ResourceKind::Custom(index) => {
+            if let Some(def) = crate::models::resources::catalog::custom_def(index) {
+                let resource = ApiResource::from_gvk_with_plural(
+                    &GroupVersionKind::gvk(&def.group, &def.version, &def.kind),
+                    &def.plural,
+                );
+                task.run_dynamic(resource, scope).await;
+            }
+        }
     }
 }
 
@@ -117,9 +186,19 @@ impl WatchTask {
         self.run_stream(api, map).await;
     }
 
+    async fn run_dynamic(&mut self, resource: ApiResource, scope: NamespaceScope) {
+        let api = match &scope {
+            NamespaceScope::All => Api::<DynamicObject>::all_with(self.client.clone(), &resource),
+            NamespaceScope::One(namespace) => {
+                Api::<DynamicObject>::namespaced_with(self.client.clone(), namespace, &resource)
+            }
+        };
+        self.run_stream(api, custom_item).await;
+    }
+
     async fn run_stream<K, F>(&mut self, api: Api<K>, map: F)
     where
-        K: Resource<DynamicType = ()> + Clone + Debug + DeserializeOwned + Send + 'static,
+        K: Resource + Clone + Debug + DeserializeOwned + Send + 'static,
         F: Fn(&K) -> Item + Copy,
     {
         let list_params = ListParams::default();
@@ -496,6 +575,307 @@ fn secret_item(secret: &Secret) -> Item {
         .as_ref()
         .and_then(|data| data.keys().next().cloned())
         .unwrap_or_default();
+    item
+}
+
+fn stateful_set_item(stateful_set: &StatefulSet) -> Item {
+    let mut item = base_item(stateful_set);
+    let desired = stateful_set
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(0);
+    let ready = stateful_set
+        .status
+        .as_ref()
+        .and_then(|status| status.ready_replicas)
+        .unwrap_or(0);
+    item.ready = format!("{ready}/{desired}");
+    item.capacity = desired.to_string();
+    item.status = if ready >= desired {
+        "ready"
+    } else {
+        "progressing"
+    }
+    .to_string();
+    item.version = version_label(stateful_set.metadata.labels.as_ref());
+    item
+}
+
+fn replica_set_item(replica_set: &ReplicaSet) -> Item {
+    let mut item = base_item(replica_set);
+    let desired = replica_set
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(0);
+    let ready = replica_set
+        .status
+        .as_ref()
+        .and_then(|status| status.ready_replicas)
+        .unwrap_or(0);
+    item.ready = format!("{ready}/{desired}");
+    item.capacity = desired.to_string();
+    item.status = if ready >= desired {
+        "ready"
+    } else {
+        "progressing"
+    }
+    .to_string();
+    item.version = version_label(replica_set.metadata.labels.as_ref());
+    item
+}
+
+fn replication_controller_item(controller: &ReplicationController) -> Item {
+    let mut item = base_item(controller);
+    let desired = controller
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.replicas)
+        .unwrap_or(0);
+    let ready = controller
+        .status
+        .as_ref()
+        .and_then(|status| status.ready_replicas)
+        .unwrap_or(0);
+    item.ready = format!("{ready}/{desired}");
+    item.capacity = desired.to_string();
+    item.status = if ready >= desired {
+        "ready"
+    } else {
+        "progressing"
+    }
+    .to_string();
+    item.version = version_label(controller.metadata.labels.as_ref());
+    item
+}
+
+fn horizontal_pod_autoscaler_item(autoscaler: &HorizontalPodAutoscaler) -> Item {
+    let mut item = base_item(autoscaler);
+    let spec = autoscaler.spec.as_ref();
+    let max = spec.map(|spec| spec.max_replicas).unwrap_or(0);
+    let min = spec.and_then(|spec| spec.min_replicas).unwrap_or(0);
+    let current = autoscaler
+        .status
+        .as_ref()
+        .and_then(|status| status.current_replicas)
+        .unwrap_or(0);
+    item.ready = format!("{current}/{min}");
+    item.capacity = max.to_string();
+    item.status = if current >= min { "active" } else { "idle" }.to_string();
+    item.version = spec
+        .map(|spec| {
+            format!(
+                "{}/{}",
+                spec.scale_target_ref.kind, spec.scale_target_ref.name
+            )
+        })
+        .unwrap_or_default();
+    item
+}
+
+fn pod_disruption_budget_item(budget: &PodDisruptionBudget) -> Item {
+    let mut item = base_item(budget);
+    let status = budget.status.as_ref();
+    let current = status.map(|status| status.current_healthy).unwrap_or(0);
+    let desired = status.map(|status| status.desired_healthy).unwrap_or(0);
+    let allowed = status.map(|status| status.disruptions_allowed).unwrap_or(0);
+    item.ready = format!("{current}/{desired}");
+    item.capacity = allowed.to_string();
+    item.status = if allowed > 0 { "ready" } else { "blocked" }.to_string();
+    item
+}
+
+fn lease_item(lease: &Lease) -> Item {
+    let mut item = base_item(lease);
+    let spec = lease.spec.as_ref();
+    item.version = spec
+        .and_then(|spec| spec.holder_identity.clone())
+        .unwrap_or_default();
+    item.capacity = spec
+        .and_then(|spec| spec.lease_duration_seconds)
+        .map(|seconds| format!("{seconds}s"))
+        .unwrap_or_default();
+    item.status = "active".to_string();
+    item
+}
+
+fn endpoints_item(endpoints: &Endpoints) -> Item {
+    let mut item = base_item(endpoints);
+    let addresses = endpoints
+        .subsets
+        .as_ref()
+        .map(|subsets| {
+            subsets
+                .iter()
+                .map(|subset| {
+                    subset.addresses.as_ref().map(Vec::len).unwrap_or(0)
+                        + subset
+                            .not_ready_addresses
+                            .as_ref()
+                            .map(Vec::len)
+                            .unwrap_or(0)
+                })
+                .sum::<usize>()
+        })
+        .unwrap_or(0);
+    item.capacity = addresses.to_string();
+    item.status = "active".to_string();
+    item
+}
+
+fn endpoint_slice_item(slice: &EndpointSlice) -> Item {
+    let mut item = base_item(slice);
+    item.capacity = slice.endpoints.len().to_string();
+    item.version = slice.address_type.clone();
+    item.status = "active".to_string();
+    item
+}
+
+fn network_policy_item(policy: &NetworkPolicy) -> Item {
+    let mut item = base_item(policy);
+    item.capacity = policy
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.policy_types.as_ref())
+        .map(|types| types.join(", "))
+        .unwrap_or_default();
+    item.status = "active".to_string();
+    item
+}
+
+fn event_item(event: &Event) -> Item {
+    let mut item = base_item(event);
+    item.status = event
+        .type_
+        .clone()
+        .unwrap_or_else(|| "normal".to_string())
+        .to_lowercase();
+    item.version = event.reason.clone().unwrap_or_default();
+    item.capacity = event.count.unwrap_or(1).to_string();
+    item
+}
+
+fn cluster_role_item(cluster_role: &ClusterRole) -> Item {
+    let mut item = base_item(cluster_role);
+    item.capacity = cluster_role
+        .rules
+        .as_ref()
+        .map(|rules| rules.len())
+        .unwrap_or(0)
+        .to_string();
+    item.status = "active".to_string();
+    item
+}
+
+fn role_item(role: &Role) -> Item {
+    let mut item = base_item(role);
+    item.capacity = role
+        .rules
+        .as_ref()
+        .map(|rules| rules.len())
+        .unwrap_or(0)
+        .to_string();
+    item.status = "active".to_string();
+    item
+}
+
+fn role_binding_item(binding: &RoleBinding) -> Item {
+    let mut item = base_item(binding);
+    item.capacity = binding
+        .subjects
+        .as_ref()
+        .map(|subjects| subjects.len())
+        .unwrap_or(0)
+        .to_string();
+    item.version = format!("{}/{}", binding.role_ref.kind, binding.role_ref.name);
+    item.status = "active".to_string();
+    item
+}
+
+fn custom_item(object: &DynamicObject) -> Item {
+    let mut item = base_item(object);
+    let Some(status) = object.data.get("status") else {
+        return item;
+    };
+    if let Some(phase) = status.get("phase").and_then(serde_json::Value::as_str) {
+        item.status = phase.to_lowercase();
+    } else if let Some(conditions) = status
+        .get("conditions")
+        .and_then(serde_json::Value::as_array)
+    {
+        let ready = conditions.iter().find(|condition| {
+            condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+        });
+        if let Some(ready) = ready {
+            item.status =
+                if ready.get("status").and_then(serde_json::Value::as_str) == Some("True") {
+                    "ready"
+                } else {
+                    "notready"
+                }
+                .to_string();
+        }
+    }
+    item
+}
+
+fn cron_job_item(cron_job: &CronJob) -> Item {
+    let mut item = base_item(cron_job);
+    let active = cron_job
+        .status
+        .as_ref()
+        .and_then(|status| status.active.as_ref())
+        .map(|active| active.len())
+        .unwrap_or(0);
+    let suspended = cron_job
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.suspend)
+        .unwrap_or(false);
+    item.capacity = active.to_string();
+    item.status = if suspended { "suspended" } else { "active" }.to_string();
+    item.version = cron_job
+        .spec
+        .as_ref()
+        .map(|spec| spec.schedule.clone())
+        .unwrap_or_default();
+    item
+}
+
+fn service_account_item(service_account: &ServiceAccount) -> Item {
+    let mut item = base_item(service_account);
+    let secrets = service_account.secrets.as_ref().map(Vec::len).unwrap_or(0);
+    item.status = "account".to_string();
+    item.capacity = secrets.to_string();
+    item.version = service_account
+        .secrets
+        .as_ref()
+        .and_then(|secrets| secrets.first())
+        .and_then(|secret| secret.name.clone())
+        .unwrap_or_default();
+    item
+}
+
+fn storage_class_item(storage_class: &StorageClass) -> Item {
+    let mut item = base_item(storage_class);
+    item.version = storage_class.provisioner.clone();
+    item.capacity = storage_class.reclaim_policy.clone().unwrap_or_default();
+    item.ready = storage_class
+        .volume_binding_mode
+        .clone()
+        .unwrap_or_default();
+    item
+}
+
+fn namespace_item(namespace: &Namespace) -> Item {
+    let mut item = base_item(namespace);
+    item.status = namespace
+        .status
+        .as_ref()
+        .and_then(|status| status.phase.clone())
+        .unwrap_or_else(|| "unknown".to_string())
+        .to_lowercase();
     item
 }
 

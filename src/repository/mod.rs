@@ -115,7 +115,8 @@ pub(crate) fn subscribe_kind(
             _cancel: cancel,
             refresh,
         });
-        let watch_task = resources::watcher::run(client, kind, scope, snapshots, cancel_rx, refresh_rx);
+        let watch_task =
+            resources::watcher::run(client, kind, scope, snapshots, cancel_rx, refresh_rx);
         tokio.spawn(watch_task);
         repository.entries.insert(key, Arc::downgrade(&entry));
         Subscription { rx, _entry: entry }

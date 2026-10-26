@@ -5,12 +5,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use gpui_kit::component::table::{Column, TableDelegate, TableState};
 use gpui_kit::px;
-use gpui_kit::{App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Styled as _, Window, div};
+use gpui_kit::{
+    App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Styled as _, Window,
+    div,
+};
 use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
-use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase};
 use crate::models::resources::config_maps::ConfigMapsModel;
+use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase};
 use crate::repository;
 
 pub struct ConfigMapsViewModel {
@@ -33,7 +36,9 @@ impl ConfigMapsViewModel {
         let active = Arc::new(AtomicBool::new(true));
         let model = cx.new(|_| ConfigMapsModel::new());
         let table_model = model.clone();
-        let table = cx.new(|cx| TableState::new(ConfigMapsViewModelTable { model: table_model }, _window, cx));
+        let table = cx.new(|cx| {
+            TableState::new(ConfigMapsViewModelTable { model: table_model }, _window, cx)
+        });
         let cluster_sub = cx.observe_global::<ClusterState>(|this, cx| {
             let (scope, epoch) = {
                 let state = cx.global::<ClusterState>();
@@ -122,17 +127,18 @@ impl ConfigMapsViewModel {
 
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
-        let subscription = match repository::resources::config_maps::subscribe(cx, self.scope.clone()) {
-            Ok(s) => s,
-            Err(error) => {
-                use crate::models::ResourceSnapshot;
-                self.model.update(cx, |model, cx| {
-                    model.apply_snapshot(Arc::new(ResourceSnapshot::failed(error)));
-                    cx.notify();
-                });
-                return;
-            }
-        };
+        let subscription =
+            match repository::resources::config_maps::subscribe(cx, self.scope.clone()) {
+                Ok(s) => s,
+                Err(error) => {
+                    use crate::models::ResourceSnapshot;
+                    self.model.update(cx, |model, cx| {
+                        model.apply_snapshot(Arc::new(ResourceSnapshot::failed(error)));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
         let initial = subscription.snapshot();
         let notify_now = self.is_active();
         self.model.update(cx, |model, cx| {
@@ -152,7 +158,9 @@ impl ConfigMapsViewModel {
                     _ = cancel_rx.changed() => break,
                     snapshot = pump.next() => snapshot,
                 };
-                let Some(snapshot) = snapshot else { break; };
+                let Some(snapshot) = snapshot else {
+                    break;
+                };
                 let should_notify = active.load(Ordering::Relaxed);
                 let applied = model.update(cx, |model, cx| {
                     model.apply_snapshot(snapshot);
@@ -178,28 +186,31 @@ pub struct ConfigMapsViewModelTable {
 
 fn columns() -> Vec<Column> {
     vec![
-        Column::new("name",     "Name").width(px(300.)),
-        Column::new("namespace","Namespace").width(px(150.)),
+        Column::new("name", "Name").width(px(300.)),
+        Column::new("namespace", "Namespace").width(px(150.)),
         Column::new("capacity", "Keys").width(px(90.)).text_right(),
-        Column::new("age",      "Age").width(px(90.)).text_right(),
+        Column::new("age", "Age").width(px(90.)).text_right(),
     ]
 }
 
 fn column_key(col_ix: usize) -> gpui_kit::SharedString {
-    columns().get(col_ix).map(|c| c.key.clone()).unwrap_or_default()
+    columns()
+        .get(col_ix)
+        .map(|c| c.key.clone())
+        .unwrap_or_default()
 }
 
 fn cell(item: &Item, key: &str) -> String {
     match key {
-        "name"      => item.name.clone(),
+        "name" => item.name.clone(),
         "namespace" => item.namespace.clone(),
-        "ready"     => item.ready.clone(),
-        "restarts"  => item.restarts.to_string(),
-        "capacity"  => item.capacity.clone(),
-        "version"   => item.version.clone(),
-        "status"    => item.status.clone(),
-        "age"       => item.age(),
-        _           => String::new(),
+        "ready" => item.ready.clone(),
+        "restarts" => item.restarts.to_string(),
+        "capacity" => item.capacity.clone(),
+        "version" => item.version.clone(),
+        "status" => item.status.clone(),
+        "age" => item.age(),
+        _ => String::new(),
     }
 }
 
@@ -213,7 +224,10 @@ impl TableDelegate for ConfigMapsViewModelTable {
     }
 
     fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        columns().get(col_ix).cloned().unwrap_or_else(|| Column::new("empty", ""))
+        columns()
+            .get(col_ix)
+            .cloned()
+            .unwrap_or_else(|| Column::new("empty", ""))
     }
 
     fn render_td(

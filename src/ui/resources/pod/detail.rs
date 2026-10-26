@@ -8,7 +8,9 @@ use gpui_kit::{
     AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _, div,
 };
 
-use crate::models::resources::pod::detail::{PodContainer, PodDetail, PodDetailState, UsageHistory};
+use crate::models::resources::pod::detail::{
+    PodContainer, PodDetail, PodDetailState, UsageHistory,
+};
 use crate::ui::components::detail::{
     age, detail_header, detail_shell, empty_row, error_body, field, key_values, loading_body,
     raw_manifest, section, usage_section,

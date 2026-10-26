@@ -33,7 +33,14 @@ impl Item {
     pub fn is_ok(&self) -> bool {
         matches!(
             self.status.as_str(),
-            "running" | "bound" | "ready" | "succeeded"
+            "running"
+                | "bound"
+                | "ready"
+                | "succeeded"
+                | "active"
+                | "suspended"
+                | "account"
+                | "normal"
         )
     }
 

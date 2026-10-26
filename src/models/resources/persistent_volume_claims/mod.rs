@@ -1,7 +1,7 @@
 //! Model for PersistentVolumeClaimsModel: holds the latest immutable snapshot.
 
-use std::sync::Arc;
 use crate::models::{ResourceKind, ResourceSnapshot, SnapshotPhase};
+use std::sync::Arc;
 
 pub struct PersistentVolumeClaimsModel {
     snapshot: Arc<ResourceSnapshot>,

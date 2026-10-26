@@ -1,5 +1,6 @@
 //! Settings page: application preferences.
 
+pub mod custom_resources;
 pub mod theme;
 
 use self::theme::{AppearanceState, ThemePreference};
@@ -87,6 +88,26 @@ pub fn render_settings(cx: &Context<crate::ui::Workspace>) -> impl IntoElement {
                                             }
                                         }),
                                 ),
+                        )
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .child("Custom resources"),
+                                )
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(
+                                            "Add a resource kind served by a CRD so it appears \
+                                             in the sidebar.",
+                                        ),
+                                )
+                                .child(custom_resources::render_add_button(cx)),
                         ),
                 ),
             ),

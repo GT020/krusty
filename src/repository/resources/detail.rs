@@ -97,17 +97,72 @@ fn api_resource(kind: ResourceKind) -> ApiResource {
     let (group, version, kind_name, plural) = match kind {
         ResourceKind::Pods => ("", "v1", "Pod", "pods"),
         ResourceKind::Deployments => ("apps", "v1", "Deployment", "deployments"),
+        ResourceKind::StatefulSets => ("apps", "v1", "StatefulSet", "statefulsets"),
+        ResourceKind::ReplicaSets => ("apps", "v1", "ReplicaSet", "replicasets"),
+        ResourceKind::ReplicationControllers => {
+            ("", "v1", "ReplicationController", "replicationcontrollers")
+        }
         ResourceKind::DaemonSets => ("apps", "v1", "DaemonSet", "daemonsets"),
         ResourceKind::Jobs => ("batch", "v1", "Job", "jobs"),
+        ResourceKind::CronJobs => ("batch", "v1", "CronJob", "cronjobs"),
+        ResourceKind::HorizontalPodAutoscalers => (
+            "autoscaling",
+            "v2",
+            "HorizontalPodAutoscaler",
+            "horizontalpodautoscalers",
+        ),
+        ResourceKind::PodDisruptionBudgets => (
+            "policy",
+            "v1",
+            "PodDisruptionBudget",
+            "poddisruptionbudgets",
+        ),
         ResourceKind::Services => ("", "v1", "Service", "services"),
         ResourceKind::Ingresses => ("networking.k8s.io", "v1", "Ingress", "ingresses"),
+        ResourceKind::Endpoints => ("", "v1", "Endpoints", "endpoints"),
+        ResourceKind::EndpointSlices => {
+            ("discovery.k8s.io", "v1", "EndpointSlice", "endpointslices")
+        }
+        ResourceKind::NetworkPolicies => (
+            "networking.k8s.io",
+            "v1",
+            "NetworkPolicy",
+            "networkpolicies",
+        ),
         ResourceKind::PersistentVolumes => ("", "v1", "PersistentVolume", "persistentvolumes"),
         ResourceKind::PersistentVolumeClaims => {
             ("", "v1", "PersistentVolumeClaim", "persistentvolumeclaims")
         }
+        ResourceKind::StorageClasses => ("storage.k8s.io", "v1", "StorageClass", "storageclasses"),
         ResourceKind::ConfigMaps => ("", "v1", "ConfigMap", "configmaps"),
         ResourceKind::Secrets => ("", "v1", "Secret", "secrets"),
+        ResourceKind::ServiceAccounts => ("", "v1", "ServiceAccount", "serviceaccounts"),
+        ResourceKind::Namespaces => ("", "v1", "Namespace", "namespaces"),
         ResourceKind::Nodes => ("", "v1", "Node", "nodes"),
+        ResourceKind::Leases => ("coordination.k8s.io", "v1", "Lease", "leases"),
+        ResourceKind::Events => ("", "v1", "Event", "events"),
+        ResourceKind::ClusterRoles => (
+            "rbac.authorization.k8s.io",
+            "v1",
+            "ClusterRole",
+            "clusterroles",
+        ),
+        ResourceKind::Roles => ("rbac.authorization.k8s.io", "v1", "Role", "roles"),
+        ResourceKind::RoleBindings => (
+            "rbac.authorization.k8s.io",
+            "v1",
+            "RoleBinding",
+            "rolebindings",
+        ),
+        ResourceKind::Custom(index) => match crate::models::resources::catalog::custom_def(index) {
+            Some(def) => {
+                return ApiResource::from_gvk_with_plural(
+                    &GroupVersionKind::gvk(&def.group, &def.version, &def.kind),
+                    &def.plural,
+                );
+            }
+            None => ("", "v1", "Unknown", "unknowns"),
+        },
     };
     ApiResource::from_gvk_with_plural(&GroupVersionKind::gvk(group, version, kind_name), plural)
 }
@@ -153,5 +208,11 @@ mod tests {
             "persistentvolumeclaims"
         );
         assert_eq!(api_resource(ResourceKind::Nodes).group, "");
+        assert_eq!(api_resource(ResourceKind::CronJobs).plural, "cronjobs");
+        assert_eq!(
+            api_resource(ResourceKind::StorageClasses).group,
+            "storage.k8s.io"
+        );
+        assert_eq!(api_resource(ResourceKind::Namespaces).plural, "namespaces");
     }
 }
