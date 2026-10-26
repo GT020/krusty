@@ -1,6 +1,52 @@
-//! Resource list and detail views.
+//! Resource list, shared detail infrastructure, and per-kind detail views.
 
+use gpui_kit::{AnyElement, Context, Entity};
+
+use crate::models::resources::detail::ResourceDetailState;
+use crate::models::ResourceKind;
+
+pub mod config_maps;
+pub mod daemon_sets;
+pub mod deployments;
 pub mod detail;
+pub mod detail_common;
+pub mod ingresses;
+pub mod jobs;
 pub mod list;
 pub mod node;
+pub mod persistent_volume_claims;
+pub mod persistent_volumes;
 pub mod pod;
+pub mod secrets;
+pub mod services;
+
+#[allow(clippy::too_many_arguments)]
+pub fn render_detail<T: 'static>(
+    kind: ResourceKind,
+    state: ResourceDetailState,
+    view: Entity<T>,
+    compact: bool,
+    close: fn(&mut T, &mut Context<T>),
+    cx: &mut Context<T>,
+) -> AnyElement {
+    match kind {
+        ResourceKind::Deployments => {
+            deployments::detail::render(state, view, compact, close, cx)
+        }
+        ResourceKind::DaemonSets => {
+            daemon_sets::detail::render(state, view, compact, close, cx)
+        }
+        ResourceKind::Jobs => jobs::detail::render(state, view, compact, close, cx),
+        ResourceKind::Services => services::detail::render(state, view, compact, close, cx),
+        ResourceKind::Ingresses => ingresses::detail::render(state, view, compact, close, cx),
+        ResourceKind::PersistentVolumes => {
+            persistent_volumes::detail::render(state, view, compact, close, cx)
+        }
+        ResourceKind::PersistentVolumeClaims => {
+            persistent_volume_claims::detail::render(state, view, compact, close, cx)
+        }
+        ResourceKind::ConfigMaps => config_maps::detail::render(state, view, compact, close, cx),
+        ResourceKind::Secrets => secrets::detail::render(state, view, compact, close, cx),
+        _ => detail::render_detail(kind, state, view, compact, close, cx),
+    }
+}
