@@ -29,6 +29,7 @@ fn main() {
                 "krusty: gpui_kit initialized"
             );
 
+            ui::theme::init(cx);
             repository::init(cx);
             let cluster_started = std::time::Instant::now();
             cluster::init(cx);
