@@ -1,4 +1,9 @@
 /target
+/dist
+/.flatpak-builder
+/repo
+/build-dir
+/packaging/flatpak/cargo-sources.json
 docs/PLAN.md
 *PLAN*.md
 *plan*.md

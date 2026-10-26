@@ -1,0 +1,42 @@
+app-id: io.github.GT020.Krusty
+runtime: org.freedesktop.Platform
+runtime-version: "25.08"
+sdk: org.freedesktop.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: krusty
+
+finish-args:
+  - --share=network
+  - --share=ipc
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --device=dri
+  - --filesystem=~/.kube:ro
+  - --filesystem=xdg-config/kube:ro
+
+modules:
+  - name: krusty
+    buildsystem: simple
+    build-options:
+      append-path: /usr/lib/sdk/rust-stable/bin
+      env:
+        CARGO_HOME: /run/build/krusty/cargo
+        CARGO_NET_OFFLINE: "true"
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --locked
+      - install -Dm755 target/release/krusty ${FLATPAK_DEST}/bin/krusty
+      - install -Dm644 assets/krusty.desktop ${FLATPAK_DEST}/share/applications/${FLATPAK_ID}.desktop
+      - install -Dm644 assets/app-icon.png ${FLATPAK_DEST}/share/icons/hicolor/512x512/apps/${FLATPAK_ID}.png
+    sources:
+      - type: dir
+        path: ../..
+        skip:
+          - .git
+          - target
+          - dist
+          - repo
+          - build-dir
+          - .flatpak-builder
+      - cargo-sources.json

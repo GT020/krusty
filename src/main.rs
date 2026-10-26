@@ -8,7 +8,7 @@ mod view_models;
 fn window_options() -> gpui_kit::WindowOptions {
     let mut options = gpui_kit::component::TitleBar::window_options();
     options.icon = window_icon();
-    options.app_id = Some("krusty".to_string());
+    options.app_id = Some("io.github.GT020.Krusty".to_string());
     options
 }
 
