@@ -1,5 +1,3 @@
-use gpui_kit::component::sidebar::SidebarMenuItem;
-
 type Icon = gpui_kit::assets::IconName;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
@@ -79,10 +77,6 @@ impl ResourceKind {
                 vec![ResourceKind::ConfigMaps, ResourceKind::Secrets],
             ),
         ]
-    }
-
-    pub fn menu_item(self) -> SidebarMenuItem {
-        SidebarMenuItem::new(self.label()).icon(self.icon())
     }
 
     /// Cluster-scoped kinds ignore the namespace selector.
