@@ -2,6 +2,8 @@
 name = "krusty"
 version = "0.1.0"
 edition = "2024"
+license = "GPL-2.0-only"
+description = "A native Kubernetes desktop client built with GPUI Kit"
 
 [dependencies]
 dirs = "7.0.0"
