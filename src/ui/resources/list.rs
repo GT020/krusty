@@ -159,7 +159,7 @@ impl Render for ResourceListView {
 
         let viewport_width = window.viewport_size().width.as_f32();
         let split = viewport_width >= SPLIT_MIN_VIEWPORT_WIDTH;
-        let detail = crate::ui::resources::detail::render_detail(
+        let detail = crate::ui::resources::render_detail(
             self.kind,
             detail_state,
             cx.entity().clone(),
