@@ -1,9 +1,11 @@
 pub mod kubeconfig;
 
 use crate::models::NamespaceScope;
-use gpui_kit::{App, AppContext as _, BorrowAppContext as _, Global};
+use gpui_kit::{App, BorrowAppContext as _, Global};
 use k8s_openapi::api::core::v1::Namespace;
-use kube::api::ListParams;
+use futures::TryStreamExt as _;
+use kube::api::{ListParams, WatchEvent, WatchParams};
+use tokio::sync::watch;
 use kube::{Api, Client, Config};
 
 /// One selectable cluster context: a kubectl context or a cluster added to krusty.
@@ -44,6 +46,7 @@ pub struct ClusterState {
     namespaces: Vec<String>,
     scope: NamespaceScope,
     context_epoch: u64,
+    namespace_cancel: Option<watch::Sender<bool>>,
 }
 
 impl Global for ClusterState {}
@@ -176,6 +179,7 @@ pub fn init(cx: &mut App) {
         namespaces: Vec::new(),
         scope: NamespaceScope::All,
         context_epoch: 0,
+        namespace_cancel: None,
     });
     refresh_namespaces(cx);
     tracing::info!(
@@ -185,39 +189,139 @@ pub fn init(cx: &mut App) {
     );
 }
 
-/// Reload namespace names for the namespace selector. Runs off the UI thread.
+async fn run_namespace_watcher(
+    client: Client,
+    tx: watch::Sender<Vec<String>>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    let api: Api<Namespace> = Api::all(client);
+    let list_params = ListParams::default();
+    let watch_params = WatchParams::default().timeout(280);
+
+    loop {
+        if cancel.has_changed().is_err() || *cancel.borrow() {
+            return;
+        }
+
+        let listed = tokio::select! {
+            _ = cancel.changed() => return,
+            result = api.list(&list_params) => result,
+        };
+
+        let list = match listed {
+            Ok(list) => list,
+            Err(error) => {
+                tracing::warn!(%error, "cluster: namespace list failed, retrying");
+                tokio::select! {
+                    _ = cancel.changed() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1500)) => continue,
+                };
+            }
+        };
+
+        let mut names = crate::repository::namespace_names(list.items);
+        let mut resource_version = list.metadata.resource_version.unwrap_or_default();
+        let _ = tx.send(names.clone());
+
+        let watched = tokio::select! {
+            _ = cancel.changed() => return,
+            result = api.watch(&watch_params, &resource_version) => result,
+        };
+
+        let mut stream = match watched {
+            Ok(stream) => Box::pin(stream),
+            Err(error) => {
+                tracing::warn!(%error, "cluster: namespace watch setup failed, retrying");
+                tokio::select! {
+                    _ = cancel.changed() => return,
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(1500)) => continue,
+                };
+            }
+        };
+
+        loop {
+            let event = tokio::select! {
+                _ = cancel.changed() => return,
+                item = stream.try_next() => item,
+            };
+
+            match event {
+                Ok(Some(WatchEvent::Added(ns))) => {
+                    if let Some(name) = ns.metadata.name {
+                        if !names.contains(&name) {
+                            names.push(name);
+                            names.sort_unstable();
+                            let _ = tx.send(names.clone());
+                        }
+                    }
+                    if let Some(version) = ns.metadata.resource_version {
+                        resource_version = version;
+                    }
+                }
+                Ok(Some(WatchEvent::Deleted(ns))) => {
+                    if let Some(name) = ns.metadata.name {
+                        if let Some(idx) = names.iter().position(|n| n == &name) {
+                            names.remove(idx);
+                            let _ = tx.send(names.clone());
+                        }
+                    }
+                    if let Some(version) = ns.metadata.resource_version {
+                        resource_version = version;
+                    }
+                }
+                Ok(Some(WatchEvent::Bookmark(bm))) => {
+                    resource_version = bm.metadata.resource_version;
+                }
+                Ok(Some(WatchEvent::Modified(_))) => {}
+                Ok(Some(WatchEvent::Error(err))) => {
+                    tracing::warn!(%err, "cluster: namespace watch error, relisting");
+                    break;
+                }
+                Ok(None) => {
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "cluster: namespace watch stream error, relisting");
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Start or restart the continuous namespace list/watch loop.
 pub fn refresh_namespaces(cx: &mut App) {
-    let state = cx.global::<ClusterState>().clone();
-    let Some(client) = state.client else {
+    let state = cx.global::<ClusterState>();
+    let Some(client) = state.client.clone() else {
         return;
     };
     let tokio = state.tokio.clone();
+
+    if let Some(cancel) = &state.namespace_cancel {
+        let _ = cancel.send(true);
+    }
+
+    let (cancel_tx, cancel_rx) = watch::channel(false);
+    let (names_tx, mut names_rx) = watch::channel(state.namespaces.clone());
+
+    cx.update_global::<ClusterState, _>(|state, _| {
+        state.namespace_cancel = Some(cancel_tx);
+    });
+
+    tokio.spawn(run_namespace_watcher(client, names_tx, cancel_rx));
+
     cx.spawn(async move |cx: &mut gpui_kit::AsyncApp| {
-        let result = cx
-            .background_spawn(async move {
-                tokio
-                    .spawn(async move {
-                        let api: Api<Namespace> = Api::all(client);
-                        api.list(&ListParams::default()).await
-                    })
-                    .await
-                    .unwrap_or_else(|error| Err(kube::Error::Service(error.into())))
-            })
-            .await;
-        match result {
-            Ok(list) => {
-                let names = crate::repository::namespace_names(list.items);
-                cx.update_global::<ClusterState, _>(|state, _| {
-                    state.namespaces = names;
-                    state.reachable = Some(true);
-                });
-            }
-            Err(error) => {
-                tracing::warn!(%error, "cluster: namespace list failed");
-                cx.update_global::<ClusterState, _>(|state, _| {
-                    state.reachable = Some(false);
-                });
-            }
+        while names_rx.changed().await.is_ok() {
+            let names = names_rx.borrow_and_update().clone();
+            cx.update_global::<ClusterState, _>(|state, _| {
+                state.namespaces = names.clone();
+                state.reachable = Some(true);
+                if let NamespaceScope::One(ref selected) = state.scope {
+                    if !names.contains(selected) {
+                        state.scope = NamespaceScope::All;
+                    }
+                }
+            });
         }
     })
     .detach();
@@ -336,6 +440,9 @@ pub fn switch_context(cx: &mut App, id: &str) -> Result<(), &'static str> {
         state.namespaces.clear();
         state.scope = NamespaceScope::All;
         state.context_epoch = state.context_epoch.wrapping_add(1);
+        if let Some(cancel) = state.namespace_cancel.take() {
+            let _ = cancel.send(true);
+        }
         state.store.set_last_context(Some(id));
         let _ = state.store.save();
         Ok(())

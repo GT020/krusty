@@ -63,7 +63,10 @@ pub fn render_sidebar(
                         .small()
                         .label(label)
                         .icon(IconName::ChevronsUpDown)
-                        .dropdown_menu(move |mut menu, _, _| {
+                        .dropdown_menu(move |mut menu, _, cx| {
+                            let state = cx.global::<ClusterState>();
+                            let contexts = state.contexts().to_vec();
+                            let active = state.active_id().map(str::to_string);
                             if contexts.is_empty() {
                                 return menu
                                     .item(PopupMenuItem::new("No contexts found").disabled(true));
@@ -96,8 +99,11 @@ pub fn render_sidebar(
                         .small()
                         .label(scope_label)
                         .icon(IconName::ChevronsUpDown)
-                        .dropdown_menu(move |mut menu, _, _| {
+                        .dropdown_menu(move |mut menu, _, cx| {
                             use crate::models::NamespaceScope;
+                            let state = cx.global::<ClusterState>();
+                            let namespaces = state.namespaces().to_vec();
+                            let scope = state.scope().clone();
                             menu = menu.item(
                                 PopupMenuItem::new("All namespaces")
                                     .checked(scope.is_all())
