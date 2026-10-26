@@ -4,6 +4,7 @@ use crate::cluster::ClusterState;
 use crate::models::{NamespaceScope, ResourceKind};
 use crate::ui::nav::NavTarget;
 use crate::ui::node::NodesView;
+use crate::ui::pod::PodsView;
 use crate::ui::resource_list::ResourceListView;
 use crate::ui::settings::render_settings;
 use crate::ui::sidebar::render_sidebar;
@@ -24,6 +25,7 @@ use std::collections::BTreeMap;
 pub struct Workspace {
     selected: NavTarget,
     panels: BTreeMap<ResourceKind, Entity<ResourceListView>>,
+    pods: Option<Entity<PodsView>>,
     nodes: Option<Entity<NodesView>>,
     _cluster_subscription: gpui_kit::Subscription,
     _appearance_subscription: gpui_kit::Subscription,
@@ -46,11 +48,8 @@ impl Workspace {
             }
         });
         let preference_subscription = cx.observe_global::<AppearanceState>(|_, cx| cx.notify());
-        let mut panels = BTreeMap::new();
-        panels.insert(
-            ResourceKind::Pods,
-            cx.new(|cx| ResourceListView::new(ResourceKind::Pods, window, cx)),
-        );
+        let panels = BTreeMap::new();
+        let pods = Some(cx.new(|cx| PodsView::new(window, cx)));
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "ui: workspace construction complete"
@@ -58,6 +57,7 @@ impl Workspace {
         Self {
             selected: NavTarget::Resource(ResourceKind::Pods),
             panels,
+            pods,
             nodes: None,
             _cluster_subscription: cluster_subscription,
             _appearance_subscription: appearance_subscription,
@@ -72,29 +72,49 @@ impl Workspace {
         }
         tracing::info!(from = ?self.selected, to = ?target, "ui: select navigation target");
         if let NavTarget::Resource(kind) = self.selected {
-            if kind == ResourceKind::Nodes {
-                if let Some(nodes) = self.nodes.clone() {
-                    nodes.update(cx, |view, cx| view.set_active(false, cx));
+            match kind {
+                ResourceKind::Pods => {
+                    if let Some(pods) = self.pods.clone() {
+                        pods.update(cx, |view, cx| view.set_active(false, cx));
+                    }
                 }
-            } else if let Some(previous) = self.panels.get(&kind).cloned() {
-                previous.update(cx, |view, cx| view.set_active(false, cx));
+                ResourceKind::Nodes => {
+                    if let Some(nodes) = self.nodes.clone() {
+                        nodes.update(cx, |view, cx| view.set_active(false, cx));
+                    }
+                }
+                _ => {
+                    if let Some(previous) = self.panels.get(&kind).cloned() {
+                        previous.update(cx, |view, cx| view.set_active(false, cx));
+                    }
+                }
             }
         }
         self.selected = target;
         if let NavTarget::Resource(kind) = target {
-            if kind == ResourceKind::Nodes {
-                let nodes = self
-                    .nodes
-                    .get_or_insert_with(|| cx.new(|cx| NodesView::new(window, cx)))
-                    .clone();
-                nodes.update(cx, |view, cx| view.set_active(true, cx));
-            } else {
-                let panel = self
-                    .panels
-                    .entry(kind)
-                    .or_insert_with(|| cx.new(|cx| ResourceListView::new(kind, window, cx)))
-                    .clone();
-                panel.update(cx, |view, cx| view.set_active(true, cx));
+            match kind {
+                ResourceKind::Pods => {
+                    let pods = self
+                        .pods
+                        .get_or_insert_with(|| cx.new(|cx| PodsView::new(window, cx)))
+                        .clone();
+                    pods.update(cx, |view, cx| view.set_active(true, cx));
+                }
+                ResourceKind::Nodes => {
+                    let nodes = self
+                        .nodes
+                        .get_or_insert_with(|| cx.new(|cx| NodesView::new(window, cx)))
+                        .clone();
+                    nodes.update(cx, |view, cx| view.set_active(true, cx));
+                }
+                _ => {
+                    let panel = self
+                        .panels
+                        .entry(kind)
+                        .or_insert_with(|| cx.new(|cx| ResourceListView::new(kind, window, cx)))
+                        .clone();
+                    panel.update(cx, |view, cx| view.set_active(true, cx));
+                }
             }
         }
         cx.notify();
@@ -102,6 +122,11 @@ impl Workspace {
 
     fn content(&self, cx: &Context<Self>) -> gpui_kit::AnyElement {
         match self.selected {
+            NavTarget::Resource(ResourceKind::Pods) => self
+                .pods
+                .clone()
+                .expect("selected pod panel exists")
+                .into_any_element(),
             NavTarget::Resource(ResourceKind::Nodes) => self
                 .nodes
                 .clone()

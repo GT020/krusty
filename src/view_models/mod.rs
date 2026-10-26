@@ -8,7 +8,7 @@ pub mod jobs;
 pub mod node;
 pub mod persistent_volume_claims;
 pub mod persistent_volumes;
-pub mod pods;
+pub mod pod;
 pub mod secrets;
 pub mod services;
 
@@ -20,7 +20,7 @@ pub use jobs::JobsViewModel;
 pub use node::NodesViewModel;
 pub use persistent_volume_claims::PersistentVolumeClaimsViewModel;
 pub use persistent_volumes::PersistentVolumesViewModel;
-pub use pods::PodsViewModel;
+pub use pod::PodsViewModel;
 pub use secrets::SecretsViewModel;
 pub use services::ServicesViewModel;
 
