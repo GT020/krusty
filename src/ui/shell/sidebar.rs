@@ -1,5 +1,5 @@
 use crate::models::ResourceKind;
-use crate::ui::shell::nav::NavTarget;
+use crate::ui::shell::nav::{self, NavTarget};
 use gpui_kit::component::ActiveTheme;
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarFooter, SidebarGroup, SidebarMenuItem,
@@ -12,8 +12,7 @@ fn nav_item(
     entity: &Entity<crate::ui::Workspace>,
 ) -> SidebarMenuItem {
     let handle = entity.clone();
-    target
-        .menu_item()
+    nav::menu_item(target)
         .active(selected == target)
         .on_click(move |_, window, cx| {
             handle.update(cx, |workspace, cx| workspace.select(target, window, cx));

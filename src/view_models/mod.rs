@@ -1,6 +1,7 @@
 //! ViewModel layer: GPUI entities owning presentation state, bound to models.
 
 pub mod resources;
+pub mod shell;
 
 pub use resources::{
     ClusterRolesViewModel, ConfigMapsViewModel, CronJobsViewModel, CustomResourceViewModel,
