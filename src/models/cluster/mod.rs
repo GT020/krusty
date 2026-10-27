@@ -21,8 +21,4 @@ impl NamespaceScope {
             Self::One(namespace) => namespace.clone(),
         }
     }
-
-    pub fn is_all(&self) -> bool {
-        matches!(self, Self::All)
-    }
 }
