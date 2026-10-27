@@ -17,13 +17,16 @@ use crate::ui::shell::sidebar::render_sidebar;
 use crate::ui::shell::status_bar::render_status_bar;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
+use gpui_kit::component::select::{
+    SearchableVec, Select, SelectEvent, SelectItem, SelectState,
+};
 use gpui_kit::component::{
     ActiveTheme, IconName, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
 };
 use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, Styled as _, Window,
-    div,
+    div, px,
 };
 use std::collections::BTreeMap;
 
@@ -33,6 +36,12 @@ pub struct Workspace {
     pods: Option<Entity<PodsView>>,
     nodes: Option<Entity<NodesView>>,
     custom_resources: Entity<CustomResourcesView>,
+    namespace_select: Entity<SelectState<SearchableVec<NamespaceItem>>>,
+    /// Last-synced values mirrored into `namespace_select`; used to avoid
+    /// rebuilding the list on every render, which would discard the user's
+    /// in-progress search filter.
+    synced_namespaces: Vec<String>,
+    synced_scope: NamespaceScope,
     _cluster_subscription: gpui_kit::Subscription,
     _appearance_subscription: gpui_kit::Subscription,
     _activation_subscription: gpui_kit::Subscription,
@@ -66,6 +75,34 @@ impl Workspace {
             );
         let panels = BTreeMap::new();
         let pods = Some(cx.new(|cx| PodsView::new(window, cx)));
+
+        let namespace_select = cx.new(|cx| {
+            let state = cx.global::<ClusterState>();
+            let items = namespace_items(state.namespaces());
+            let selected = state.scope().namespace().map(str::to_string);
+            let mut select = SelectState::new(items, None, window, cx).searchable(true);
+            if let Some(selected) = selected {
+                select.set_selected_value(&selected, window, cx);
+            }
+            select
+        });
+        let synced_namespaces = cx.global::<ClusterState>().namespaces().to_vec();
+        let synced_scope = cx.global::<ClusterState>().scope().clone();
+        cx.subscribe(
+            &namespace_select,
+            |_, _, event: &SelectEvent<SearchableVec<NamespaceItem>>, cx| {
+                let SelectEvent::Confirm(value) = event;
+                let scope = match value {
+                    Some(namespace) if !namespace.is_empty() => {
+                        NamespaceScope::One(namespace.clone())
+                    }
+                    _ => NamespaceScope::All,
+                };
+                crate::cluster::set_namespace_scope(cx, scope);
+            },
+        )
+        .detach();
+
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "ui: workspace construction complete"
@@ -76,6 +113,9 @@ impl Workspace {
             pods,
             nodes: None,
             custom_resources,
+            namespace_select,
+            synced_namespaces,
+            synced_scope,
             _cluster_subscription: cluster_subscription,
             _appearance_subscription: appearance_subscription,
             _activation_subscription: activation_subscription,
@@ -199,47 +239,103 @@ fn render_context_selector(cx: &Context<Workspace>) -> impl IntoElement {
         })
 }
 
-fn render_namespace_selector(cx: &Context<Workspace>) -> impl IntoElement {
+/// One row in the namespace selector. `name` is empty for the "All namespaces"
+/// sentinel; `value()` distinguishes the scope.
+#[derive(Clone, Debug)]
+struct NamespaceItem {
+    name: String,
+}
+
+impl NamespaceItem {
+    fn all() -> Self {
+        Self {
+            name: String::new(),
+        }
+    }
+
+    fn named(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
+    fn is_all(&self) -> bool {
+        self.name.is_empty()
+    }
+}
+
+impl SelectItem for NamespaceItem {
+    type Value = String;
+
+    fn title(&self) -> gpui_kit::SharedString {
+        if self.is_all() {
+            "All namespaces".into()
+        } else {
+            self.name.clone().into()
+        }
+    }
+
+    fn value(&self) -> &Self::Value {
+        &self.name
+    }
+}
+
+/// Build the select items: an "All namespaces" sentinel first, then namespaces.
+fn namespace_items(namespaces: &[String]) -> SearchableVec<NamespaceItem> {
+    let mut items = Vec::with_capacity(namespaces.len() + 1);
+    items.push(NamespaceItem::all());
+    items.extend(namespaces.iter().cloned().map(NamespaceItem::named));
+    SearchableVec::new(items)
+}
+
+/// Sync the namespace select from the cluster global, but only when the
+/// namespaces list or the scope actually changed. `set_items` rebuilds the
+/// delegate and would drop the in-progress search filter, so we avoid calling
+/// it on every render.
+fn sync_namespace_select(
+    workspace: &mut Workspace,
+    window: &mut Window,
+    cx: &mut Context<Workspace>,
+) {
     let state = cx.global::<ClusterState>();
-    let scope_label = state.scope().label();
-    Button::new("namespace")
-        .ghost()
+    let namespaces = state.namespaces().to_vec();
+    let scope = state.scope().clone();
+
+    let namespaces_changed = namespaces != workspace.synced_namespaces;
+    let scope_changed = scope != workspace.synced_scope;
+    if !namespaces_changed && !scope_changed {
+        return;
+    }
+
+    workspace.synced_namespaces = namespaces.clone();
+    workspace.synced_scope = scope.clone();
+
+    workspace.namespace_select.update(cx, |select, cx| {
+        if namespaces_changed {
+            select.set_items(namespace_items(&namespaces), window, cx);
+        }
+        let value = scope.namespace().map(str::to_string).unwrap_or_default();
+        if select.selected_value() != Some(&value) {
+            select.set_selected_value(&value, window, cx);
+        }
+    });
+}
+
+fn render_namespace_selector(
+    select: &Entity<SelectState<SearchableVec<NamespaceItem>>>,
+) -> impl IntoElement {
+    Select::new(select)
+        .id("namespace")
         .small()
-        .label(scope_label)
-        .icon(IconName::ChevronsUpDown)
-        .dropdown_menu(move |mut menu, _, cx| {
-            let state = cx.global::<ClusterState>();
-            let namespaces = state.namespaces().to_vec();
-            let scope = state.scope().clone();
-            menu = menu.item(
-                PopupMenuItem::new("All namespaces")
-                    .checked(scope.is_all())
-                    .on_click(move |_, _, cx| {
-                        crate::cluster::set_namespace_scope(cx, NamespaceScope::All);
-                    }),
-            );
-            for namespace in &namespaces {
-                let id = namespace.clone();
-                let selected = scope.namespace() == Some(namespace.as_str());
-                menu = menu.item(
-                    PopupMenuItem::new(namespace.clone())
-                        .checked(selected)
-                        .on_click(move |_, _, cx| {
-                            crate::cluster::set_namespace_scope(
-                                cx,
-                                NamespaceScope::One(id.clone()),
-                            );
-                        }),
-                );
-            }
-            menu
-        })
+        .w(px(180.))
+        .menu_max_h(px(320.))
+        .placeholder("All namespaces")
+        .search_placeholder("Search namespaces")
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let started = std::time::Instant::now();
         tracing::trace!(selected = ?self.selected, panels = self.panels.len(), "ui: workspace render start");
+        sync_namespace_select(self, window, cx);
         let sidebar = render_sidebar(self.selected, cx.entity(), cx);
 
         let root = v_flex()
@@ -258,7 +354,7 @@ impl Render for Workspace {
                                 .child("krusty"),
                         )
                         .child(render_context_selector(cx))
-                        .child(render_namespace_selector(cx)),
+                        .child(render_namespace_selector(&self.namespace_select)),
                 ),
             )
             .child(
