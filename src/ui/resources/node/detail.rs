@@ -10,8 +10,9 @@ use crate::models::resources::node::detail::{
     NodeCondition, NodeDetail, NodeDetailState, UsageHistory,
 };
 use crate::ui::components::detail::{
-    age, detail_header, detail_shell, empty_row, error_body, field, key_values, loading_body,
-    raw_manifest, section, usage_section, value_pair,
+    SelectableTextStyle, age, detail_header, detail_shell, empty_row, error_body, field,
+    field_colored, field_with_id, key_values, loading_body, raw_manifest, section, selectable_text,
+    usage_section, value_pair,
 };
 use crate::ui::resources::node::NodesView;
 
@@ -87,7 +88,7 @@ fn overview(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
     let mut body = v_flex();
     body = body
         .child(field("Name", &detail.name, cx))
-        .child(colored_field(
+        .child(field_colored(
             "Status",
             detail.status_label(),
             if detail.is_ready() {
@@ -201,22 +202,18 @@ fn conditions(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
                     ),
             );
         if !condition.reason.is_empty() {
-            block = block.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(condition.reason.clone()),
-            );
+            block = block.child(div().w_full().min_w_0().child(selectable_text(
+                format!("node-condition-{}-reason", condition.type_),
+                condition.reason.clone(),
+                SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+            )));
         }
         if !condition.message.is_empty() {
-            block = block.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .text_xs()
-                    .whitespace_normal()
-                    .child(condition.message.clone()),
-            );
+            block = block.child(div().w_full().min_w_0().child(selectable_text(
+                format!("node-condition-{}-message", condition.type_),
+                condition.message.clone(),
+                SelectableTextStyle::xs(),
+            )));
         }
         body = body.child(block);
     }
@@ -236,37 +233,6 @@ fn condition_color(condition: &NodeCondition, cx: &Context<NodesView>) -> gpui_k
         "Unknown" => cx.theme().warning,
         _ => cx.theme().muted_foreground,
     }
-}
-
-fn colored_field<T: 'static>(
-    label: &str,
-    value: &str,
-    color: gpui_kit::Hsla,
-    cx: &mut Context<T>,
-) -> AnyElement {
-    v_flex()
-        .w_full()
-        .min_w_0()
-        .gap_1()
-        .py_1()
-        .border_b_1()
-        .border_color(cx.theme().border)
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(label.to_string()),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .text_xs()
-                .whitespace_normal()
-                .text_color(color)
-                .child(value.to_string()),
-        )
-        .into_any_element()
 }
 
 fn system(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
@@ -299,7 +265,12 @@ fn addresses(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
         body = body.child(empty_row("No addresses reported", cx));
     }
     for address in &detail.addresses {
-        body = body.child(field(&address.type_, &address.address, cx));
+        body = body.child(field_with_id(
+            format!("node-address-{}", address.type_),
+            &address.type_,
+            &address.address,
+            cx,
+        ));
     }
     section("Addresses", body, cx)
 }
@@ -315,7 +286,12 @@ fn taints(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
         } else {
             format!("{} · {}", taint.key, taint.effect)
         };
-        body = body.child(field(&label, dash(&taint.value), cx));
+        body = body.child(field_with_id(
+            format!("node-taint-{}-{}", taint.key, taint.effect),
+            &label,
+            dash(&taint.value),
+            cx,
+        ));
     }
     section("Taints", body, cx)
 }
@@ -330,7 +306,13 @@ fn images(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
             "Image · {}",
             crate::ui::components::detail::format_bytes(image.size_bytes.max(0) as u64)
         );
-        body = body.child(field(&label, &image.names.join(", "), cx));
+        let names = image.names.join(", ");
+        body = body.child(field_with_id(
+            format!("node-image-{}", image.names.join(",")),
+            &label,
+            &names,
+            cx,
+        ));
     }
     section("Images", body, cx)
 }

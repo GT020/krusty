@@ -12,8 +12,8 @@ use serde_json::Value;
 use crate::models::ResourceKind;
 use crate::models::resources::detail::{ResourceDetail, ResourceDetailState};
 use crate::ui::components::detail::{
-    age, detail_header, detail_shell, empty_row, error_body, field, key_values, loading_body,
-    raw_manifest, section,
+    SelectableTextStyle, age, detail_header, detail_shell, empty_row, error_body, field_with_id,
+    key_values, loading_body, raw_manifest, section, selectable_text,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -125,7 +125,12 @@ pub fn fields_section<T: 'static>(
 ) -> AnyElement {
     let mut body = v_flex();
     for (label, value) in fields {
-        body = body.child(field(label, &value, cx));
+        body = body.child(field_with_id(
+            format!("detail-section-{title}-{label}"),
+            label,
+            &value,
+            cx,
+        ));
     }
     section(title, body, cx)
 }
@@ -145,7 +150,12 @@ pub fn json_section<T: 'static>(
         body = body.child(empty_row("None", cx));
     }
     for (path, value) in fields {
-        body = body.child(field(&path, &value, cx));
+        body = body.child(field_with_id(
+            format!("detail-section-{title}-{path}"),
+            &path,
+            &value,
+            cx,
+        ));
     }
     section(title, body, cx)
 }
@@ -172,6 +182,7 @@ pub fn conditions_section<T: 'static>(
     }
     for condition in items {
         let status = text(condition.get("status"));
+        let condition_type = text(condition.get("type"));
         let status_color = match status.as_str() {
             "True" => cx.theme().success,
             "Unknown" => cx.theme().warning,
@@ -192,7 +203,7 @@ pub fn conditions_section<T: 'static>(
                         div()
                             .text_xs()
                             .font_weight(FontWeight::MEDIUM)
-                            .child(text(condition.get("type"))),
+                            .child(condition_type.clone()),
                     )
                     .child(div().text_xs().text_color(status_color).child(status))
                     .child(
@@ -215,23 +226,19 @@ pub fn conditions_section<T: 'static>(
             );
         let reason = text(condition.get("reason"));
         if reason != "—" {
-            block = block.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(reason),
-            );
+            block = block.child(div().w_full().min_w_0().child(selectable_text(
+                format!("condition-{condition_type}-reason"),
+                reason,
+                SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+            )));
         }
         let message = text(condition.get("message"));
         if message != "—" {
-            block = block.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .text_xs()
-                    .whitespace_normal()
-                    .child(message),
-            );
+            block = block.child(div().w_full().min_w_0().child(selectable_text(
+                format!("condition-{condition_type}-message"),
+                message,
+                SelectableTextStyle::xs(),
+            )));
         }
         body = body.child(block);
     }
