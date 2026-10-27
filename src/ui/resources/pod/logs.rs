@@ -6,14 +6,16 @@ use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
     ActiveTheme as _, Sizable as _,
     button::{Button, ButtonVariants as _},
-    menu::{DropdownMenu as _, PopupMenuItem},
+    menu::{ContextMenuExt, DropdownMenu as _, PopupMenuItem},
 };
 use gpui_kit::{
     AnyElement, Context, Entity, InteractiveElement as _, IntoElement, ParentElement as _, Render,
-    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
-    div,
+    ScrollHandle, StatefulInteractiveElement as _, Styled as _, Subscription, Window, div,
 };
 
+use crate::ui::components::detail::{
+    SelectableTextStyle, selectable_text, text_selection_context_menu,
+};
 use crate::view_models::resources::pod::logs::PodLogsViewModel;
 
 pub struct PodLogsView {
@@ -87,20 +89,23 @@ impl PodLogsView {
                 clear_vm.update(cx, |vm, cx| vm.clear(cx));
             });
 
-        let mut status_row = h_flex().gap_2().items_center().child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(SharedString::from(status)),
-        );
+        let actions = h_flex()
+            .gap_1()
+            .items_center()
+            .child(follow_button)
+            .child(clear_button);
+
+        let mut status_row = h_flex().gap_2().items_center().child(selectable_text(
+            "pod-logs-status".to_string(),
+            status,
+            SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+        ));
         if let Some(error) = error {
-            status_row = status_row.child(
-                div()
-                    .text_xs()
-                    .whitespace_normal()
-                    .text_color(cx.theme().danger)
-                    .child(SharedString::from(error)),
-            );
+            status_row = status_row.child(selectable_text(
+                "pod-logs-error".to_string(),
+                error,
+                SelectableTextStyle::xs().color(cx.theme().danger),
+            ));
         }
 
         v_flex()
@@ -122,19 +127,13 @@ impl PodLogsView {
                             )
                             .child(container_button),
                     )
-                    .child(
-                        h_flex()
-                            .gap_1()
-                            .items_center()
-                            .child(follow_button)
-                            .child(clear_button),
-                    ),
+                    .child(actions),
             )
             .child(status_row)
             .into_any_element()
     }
 
-    fn output(lines: &[String], scroll: &ScrollHandle, cx: &mut Context<Self>) -> AnyElement {
+    fn output(logs: String, scroll: &ScrollHandle, cx: &mut Context<Self>) -> AnyElement {
         div()
             .id("pod-logs-output")
             .flex_1()
@@ -145,18 +144,12 @@ impl PodLogsView {
             .p_3()
             .track_scroll(scroll)
             .overflow_y_scrollbar()
-            .children(lines.iter().map(|line| {
-                let text = if line.is_empty() {
-                    " ".to_string()
-                } else {
-                    line.clone()
-                };
-                div()
-                    .text_xs()
-                    .font_family("monospace")
-                    .whitespace_normal()
-                    .child(SharedString::from(text))
-            }))
+            .child(div().w_full().min_w_0().child(selectable_text(
+                "pod-logs-text".to_string(),
+                logs,
+                SelectableTextStyle::xs().monospace(),
+            )))
+            .context_menu(text_selection_context_menu)
             .into_any_element()
     }
 }
@@ -169,10 +162,11 @@ impl Render for PodLogsView {
         let follow = vm.follow();
         let status = vm.status().to_string();
         let error = vm.error().map(str::to_string);
-        let lines = vm.lines().to_vec();
+        let line_count = vm.lines().len();
+        let logs = vm.lines().join("\n");
 
-        if follow && !lines.is_empty() {
-            self.scroll.scroll_to_item(lines.len() - 1);
+        if follow && line_count > 0 {
+            self.scroll.scroll_to_bottom();
         }
 
         v_flex()
@@ -189,6 +183,6 @@ impl Render for PodLogsView {
                 error,
                 cx,
             ))
-            .child(Self::output(&lines, &self.scroll, cx))
+            .child(Self::output(logs, &self.scroll, cx))
     }
 }

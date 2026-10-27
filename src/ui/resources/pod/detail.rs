@@ -14,8 +14,8 @@ use crate::models::resources::pod::detail::{
     PodContainer, PodDetail, PodDetailState, UsageHistory,
 };
 use crate::ui::components::detail::{
-    age, detail_header, detail_shell, empty_row, error_body, field, key_values, loading_body,
-    raw_manifest, section, usage_section,
+    SelectableTextStyle, age, detail_header, detail_shell, empty_row, error_body, field,
+    field_with_id, key_values, loading_body, raw_manifest, section, selectable_text, usage_section,
 };
 use crate::ui::resources::pod::PodsView;
 use crate::ui::resources::pod::exec::PodExecView;
@@ -276,35 +276,91 @@ fn containers(title: &str, containers: &[PodContainer], cx: &mut Context<PodsVie
             );
         }
         if !container.last_state.is_empty() {
-            block = block.child(field("Last state", &container.last_state, cx));
+            block = block.child(field_with_id(
+                format!("pod-container-{}-last-state", container.name),
+                "Last state",
+                &container.last_state,
+                cx,
+            ));
         }
         block = block
-            .child(field("Image", dash(&container.image), cx))
-            .child(field(
+            .child(field_with_id(
+                format!("pod-container-{}-image", container.name),
+                "Image",
+                dash(&container.image),
+                cx,
+            ))
+            .child(field_with_id(
+                format!("pod-container-{}-image-pull-policy", container.name),
                 "Image pull policy",
                 dash(&container.image_pull_policy),
                 cx,
             ))
-            .child(field("Container ID", dash(&container.container_id), cx))
-            .child(field("Image ID", dash(&container.image_id), cx));
+            .child(field_with_id(
+                format!("pod-container-{}-container-id", container.name),
+                "Container ID",
+                dash(&container.container_id),
+                cx,
+            ))
+            .child(field_with_id(
+                format!("pod-container-{}-image-id", container.name),
+                "Image ID",
+                dash(&container.image_id),
+                cx,
+            ));
         if !container.command.is_empty() {
-            block = block.child(field("Command", &container.command.join(" "), cx));
+            block = block.child(field_with_id(
+                format!("pod-container-{}-command", container.name),
+                "Command",
+                &container.command.join(" "),
+                cx,
+            ));
         }
         if !container.args.is_empty() {
-            block = block.child(field("Args", &container.args.join(" "), cx));
+            block = block.child(field_with_id(
+                format!("pod-container-{}-args", container.name),
+                "Args",
+                &container.args.join(" "),
+                cx,
+            ));
         }
         if !container.ports.is_empty() {
-            block = block.child(field("Ports", &container.ports.join(", "), cx));
+            block = block.child(field_with_id(
+                format!("pod-container-{}-ports", container.name),
+                "Ports",
+                &container.ports.join(", "),
+                cx,
+            ));
         }
         if !container.env.is_empty() {
-            block = block.child(field("Env", &container.env.join("\n"), cx));
+            block = block.child(field_with_id(
+                format!("pod-container-{}-env", container.name),
+                "Env",
+                &container.env.join("\n"),
+                cx,
+            ));
         }
         if !container.mounts.is_empty() {
-            block = block.child(field("Mounts", &container.mounts.join("\n"), cx));
+            block = block.child(field_with_id(
+                format!("pod-container-{}-mounts", container.name),
+                "Mounts",
+                &container.mounts.join("\n"),
+                cx,
+            ));
         }
         block = block
-            .child(field("Requests", &quantity_map(&container.requests), cx))
-            .child(field("Limits", &quantity_map(&container.limits), cx));
+            .child(field_with_id(
+                format!("pod-container-{}-requests", container.name),
+                "Requests",
+                &quantity_map(&container.requests),
+                cx,
+            ))
+            .child(field_with_id(
+                format!("pod-container-{}-limits", container.name),
+                "Limits",
+                &quantity_map(&container.limits),
+                cx,
+            ));
         body = body.child(block);
     }
     section(title, body, cx)
@@ -373,22 +429,18 @@ fn conditions(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
                     ),
             );
         if !condition.reason.is_empty() {
-            block = block.child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(condition.reason.clone()),
-            );
+            block = block.child(div().w_full().min_w_0().child(selectable_text(
+                format!("pod-condition-{}-reason", condition.type_),
+                condition.reason.clone(),
+                SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+            )));
         }
         if !condition.message.is_empty() {
-            block = block.child(
-                div()
-                    .w_full()
-                    .min_w_0()
-                    .text_xs()
-                    .whitespace_normal()
-                    .child(condition.message.clone()),
-            );
+            block = block.child(div().w_full().min_w_0().child(selectable_text(
+                format!("pod-condition-{}-message", condition.type_),
+                condition.message.clone(),
+                SelectableTextStyle::xs(),
+            )));
         }
         body = body.child(block);
     }
@@ -406,7 +458,12 @@ fn volumes(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
         } else {
             format!("{} · {}", volume.type_, volume.name)
         };
-        body = body.child(field(&label, dash(&volume.detail), cx));
+        body = body.child(field_with_id(
+            format!("pod-volume-{}-{}", volume.type_, volume.name),
+            &label,
+            dash(&volume.detail),
+            cx,
+        ));
     }
     section("Volumes", body, cx)
 }
@@ -426,7 +483,15 @@ fn tolerations(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
         if let Some(seconds) = toleration.seconds {
             value.push_str(&format!(" · {seconds}s"));
         }
-        body = body.child(field(&label, value.trim(), cx));
+        body = body.child(field_with_id(
+            format!(
+                "pod-toleration-{}-{}-{}",
+                toleration.key, toleration.operator, toleration.value
+            ),
+            &label,
+            value.trim(),
+            cx,
+        ));
     }
     section("Tolerations", body, cx)
 }
@@ -442,7 +507,12 @@ fn owners(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
         } else {
             owner.kind.clone()
         };
-        body = body.child(field(&label, &owner.name, cx));
+        body = body.child(field_with_id(
+            format!("pod-owner-{}-{}", owner.kind, owner.name),
+            &label,
+            &owner.name,
+            cx,
+        ));
     }
     section("Owners", body, cx)
 }

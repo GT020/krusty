@@ -1,9 +1,11 @@
 //! Shared building blocks for resource detail panes.
 
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::base::{SelectableText, TextSelection, h_flex, v_flex};
 use gpui_kit::component::chart::AreaChart;
+use gpui_kit::component::menu::{ContextMenuExt, PopupMenu, PopupMenuItem};
 use gpui_kit::component::progress::Progress;
 use gpui_kit::component::scroll::ScrollableElement as _;
 use gpui_kit::component::{
@@ -11,8 +13,9 @@ use gpui_kit::component::{
     button::{Button, ButtonVariants as _},
 };
 use gpui_kit::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, SharedString,
-    Styled as _, div, px,
+    AbsoluteLength, AnyElement, ClipboardItem, Context, Entity, FontWeight, Hsla,
+    InteractiveElement as _, IntoElement, ParentElement as _, SharedString, Styled as _,
+    TextStyleRefinement, WhiteSpace, Window, div, px, rems,
 };
 
 use crate::models::resources::usage::UsageHistory;
@@ -32,7 +35,9 @@ pub(crate) fn detail_shell<T: 'static>(
     if !compact {
         root = root.border_l_1().border_color(cx.theme().border);
     }
-    root.into_any_element()
+    root.id("detail-shell")
+        .context_menu(text_selection_context_menu)
+        .into_any_element()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -82,18 +87,16 @@ pub(crate) fn detail_header<T: 'static>(
                 .flex_1()
                 .min_w_0()
                 .gap_1()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .child(title.to_string()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .whitespace_normal()
-                        .child(subtitle.to_string()),
-                ),
+                .child(div().w_full().min_w_0().child(selectable_text(
+                    format!("{id_prefix}-title"),
+                    title.to_string(),
+                    SelectableTextStyle::sm().weight(FontWeight::MEDIUM),
+                )))
+                .child(div().w_full().min_w_0().child(selectable_text(
+                    format!("{id_prefix}-subtitle"),
+                    subtitle.to_string(),
+                    SelectableTextStyle::xs(),
+                ))),
         )
         .child(close_button)
         .into_any_element()
@@ -137,13 +140,11 @@ pub(crate) fn error_body<T: 'static>(
                 .text_color(cx.theme().danger)
                 .child(title.to_string()),
         )
-        .child(
-            div()
-                .text_xs()
-                .whitespace_normal()
-                .text_color(cx.theme().muted_foreground)
-                .child(message.to_string()),
-        )
+        .child(div().w_full().min_w_0().child(selectable_text(
+            "detail-error-message".to_string(),
+            message.to_string(),
+            SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+        )))
         .into_any_element()
 }
 
@@ -165,7 +166,139 @@ pub(crate) fn section<T: 'static>(
         .into_any_element()
 }
 
+/// Visual treatment for [`SelectableText`] runs in detail panes.
+#[derive(Clone, Copy)]
+pub(crate) struct SelectableTextStyle {
+    font_size: AbsoluteLength,
+    color: Option<Hsla>,
+    font_weight: Option<FontWeight>,
+    monospace: bool,
+}
+
+impl SelectableTextStyle {
+    pub(crate) fn xs() -> Self {
+        Self {
+            font_size: rems(0.75).into(),
+            color: None,
+            font_weight: None,
+            monospace: false,
+        }
+    }
+
+    pub(crate) fn sm() -> Self {
+        Self {
+            font_size: rems(0.875).into(),
+            ..Self::xs()
+        }
+    }
+
+    pub(crate) fn color(mut self, color: Hsla) -> Self {
+        self.color = Some(color);
+        self
+    }
+
+    pub(crate) fn weight(mut self, weight: FontWeight) -> Self {
+        self.font_weight = Some(weight);
+        self
+    }
+
+    pub(crate) fn monospace(mut self) -> Self {
+        self.monospace = true;
+        self
+    }
+}
+
+pub(crate) fn selectable_text(
+    id: String,
+    text: impl Into<SharedString>,
+    style: SelectableTextStyle,
+) -> AnyElement {
+    // Detail text is rendered in reading order, so a process-wide sequence keeps
+    // runs in the order they appear on screen for drag selection across fields.
+    static NEXT_DOCUMENT_ORDER: AtomicU64 = AtomicU64::new(0);
+    let refinement = TextStyleRefinement {
+        color: style.color,
+        font_family: style.monospace.then(|| "monospace".into()),
+        font_size: Some(style.font_size),
+        font_weight: style.font_weight,
+        white_space: Some(WhiteSpace::Normal),
+        ..Default::default()
+    };
+    SelectableText::new(id, text)
+        .document_order(NEXT_DOCUMENT_ORDER.fetch_add(1, Ordering::Relaxed))
+        .text_style(refinement)
+        .into_any_element()
+}
+
+/// Context menu for the current window text selection.
+///
+/// Returns an empty menu when nothing is selected, so right-clicking plain
+/// detail text does not open a menu without a target.
+pub(crate) fn text_selection_context_menu(
+    menu: PopupMenu,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    if TextSelection::selected_text(window, cx).trim().is_empty() {
+        return menu;
+    }
+    menu.item(
+        PopupMenuItem::new("Copy")
+            .icon(IconName::Copy)
+            .on_click(|_, window, cx| {
+                let text = TextSelection::selected_text(window, cx).trim().to_string();
+                if !text.is_empty() {
+                    cx.write_to_clipboard(ClipboardItem::new_string(text));
+                }
+            }),
+    )
+}
+
 pub(crate) fn field<T: 'static>(label: &str, value: &str, cx: &mut Context<T>) -> AnyElement {
+    field_with_id(format!("detail-field-{label}"), label, value, cx)
+}
+
+pub(crate) fn field_with_id<T: 'static>(
+    id: String,
+    label: &str,
+    value: &str,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    field_row(id, label, value, None, cx)
+}
+
+pub(crate) fn field_colored<T: 'static>(
+    label: &str,
+    value: &str,
+    color: Hsla,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    field_row(
+        format!("detail-field-{label}"),
+        label,
+        value,
+        Some(color),
+        cx,
+    )
+}
+
+fn field_row<T: 'static>(
+    id: String,
+    label: &str,
+    value: &str,
+    color: Option<Hsla>,
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let label = selectable_text(
+        format!("{id}-label"),
+        label.to_string(),
+        SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+    );
+    let value_style = match color {
+        Some(color) => SelectableTextStyle::xs().color(color),
+        None => SelectableTextStyle::xs(),
+    };
+    let value = selectable_text(format!("{id}-value"), value.to_string(), value_style);
     v_flex()
         .w_full()
         .min_w_0()
@@ -173,20 +306,8 @@ pub(crate) fn field<T: 'static>(label: &str, value: &str, cx: &mut Context<T>) -
         .py_1()
         .border_b_1()
         .border_color(cx.theme().border)
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(wrap_text(label)),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .text_xs()
-                .whitespace_normal()
-                .child(wrap_text(value)),
-        )
+        .child(div().w_full().min_w_0().child(label))
+        .child(div().w_full().min_w_0().child(value))
         .into_any_element()
 }
 
@@ -195,20 +316,16 @@ pub(crate) fn value_pair<T: 'static>(label: &str, value: &str, cx: &mut Context<
         .flex_1()
         .min_w_0()
         .gap_1()
-        .child(
-            div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(label.to_string()),
-        )
-        .child(
-            div()
-                .w_full()
-                .min_w_0()
-                .text_xs()
-                .whitespace_normal()
-                .child(value.to_string()),
-        )
+        .child(div().w_full().min_w_0().child(selectable_text(
+            format!("detail-value-{label}-label"),
+            label.to_string(),
+            SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+        )))
+        .child(div().w_full().min_w_0().child(selectable_text(
+            format!("detail-value-{label}-value"),
+            value.to_string(),
+            SelectableTextStyle::xs(),
+        )))
         .into_any_element()
 }
 
@@ -234,7 +351,12 @@ pub(crate) fn key_values<T: 'static>(
         body = body.child(empty_row("None", cx));
     }
     for (key, value) in values {
-        body = body.child(field(key, value, cx));
+        body = body.child(field_with_id(
+            format!("detail-{title}-{key}"),
+            key,
+            value,
+            cx,
+        ));
     }
     section(title, body, cx)
 }
@@ -249,11 +371,15 @@ pub(crate) fn raw_manifest<T: 'static>(json: &str, cx: &mut Context<T>) -> AnyEl
             .border_1()
             .border_color(cx.theme().border)
             .p_3()
-            .font_family("monospace")
-            .text_xs()
-            .whitespace_normal()
-            .text_color(cx.theme().muted_foreground)
-            .child(wrap_text(json)),
+            .child(
+                div().w_full().min_w_0().child(selectable_text(
+                    "detail-manifest-text".to_string(),
+                    json.to_string(),
+                    SelectableTextStyle::xs()
+                        .monospace()
+                        .color(cx.theme().muted_foreground),
+                )),
+            ),
         cx,
     )
 }
@@ -447,25 +573,6 @@ fn usage_bar<T: 'static>(
                 .color(color),
         )
         .into_any_element()
-}
-
-pub(crate) fn wrap_text(value: &str) -> String {
-    const BREAK_EVERY: usize = 24;
-    let mut out = String::with_capacity(value.len() + value.len() / BREAK_EVERY);
-    let mut run = 0;
-    for character in value.chars() {
-        out.push(character);
-        if character.is_whitespace() {
-            run = 0;
-        } else {
-            run += 1;
-            if run >= BREAK_EVERY {
-                out.push('\u{200b}');
-                run = 0;
-            }
-        }
-    }
-    out
 }
 
 pub(crate) fn age(created_at: Option<i64>) -> String {
