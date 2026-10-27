@@ -5,7 +5,7 @@ pub mod sidebar;
 pub mod status_bar;
 
 use crate::cluster::ClusterState;
-use crate::models::{NamespaceScope, ResourceKind};
+use crate::models::ResourceKind;
 use crate::ui::resources::list::ResourceListView;
 use crate::ui::resources::node::NodesView;
 use crate::ui::resources::pod::PodsView;
@@ -15,11 +15,10 @@ use crate::ui::settings::theme::{self, AppearanceState};
 use crate::ui::shell::nav::NavTarget;
 use crate::ui::shell::sidebar::render_sidebar;
 use crate::ui::shell::status_bar::render_status_bar;
+use crate::view_models::shell::{NamespaceSelect, ShellViewModel};
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenuItem};
-use gpui_kit::component::select::{
-    SearchableVec, Select, SelectEvent, SelectItem, SelectState,
-};
+use gpui_kit::component::select::Select;
 use gpui_kit::component::{
     ActiveTheme, IconName, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
@@ -31,18 +30,12 @@ use gpui_kit::{
 use std::collections::BTreeMap;
 
 pub struct Workspace {
-    selected: NavTarget,
+    shell: Entity<ShellViewModel>,
     panels: BTreeMap<ResourceKind, Entity<ResourceListView>>,
     pods: Option<Entity<PodsView>>,
     nodes: Option<Entity<NodesView>>,
     custom_resources: Entity<CustomResourcesView>,
-    namespace_select: Entity<SelectState<SearchableVec<NamespaceItem>>>,
-    /// Last-synced values mirrored into `namespace_select`; used to avoid
-    /// rebuilding the list on every render, which would discard the user's
-    /// in-progress search filter.
-    synced_namespaces: Vec<String>,
-    synced_scope: NamespaceScope,
-    _cluster_subscription: gpui_kit::Subscription,
+    _shell_subscription: gpui_kit::Subscription,
     _appearance_subscription: gpui_kit::Subscription,
     _activation_subscription: gpui_kit::Subscription,
     _preference_subscription: gpui_kit::Subscription,
@@ -53,8 +46,8 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let started = std::time::Instant::now();
         tracing::info!("ui: workspace construction start");
-        let cluster_subscription =
-            cx.observe_global::<crate::cluster::ClusterState>(|_, cx| cx.notify());
+        let shell = cx.new(|cx| ShellViewModel::new(window, cx));
+        let shell_subscription = cx.observe(&shell, |_, _, cx| cx.notify());
         let appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
             theme::sync_system_appearance(window, cx);
         });
@@ -76,47 +69,17 @@ impl Workspace {
         let panels = BTreeMap::new();
         let pods = Some(cx.new(|cx| PodsView::new(window, cx)));
 
-        let namespace_select = cx.new(|cx| {
-            let state = cx.global::<ClusterState>();
-            let items = namespace_items(state.namespaces());
-            let selected = state.scope().namespace().map(str::to_string);
-            let mut select = SelectState::new(items, None, window, cx).searchable(true);
-            if let Some(selected) = selected {
-                select.set_selected_value(&selected, window, cx);
-            }
-            select
-        });
-        let synced_namespaces = cx.global::<ClusterState>().namespaces().to_vec();
-        let synced_scope = cx.global::<ClusterState>().scope().clone();
-        cx.subscribe(
-            &namespace_select,
-            |_, _, event: &SelectEvent<SearchableVec<NamespaceItem>>, cx| {
-                let SelectEvent::Confirm(value) = event;
-                let scope = match value {
-                    Some(namespace) if !namespace.is_empty() => {
-                        NamespaceScope::One(namespace.clone())
-                    }
-                    _ => NamespaceScope::All,
-                };
-                crate::cluster::set_namespace_scope(cx, scope);
-            },
-        )
-        .detach();
-
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,
             "ui: workspace construction complete"
         );
         Self {
-            selected: NavTarget::Resource(ResourceKind::Pods),
+            shell,
             panels,
             pods,
             nodes: None,
             custom_resources,
-            namespace_select,
-            synced_namespaces,
-            synced_scope,
-            _cluster_subscription: cluster_subscription,
+            _shell_subscription: shell_subscription,
             _appearance_subscription: appearance_subscription,
             _activation_subscription: activation_subscription,
             _preference_subscription: preference_subscription,
@@ -125,11 +88,12 @@ impl Workspace {
     }
 
     pub fn select(&mut self, target: NavTarget, window: &mut Window, cx: &mut Context<Self>) {
-        if target == self.selected {
+        let previous = self.shell.read(cx).selected();
+        if !self.shell.update(cx, |shell, cx| shell.select(target, cx)) {
             return;
         }
-        tracing::info!(from = ?self.selected, to = ?target, "ui: select navigation target");
-        if let NavTarget::Resource(kind) = self.selected {
+        tracing::info!(from = ?previous, to = ?target, "ui: select navigation target");
+        if let NavTarget::Resource(kind) = previous {
             match kind {
                 ResourceKind::Pods => {
                     if let Some(pods) = self.pods.clone() {
@@ -148,7 +112,6 @@ impl Workspace {
                 }
             }
         }
-        self.selected = target;
         if let NavTarget::Resource(kind) = target {
             match kind {
                 ResourceKind::Pods => {
@@ -178,8 +141,8 @@ impl Workspace {
         cx.notify();
     }
 
-    fn content(&self, cx: &Context<Self>) -> gpui_kit::AnyElement {
-        match self.selected {
+    fn content(&self, selected: NavTarget, cx: &Context<Self>) -> gpui_kit::AnyElement {
+        match selected {
             NavTarget::Resource(ResourceKind::Pods) => self
                 .pods
                 .clone()
@@ -203,9 +166,12 @@ impl Workspace {
     }
 }
 
-fn render_context_selector(cx: &Context<Workspace>) -> impl IntoElement {
-    let state = cx.global::<ClusterState>();
-    let label = state.context().unwrap_or("No context").to_string();
+fn render_context_selector(
+    cx: &Context<Workspace>,
+    shell: &Entity<ShellViewModel>,
+) -> impl IntoElement {
+    let label = shell.read(cx).context_label(cx);
+    let shell = shell.clone();
     Button::new("context")
         .ghost()
         .small()
@@ -221,11 +187,14 @@ fn render_context_selector(cx: &Context<Workspace>) -> impl IntoElement {
             for context in &contexts {
                 let id = context.id().to_string();
                 let selected = active.as_deref() == Some(context.id());
+                let shell = shell.clone();
                 menu = menu.item(
                     PopupMenuItem::new(context.label().to_string())
                         .checked(selected)
                         .on_click(move |_, _, cx| {
-                            if let Err(error) = crate::cluster::switch_context(cx, &id) {
+                            if let Err(error) =
+                                shell.update(cx, |shell, cx| shell.switch_context(&id, cx))
+                            {
                                 tracing::error!(
                                     context = %id,
                                     %error,
@@ -239,89 +208,7 @@ fn render_context_selector(cx: &Context<Workspace>) -> impl IntoElement {
         })
 }
 
-/// One row in the namespace selector. `name` is empty for the "All namespaces"
-/// sentinel; `value()` distinguishes the scope.
-#[derive(Clone, Debug)]
-struct NamespaceItem {
-    name: String,
-}
-
-impl NamespaceItem {
-    fn all() -> Self {
-        Self {
-            name: String::new(),
-        }
-    }
-
-    fn named(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
-    }
-
-    fn is_all(&self) -> bool {
-        self.name.is_empty()
-    }
-}
-
-impl SelectItem for NamespaceItem {
-    type Value = String;
-
-    fn title(&self) -> gpui_kit::SharedString {
-        if self.is_all() {
-            "All namespaces".into()
-        } else {
-            self.name.clone().into()
-        }
-    }
-
-    fn value(&self) -> &Self::Value {
-        &self.name
-    }
-}
-
-/// Build the select items: an "All namespaces" sentinel first, then namespaces.
-fn namespace_items(namespaces: &[String]) -> SearchableVec<NamespaceItem> {
-    let mut items = Vec::with_capacity(namespaces.len() + 1);
-    items.push(NamespaceItem::all());
-    items.extend(namespaces.iter().cloned().map(NamespaceItem::named));
-    SearchableVec::new(items)
-}
-
-/// Sync the namespace select from the cluster global, but only when the
-/// namespaces list or the scope actually changed. `set_items` rebuilds the
-/// delegate and would drop the in-progress search filter, so we avoid calling
-/// it on every render.
-fn sync_namespace_select(
-    workspace: &mut Workspace,
-    window: &mut Window,
-    cx: &mut Context<Workspace>,
-) {
-    let state = cx.global::<ClusterState>();
-    let namespaces = state.namespaces().to_vec();
-    let scope = state.scope().clone();
-
-    let namespaces_changed = namespaces != workspace.synced_namespaces;
-    let scope_changed = scope != workspace.synced_scope;
-    if !namespaces_changed && !scope_changed {
-        return;
-    }
-
-    workspace.synced_namespaces = namespaces.clone();
-    workspace.synced_scope = scope.clone();
-
-    workspace.namespace_select.update(cx, |select, cx| {
-        if namespaces_changed {
-            select.set_items(namespace_items(&namespaces), window, cx);
-        }
-        let value = scope.namespace().map(str::to_string).unwrap_or_default();
-        if select.selected_value() != Some(&value) {
-            select.set_selected_value(&value, window, cx);
-        }
-    });
-}
-
-fn render_namespace_selector(
-    select: &Entity<SelectState<SearchableVec<NamespaceItem>>>,
-) -> impl IntoElement {
+fn render_namespace_selector(select: &Entity<NamespaceSelect>) -> impl IntoElement {
     Select::new(select)
         .id("namespace")
         .small()
@@ -332,11 +219,12 @@ fn render_namespace_selector(
 }
 
 impl Render for Workspace {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let started = std::time::Instant::now();
-        tracing::trace!(selected = ?self.selected, panels = self.panels.len(), "ui: workspace render start");
-        sync_namespace_select(self, window, cx);
-        let sidebar = render_sidebar(self.selected, cx.entity(), cx);
+        let selected = self.shell.read(cx).selected();
+        let namespace_select = self.shell.read(cx).namespace_select().clone();
+        tracing::trace!(selected = ?selected, panels = self.panels.len(), "ui: workspace render start");
+        let sidebar = render_sidebar(selected, cx.entity(), cx);
 
         let root = v_flex()
             .size_full()
@@ -353,8 +241,8 @@ impl Render for Workspace {
                                 .text_color(cx.theme().muted_foreground)
                                 .child("krusty"),
                         )
-                        .child(render_context_selector(cx))
-                        .child(render_namespace_selector(&self.namespace_select)),
+                        .child(render_context_selector(cx, &self.shell))
+                        .child(render_namespace_selector(&namespace_select)),
                 ),
             )
             .child(
@@ -363,11 +251,11 @@ impl Render for Workspace {
                     .min_h_0()
                     .overflow_hidden()
                     .child(sidebar)
-                    .child(self.content(cx)),
+                    .child(self.content(selected, cx)),
             )
             .child(render_status_bar(cx));
         tracing::trace!(
-            selected = ?self.selected,
+            selected = ?selected,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "ui: workspace render end"
         );
