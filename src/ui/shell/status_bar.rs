@@ -7,7 +7,7 @@ pub fn render_status_bar(cx: &Context<crate::ui::Workspace>) -> impl IntoElement
     let state = cx.global::<ClusterState>();
     let context = state
         .context()
-        .map(|context| format!("{context} · {}", state.scope().label()))
+        .map(str::to_string)
         .unwrap_or_else(|| "no cluster · add a kubeconfig".to_string());
     let (dot, label) = match state.reachable() {
         Some(true) => (cx.theme().success, "Connected"),

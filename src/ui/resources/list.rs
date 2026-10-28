@@ -1,6 +1,9 @@
 //! Generic resource list view: header, virtualized table, and detail pane.
 
-use crate::models::{ResourceKind, SnapshotPhase};
+use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
+use crate::ui::resources::namespace_filter::{
+    NamespaceFilter, NamespaceFilterEvent, render as render_namespace_filter,
+};
 use crate::view_models::ResourceViewModel;
 use crate::view_models::resources::deployments::DeploymentsDetailViewModel;
 use crate::view_models::resources::detail::ResourceDetailViewModel;
@@ -11,7 +14,7 @@ use gpui_kit::component::{
     h_resizable, resizable_panel,
 };
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, FontWeight, IntoElement, ParentElement as _, Pixels,
+    AnyElement, App, AppContext as _, Context, FontWeight, IntoElement, ParentElement as _, Pixels,
     Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 
@@ -34,17 +37,33 @@ pub struct ResourceListView {
     kind: ResourceKind,
     title: SharedString,
     vm: ResourceViewModel,
+    namespace_filter: gpui_kit::Entity<NamespaceFilter>,
     detail: gpui_kit::Entity<ResourceDetailViewModel>,
     deployment_actions: gpui_kit::Entity<DeploymentsDetailViewModel>,
     _vm_sub: Subscription,
+    _namespace_sub: Subscription,
     _detail_sub: Subscription,
     _row_sub: Subscription,
 }
 
 impl ResourceListView {
-    pub fn new(kind: ResourceKind, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let vm = ResourceViewModel::new(kind, window, cx);
+    pub fn new(
+        kind: ResourceKind,
+        scope: NamespaceScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let vm = ResourceViewModel::new(kind, scope, window, cx);
         let vm_sub = vm.observe(cx, |_, cx| cx.notify());
+        let namespace_filter = cx.new(|cx| NamespaceFilter::new(window, cx));
+        let namespace_sub = cx.subscribe(
+            &namespace_filter,
+            |this, _, event: &NamespaceFilterEvent, cx| {
+                let NamespaceFilterEvent::Changed(scope) = event;
+                this.vm.set_scope(scope.clone(), cx);
+                this.close_detail(cx);
+            },
+        );
         let detail = cx.new(ResourceDetailViewModel::new);
         let deployment_actions = cx.new(|_| DeploymentsDetailViewModel::new(detail.downgrade()));
         let detail_sub = cx.observe(&detail, |_, _, cx| cx.notify());
@@ -61,21 +80,26 @@ impl ResourceListView {
             kind,
             title: kind.label().into(),
             vm,
+            namespace_filter,
             detail,
             deployment_actions,
             _vm_sub: vm_sub,
+            _namespace_sub: namespace_sub,
             _detail_sub: detail_sub,
             _row_sub: row_sub,
         }
     }
 
+    pub fn scope_label(&self, cx: &App) -> String {
+        self.vm.scope(cx).label()
+    }
+
+    pub fn namespace_filter(&self) -> &gpui_kit::Entity<NamespaceFilter> {
+        &self.namespace_filter
+    }
+
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.vm.set_active(active, cx);
-        if active {
-            self.vm.scroll_to_top(cx);
-        } else {
-            self.close_detail(cx);
-        }
     }
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
@@ -83,7 +107,6 @@ impl ResourceListView {
     }
 
     fn list(&self, cx: &Context<Self>) -> AnyElement {
-        let scope = self.vm.scope(cx).label();
         let phase = self.vm.phase(cx);
         let count = self.vm.item_count(cx);
 
@@ -96,7 +119,7 @@ impl ResourceListView {
             SnapshotPhase::Ready => div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(format!("{count} objects · {scope}"))
+                .child(format!("{count} objects"))
                 .into_any_element(),
             SnapshotPhase::Error(message) => div()
                 .text_xs()
@@ -104,6 +127,17 @@ impl ResourceListView {
                 .child(message.clone())
                 .into_any_element(),
         };
+
+        let mut header_left = h_flex().gap_3().items_center().child(
+            div()
+                .text_size(px(15.))
+                .font_weight(FontWeight::MEDIUM)
+                .child(self.title.clone()),
+        );
+        if self.kind.is_namespaced() {
+            header_left = header_left.child(render_namespace_filter(&self.namespace_filter, cx));
+        }
+        let header_left = header_left.child(status);
 
         let table_el = self.vm.render_table(cx);
         let handle = cx.entity().clone();
@@ -118,18 +152,7 @@ impl ResourceListView {
                     .px_4()
                     .border_b_1()
                     .border_color(cx.theme().border)
-                    .child(
-                        h_flex()
-                            .gap_3()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_size(px(15.))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .child(self.title.clone()),
-                            )
-                            .child(status),
-                    )
+                    .child(header_left)
                     .child(
                         Button::new("refresh")
                             .ghost()

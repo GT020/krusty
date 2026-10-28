@@ -1,6 +1,7 @@
 use crate::models::ResourceKind;
 use crate::ui::shell::nav::{self, NavTarget};
 use gpui_kit::component::ActiveTheme;
+use gpui_kit::component::menu::PopupMenuItem;
 use gpui_kit::component::sidebar::{
     Sidebar, SidebarCollapsible, SidebarFooter, SidebarGroup, SidebarMenuItem,
 };
@@ -8,19 +9,42 @@ use gpui_kit::{Context, Entity, ParentElement as _, Styled as _, div};
 
 fn nav_item(
     target: NavTarget,
-    selected: NavTarget,
+    selected: Option<NavTarget>,
     entity: &Entity<crate::ui::Workspace>,
 ) -> SidebarMenuItem {
-    let handle = entity.clone();
+    let click_handle = entity.clone();
+    let menu_handle = entity.clone();
     nav::menu_item(target)
-        .active(selected == target)
-        .on_click(move |_, window, cx| {
-            handle.update(cx, |workspace, cx| workspace.select(target, window, cx));
+        .active(selected == Some(target))
+        .on_click(move |event, window, cx| {
+            let new_tab = event.modifiers().secondary();
+            click_handle.update(cx, |workspace, cx| {
+                workspace.select(target, new_tab, window, cx);
+            });
+        })
+        .context_menu(move |menu, _, _| {
+            let open_handle = menu_handle.clone();
+            let new_tab_handle = menu_handle.clone();
+            let menu = menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
+                open_handle.update(cx, |workspace, cx| {
+                    workspace.select(target, false, window, cx);
+                });
+            }));
+            if target == NavTarget::Settings {
+                return menu;
+            }
+            menu.item(
+                PopupMenuItem::new("Open in new tab").on_click(move |_, window, cx| {
+                    new_tab_handle.update(cx, |workspace, cx| {
+                        workspace.select(target, true, window, cx);
+                    });
+                }),
+            )
         })
 }
 
 pub fn render_sidebar(
-    selected: NavTarget,
+    selected: Option<NavTarget>,
     entity: Entity<crate::ui::Workspace>,
     cx: &mut Context<crate::ui::Workspace>,
 ) -> Sidebar<SidebarGroup<SidebarMenuItem>> {

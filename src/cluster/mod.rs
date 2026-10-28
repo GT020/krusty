@@ -1,6 +1,5 @@
 pub mod kubeconfig;
 
-use crate::models::NamespaceScope;
 use futures::TryStreamExt as _;
 use gpui_kit::{App, BorrowAppContext as _, Global};
 use k8s_openapi::api::core::v1::Namespace;
@@ -44,7 +43,6 @@ pub struct ClusterState {
     store: kubeconfig::ConfigStore,
     reachable: Option<bool>,
     namespaces: Vec<String>,
-    scope: NamespaceScope,
     context_epoch: u64,
     namespace_cancel: Option<watch::Sender<bool>>,
 }
@@ -89,10 +87,6 @@ impl ClusterState {
 
     pub fn namespaces(&self) -> &[String] {
         &self.namespaces
-    }
-
-    pub fn scope(&self) -> &NamespaceScope {
-        &self.scope
     }
 }
 
@@ -177,7 +171,6 @@ pub fn init(cx: &mut App) {
         store,
         reachable: None,
         namespaces: Vec::new(),
-        scope: NamespaceScope::All,
         context_epoch: 0,
         namespace_cancel: None,
     });
@@ -316,26 +309,10 @@ pub fn refresh_namespaces(cx: &mut App) {
             cx.update_global::<ClusterState, _>(|state, _| {
                 state.namespaces = names.clone();
                 state.reachable = Some(true);
-                if let NamespaceScope::One(ref selected) = state.scope
-                    && !names.contains(selected)
-                {
-                    state.scope = NamespaceScope::All;
-                }
             });
         }
     })
     .detach();
-}
-
-/// Change the namespace filter used by every repository subscription.
-pub fn set_namespace_scope(cx: &mut App, scope: NamespaceScope) {
-    cx.update_global::<ClusterState, _>(|state, _| {
-        if state.scope == scope {
-            return;
-        }
-        state.scope = scope;
-        state.context_epoch = state.context_epoch.wrapping_add(1);
-    });
 }
 
 fn build_contexts(
@@ -438,7 +415,6 @@ pub fn switch_context(cx: &mut App, id: &str) -> Result<(), &'static str> {
         state.active = Some(context.id);
         state.reachable = None;
         state.namespaces.clear();
-        state.scope = NamespaceScope::All;
         state.context_epoch = state.context_epoch.wrapping_add(1);
         if let Some(cancel) = state.namespace_cancel.take() {
             let _ = cancel.send(true);
