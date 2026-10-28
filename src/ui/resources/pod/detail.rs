@@ -259,21 +259,20 @@ fn containers(title: &str, containers: &[PodContainer], cx: &mut Context<PodsVie
             .border_b_1()
             .border_color(cx.theme().border)
             .child(
-                div()
-                    .text_xs()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(status_color)
-                    .whitespace_normal()
-                    .child(heading),
+                div().w_full().min_w_0().child(selectable_text(
+                    format!("pod-container-{}-heading", container.name),
+                    heading,
+                    SelectableTextStyle::xs()
+                        .weight(FontWeight::MEDIUM)
+                        .color(status_color),
+                )),
             );
         if !container.state_detail.is_empty() {
-            block = block.child(
-                div()
-                    .text_xs()
-                    .whitespace_normal()
-                    .text_color(cx.theme().muted_foreground)
-                    .child(container.state_detail.clone()),
-            );
+            block = block.child(div().w_full().min_w_0().child(selectable_text(
+                format!("pod-container-{}-state-detail", container.name),
+                container.state_detail.clone(),
+                SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+            )));
         }
         if !container.last_state.is_empty() {
             block = block.child(field_with_id(
@@ -391,6 +390,11 @@ fn conditions(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
         } else {
             cx.theme().muted_foreground
         };
+        let probed = format!(
+            "Probed {} · Changed {}",
+            age(condition.last_probe),
+            age(condition.last_transition)
+        );
         let mut block = v_flex()
             .w_full()
             .min_w_0()
@@ -402,31 +406,21 @@ fn conditions(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(condition.type_.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(status_color)
-                            .child(condition.status.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_right()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "Probed {} · Changed {}",
-                                age(condition.last_probe),
-                                age(condition.last_transition)
-                            )),
-                    ),
+                    .child(selectable_text(
+                        format!("pod-condition-{}-type", condition.type_),
+                        condition.type_.clone(),
+                        SelectableTextStyle::xs().weight(FontWeight::MEDIUM),
+                    ))
+                    .child(selectable_text(
+                        format!("pod-condition-{}-status", condition.type_),
+                        condition.status.clone(),
+                        SelectableTextStyle::xs().color(status_color),
+                    ))
+                    .child(div().flex_1().min_w_0().text_right().child(selectable_text(
+                        format!("pod-condition-{}-probed", condition.type_),
+                        probed,
+                        SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+                    ))),
             );
         if !condition.reason.is_empty() {
             block = block.child(div().w_full().min_w_0().child(selectable_text(

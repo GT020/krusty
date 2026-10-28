@@ -188,6 +188,15 @@ pub fn conditions_section<T: 'static>(
             "Unknown" => cx.theme().warning,
             _ => cx.theme().muted_foreground,
         };
+        let changed = format!(
+            "Changed {}",
+            age_from_timestamp(
+                condition
+                    .get("lastTransitionTime")
+                    .or_else(|| condition.get("lastUpdateTime"))
+                    .or_else(|| condition.get("lastProbeTime"))
+            )
+        );
         let mut block = v_flex()
             .w_full()
             .min_w_0()
@@ -199,30 +208,21 @@ pub fn conditions_section<T: 'static>(
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(condition_type.clone()),
-                    )
-                    .child(div().text_xs().text_color(status_color).child(status))
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_right()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "Changed {}",
-                                age_from_timestamp(
-                                    condition
-                                        .get("lastTransitionTime")
-                                        .or_else(|| condition.get("lastUpdateTime"))
-                                        .or_else(|| condition.get("lastProbeTime"))
-                                )
-                            )),
-                    ),
+                    .child(selectable_text(
+                        format!("condition-{condition_type}-type"),
+                        condition_type.clone(),
+                        SelectableTextStyle::xs().weight(FontWeight::MEDIUM),
+                    ))
+                    .child(selectable_text(
+                        format!("condition-{condition_type}-status"),
+                        status,
+                        SelectableTextStyle::xs().color(status_color),
+                    ))
+                    .child(div().flex_1().min_w_0().text_right().child(selectable_text(
+                        format!("condition-{condition_type}-changed"),
+                        changed,
+                        SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+                    ))),
             );
         let reason = text(condition.get("reason"));
         if reason != "—" {
