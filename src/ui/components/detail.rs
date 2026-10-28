@@ -473,12 +473,11 @@ pub(crate) fn usage_section<T: 'static>(
                             .grid(true),
                     ),
                 )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("Last {last} samples · updated every 10s")),
-                ),
+                .child(div().w_full().min_w_0().child(selectable_text(
+                    "detail-usage-last-samples".to_string(),
+                    format!("Last {last} samples · updated every 10s"),
+                    SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+                ))),
         );
     } else if latest.is_some() {
         body = body.child(
@@ -488,13 +487,11 @@ pub(crate) fn usage_section<T: 'static>(
                 .child("Collecting usage samples…"),
         );
     } else if let Some(error) = error {
-        body = body.child(
-            div()
-                .text_xs()
-                .whitespace_normal()
-                .text_color(cx.theme().warning)
-                .child(error.to_string()),
-        );
+        body = body.child(div().w_full().min_w_0().child(selectable_text(
+            "detail-usage-error".to_string(),
+            error.to_string(),
+            SelectableTextStyle::xs().color(cx.theme().warning),
+        )));
     } else {
         body = body.child(
             div()
@@ -555,17 +552,16 @@ fn usage_bar<T: 'static>(
             h_flex()
                 .justify_between()
                 .gap_2()
-                .text_xs()
-                .child(div().flex_shrink_0().child(label.to_string()))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_right()
-                        .whitespace_normal()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(format!("{used} / {capacity}{basis} · {percent:.0}%")),
-                ),
+                .child(div().flex_shrink_0().child(selectable_text(
+                    format!("detail-usage-{label}-label"),
+                    label.to_string(),
+                    SelectableTextStyle::xs(),
+                )))
+                .child(div().flex_1().min_w_0().text_right().child(selectable_text(
+                    format!("detail-usage-{label}-value"),
+                    format!("{used} / {capacity}{basis} · {percent:.0}%"),
+                    SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+                ))),
         )
         .child(
             Progress::new(format!("detail-usage-{label}"))

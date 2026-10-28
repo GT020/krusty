@@ -144,7 +144,11 @@ fn capacity(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
                 .py_2()
                 .border_b_1()
                 .border_color(cx.theme().border)
-                .child(div().text_xs().font_weight(FontWeight::MEDIUM).child(key))
+                .child(div().w_full().min_w_0().child(selectable_text(
+                    format!("node-capacity-{key}-key"),
+                    key.clone(),
+                    SelectableTextStyle::xs().weight(FontWeight::MEDIUM),
+                )))
                 .child(
                     h_flex()
                         .gap_4()
@@ -164,6 +168,11 @@ fn conditions(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
     }
     for condition in &detail.conditions {
         let status_color = condition_color(condition, cx);
+        let heartbeat = format!(
+            "Heartbeat {} · Changed {}",
+            age(condition.last_heartbeat),
+            age(condition.last_transition)
+        );
         let mut block = v_flex()
             .w_full()
             .min_w_0()
@@ -175,31 +184,21 @@ fn conditions(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
                 h_flex()
                     .gap_2()
                     .items_center()
-                    .child(
-                        div()
-                            .text_xs()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(condition.type_.clone()),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(status_color)
-                            .child(condition.status.clone()),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .text_xs()
-                            .text_right()
-                            .text_color(cx.theme().muted_foreground)
-                            .child(format!(
-                                "Heartbeat {} · Changed {}",
-                                age(condition.last_heartbeat),
-                                age(condition.last_transition)
-                            )),
-                    ),
+                    .child(selectable_text(
+                        format!("node-condition-{}-type", condition.type_),
+                        condition.type_.clone(),
+                        SelectableTextStyle::xs().weight(FontWeight::MEDIUM),
+                    ))
+                    .child(selectable_text(
+                        format!("node-condition-{}-status", condition.type_),
+                        condition.status.clone(),
+                        SelectableTextStyle::xs().color(status_color),
+                    ))
+                    .child(div().flex_1().min_w_0().text_right().child(selectable_text(
+                        format!("node-condition-{}-heartbeat", condition.type_),
+                        heartbeat,
+                        SelectableTextStyle::xs().color(cx.theme().muted_foreground),
+                    ))),
             );
         if !condition.reason.is_empty() {
             block = block.child(div().w_full().min_w_0().child(selectable_text(
