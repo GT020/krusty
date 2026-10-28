@@ -51,81 +51,100 @@ pub enum ResourceViewModel {
 }
 
 impl ResourceViewModel {
-    pub fn new<V: 'static>(kind: ResourceKind, window: &mut Window, cx: &mut Context<V>) -> Self {
+    pub fn new<V: 'static>(
+        kind: ResourceKind,
+        scope: NamespaceScope,
+        window: &mut Window,
+        cx: &mut Context<V>,
+    ) -> Self {
         match kind {
-            ResourceKind::Pods => Self::Pods(cx.new(|cx| PodsViewModel::new(window, cx))),
+            ResourceKind::Pods => {
+                Self::Pods(cx.new(|cx| PodsViewModel::new(scope.clone(), window, cx)))
+            }
             ResourceKind::Deployments => {
-                Self::Deployments(cx.new(|cx| DeploymentsViewModel::new(window, cx)))
+                Self::Deployments(cx.new(|cx| DeploymentsViewModel::new(scope.clone(), window, cx)))
             }
-            ResourceKind::StatefulSets => {
-                Self::StatefulSets(cx.new(|cx| StatefulSetsViewModel::new(window, cx)))
-            }
+            ResourceKind::StatefulSets => Self::StatefulSets(
+                cx.new(|cx| StatefulSetsViewModel::new(scope.clone(), window, cx)),
+            ),
             ResourceKind::ReplicaSets => {
-                Self::ReplicaSets(cx.new(|cx| ReplicaSetsViewModel::new(window, cx)))
+                Self::ReplicaSets(cx.new(|cx| ReplicaSetsViewModel::new(scope.clone(), window, cx)))
             }
             ResourceKind::DaemonSets => {
-                Self::DaemonSets(cx.new(|cx| DaemonSetsViewModel::new(window, cx)))
+                Self::DaemonSets(cx.new(|cx| DaemonSetsViewModel::new(scope.clone(), window, cx)))
             }
             ResourceKind::CronJobs => {
-                Self::CronJobs(cx.new(|cx| CronJobsViewModel::new(window, cx)))
+                Self::CronJobs(cx.new(|cx| CronJobsViewModel::new(scope.clone(), window, cx)))
             }
-            ResourceKind::Jobs => Self::Jobs(cx.new(|cx| JobsViewModel::new(window, cx))),
+            ResourceKind::Jobs => {
+                Self::Jobs(cx.new(|cx| JobsViewModel::new(scope.clone(), window, cx)))
+            }
             ResourceKind::Services => {
-                Self::Services(cx.new(|cx| ServicesViewModel::new(window, cx)))
+                Self::Services(cx.new(|cx| ServicesViewModel::new(scope.clone(), window, cx)))
             }
             ResourceKind::Ingresses => {
-                Self::Ingresses(cx.new(|cx| IngressesViewModel::new(window, cx)))
+                Self::Ingresses(cx.new(|cx| IngressesViewModel::new(scope.clone(), window, cx)))
             }
-            ResourceKind::PersistentVolumes => {
-                Self::PersistentVolumes(cx.new(|cx| PersistentVolumesViewModel::new(window, cx)))
-            }
+            ResourceKind::PersistentVolumes => Self::PersistentVolumes(
+                cx.new(|cx| PersistentVolumesViewModel::new(scope.clone(), window, cx)),
+            ),
             ResourceKind::PersistentVolumeClaims => Self::PersistentVolumeClaims(
-                cx.new(|cx| PersistentVolumeClaimsViewModel::new(window, cx)),
+                cx.new(|cx| PersistentVolumeClaimsViewModel::new(scope.clone(), window, cx)),
             ),
             ResourceKind::ConfigMaps => {
-                Self::ConfigMaps(cx.new(|cx| ConfigMapsViewModel::new(window, cx)))
+                Self::ConfigMaps(cx.new(|cx| ConfigMapsViewModel::new(scope.clone(), window, cx)))
             }
-            ResourceKind::Secrets => Self::Secrets(cx.new(|cx| SecretsViewModel::new(window, cx))),
-            ResourceKind::ServiceAccounts => {
-                Self::ServiceAccounts(cx.new(|cx| ServiceAccountsViewModel::new(window, cx)))
+            ResourceKind::Secrets => {
+                Self::Secrets(cx.new(|cx| SecretsViewModel::new(scope.clone(), window, cx)))
             }
-            ResourceKind::StorageClasses => {
-                Self::StorageClasses(cx.new(|cx| StorageClassesViewModel::new(window, cx)))
-            }
-            ResourceKind::Namespaces => {
-                Self::Namespaces(cx.new(|cx| NamespacesViewModel::new(window, cx)))
-            }
-            ResourceKind::Nodes => Self::Nodes(cx.new(|cx| NodesViewModel::new(window, cx))),
-            ResourceKind::ClusterRoles => {
-                Self::ClusterRoles(cx.new(|cx| ClusterRolesViewModel::new(window, cx)))
-            }
-            ResourceKind::EndpointSlices => {
-                Self::EndpointSlices(cx.new(|cx| EndpointSlicesViewModel::new(window, cx)))
-            }
-            ResourceKind::Endpoints => {
-                Self::Endpoints(cx.new(|cx| EndpointsViewModel::new(window, cx)))
-            }
-            ResourceKind::Events => Self::Events(cx.new(|cx| EventsViewModel::new(window, cx))),
-            ResourceKind::HorizontalPodAutoscalers => Self::HorizontalPodAutoscalers(
-                cx.new(|cx| HorizontalPodAutoscalersViewModel::new(window, cx)),
+            ResourceKind::ServiceAccounts => Self::ServiceAccounts(
+                cx.new(|cx| ServiceAccountsViewModel::new(scope.clone(), window, cx)),
             ),
-            ResourceKind::Leases => Self::Leases(cx.new(|cx| LeasesViewModel::new(window, cx))),
-            ResourceKind::NetworkPolicies => {
-                Self::NetworkPolicies(cx.new(|cx| NetworkPoliciesViewModel::new(window, cx)))
+            ResourceKind::StorageClasses => Self::StorageClasses(
+                cx.new(|cx| StorageClassesViewModel::new(scope.clone(), window, cx)),
+            ),
+            ResourceKind::Namespaces => {
+                Self::Namespaces(cx.new(|cx| NamespacesViewModel::new(scope.clone(), window, cx)))
             }
+            ResourceKind::Nodes => {
+                Self::Nodes(cx.new(|cx| NodesViewModel::new(scope.clone(), window, cx)))
+            }
+            ResourceKind::ClusterRoles => Self::ClusterRoles(
+                cx.new(|cx| ClusterRolesViewModel::new(scope.clone(), window, cx)),
+            ),
+            ResourceKind::EndpointSlices => Self::EndpointSlices(
+                cx.new(|cx| EndpointSlicesViewModel::new(scope.clone(), window, cx)),
+            ),
+            ResourceKind::Endpoints => {
+                Self::Endpoints(cx.new(|cx| EndpointsViewModel::new(scope.clone(), window, cx)))
+            }
+            ResourceKind::Events => {
+                Self::Events(cx.new(|cx| EventsViewModel::new(scope.clone(), window, cx)))
+            }
+            ResourceKind::HorizontalPodAutoscalers => Self::HorizontalPodAutoscalers(
+                cx.new(|cx| HorizontalPodAutoscalersViewModel::new(scope.clone(), window, cx)),
+            ),
+            ResourceKind::Leases => {
+                Self::Leases(cx.new(|cx| LeasesViewModel::new(scope.clone(), window, cx)))
+            }
+            ResourceKind::NetworkPolicies => Self::NetworkPolicies(
+                cx.new(|cx| NetworkPoliciesViewModel::new(scope.clone(), window, cx)),
+            ),
             ResourceKind::PodDisruptionBudgets => Self::PodDisruptionBudgets(
-                cx.new(|cx| PodDisruptionBudgetsViewModel::new(window, cx)),
+                cx.new(|cx| PodDisruptionBudgetsViewModel::new(scope.clone(), window, cx)),
             ),
             ResourceKind::ReplicationControllers => Self::ReplicationControllers(
-                cx.new(|cx| ReplicationControllersViewModel::new(window, cx)),
+                cx.new(|cx| ReplicationControllersViewModel::new(scope.clone(), window, cx)),
             ),
-            ResourceKind::RoleBindings => {
-                Self::RoleBindings(cx.new(|cx| RoleBindingsViewModel::new(window, cx)))
+            ResourceKind::RoleBindings => Self::RoleBindings(
+                cx.new(|cx| RoleBindingsViewModel::new(scope.clone(), window, cx)),
+            ),
+            ResourceKind::Roles => {
+                Self::Roles(cx.new(|cx| RolesViewModel::new(scope.clone(), window, cx)))
             }
-            ResourceKind::Roles => Self::Roles(cx.new(|cx| RolesViewModel::new(window, cx))),
-            ResourceKind::Custom(_) => {
-                Self::Custom(cx.new(|cx| CustomResourceViewModel::new(kind, window, cx)))
-            }
+            ResourceKind::Custom(_) => Self::Custom(
+                cx.new(|cx| CustomResourceViewModel::new(kind, scope.clone(), window, cx)),
+            ),
         }
     }
 
@@ -484,6 +503,48 @@ impl ResourceViewModel {
         }
     }
 
+    pub fn set_scope<V: 'static>(&self, scope: NamespaceScope, cx: &mut Context<V>) {
+        match self {
+            Self::Pods(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Deployments(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::StatefulSets(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::ReplicaSets(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::CronJobs(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::ServiceAccounts(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::StorageClasses(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Namespaces(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::DaemonSets(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Jobs(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Services(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Ingresses(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::PersistentVolumes(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::PersistentVolumeClaims(vm) => {
+                vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx))
+            }
+            Self::ConfigMaps(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Secrets(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Nodes(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::ClusterRoles(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::EndpointSlices(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Endpoints(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Events(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::HorizontalPodAutoscalers(vm) => {
+                vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx))
+            }
+            Self::Leases(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::NetworkPolicies(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::PodDisruptionBudgets(vm) => {
+                vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx))
+            }
+            Self::ReplicationControllers(vm) => {
+                vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx))
+            }
+            Self::RoleBindings(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Roles(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+            Self::Custom(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+        }
+    }
+
     pub fn refresh<V: 'static>(&self, cx: &mut Context<V>) {
         match self {
             Self::Pods(vm) => vm.update(cx, |vm, cx| vm.refresh(cx)),
@@ -515,127 +576,6 @@ impl ResourceViewModel {
             Self::RoleBindings(vm) => vm.update(cx, |vm, cx| vm.refresh(cx)),
             Self::Roles(vm) => vm.update(cx, |vm, cx| vm.refresh(cx)),
             Self::Custom(vm) => vm.update(cx, |vm, cx| vm.refresh(cx)),
-        }
-    }
-
-    pub fn scroll_to_top<V: 'static>(&self, cx: &mut Context<V>) {
-        match self {
-            Self::Pods(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Deployments(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::StatefulSets(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::ReplicaSets(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::CronJobs(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::ServiceAccounts(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::StorageClasses(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Namespaces(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::DaemonSets(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Jobs(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Services(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Ingresses(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::PersistentVolumes(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::PersistentVolumeClaims(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::ConfigMaps(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Secrets(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Nodes(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::ClusterRoles(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::EndpointSlices(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Endpoints(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Events(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::HorizontalPodAutoscalers(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Leases(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::NetworkPolicies(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::PodDisruptionBudgets(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::ReplicationControllers(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::RoleBindings(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Roles(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
-            Self::Custom(vm) => {
-                let table = vm.read(cx).table().clone();
-                table.update(cx, |t, cx| t.scroll_to_row(0, cx));
-            }
         }
     }
 

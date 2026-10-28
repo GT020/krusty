@@ -1,4 +1,4 @@
-//! Live pod logs sheet: container selection, follow toggle, and buffered output.
+//! Live pod logs panel: container selection, follow toggle, and buffered output.
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};

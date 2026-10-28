@@ -4,10 +4,9 @@ use std::collections::BTreeMap;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, WindowExt as _, button::Button};
+use gpui_kit::component::{ActiveTheme as _, Sizable as _, button::Button};
 use gpui_kit::{
-    AnyElement, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _,
-    Styled as _, div, px,
+    AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _, div,
 };
 
 use crate::models::resources::pod::detail::{
@@ -18,10 +17,6 @@ use crate::ui::components::detail::{
     field_with_id, key_values, loading_body, raw_manifest, section, selectable_text, usage_section,
 };
 use crate::ui::resources::pod::PodsView;
-use crate::ui::resources::pod::exec::PodExecView;
-use crate::ui::resources::pod::logs::PodLogsView;
-use crate::view_models::resources::pod::exec::PodExecViewModel;
-use crate::view_models::resources::pod::logs::PodLogsViewModel;
 
 pub fn render_detail(
     state: PodDetailState,
@@ -47,6 +42,7 @@ pub fn render_detail(
         ),
         PodDetailState::Closed => return div().into_any_element(),
     };
+    let actions_view = view.clone();
     let header = detail_header(
         &title,
         &subtitle,
@@ -71,7 +67,7 @@ pub fn render_detail(
             let mut body = v_flex()
                 .gap_6()
                 .p_4()
-                .child(actions(&detail))
+                .child(actions(&detail, actions_view))
                 .child(overview(&detail, cx))
                 .child(usage_section(&usage, usage_error.as_deref(), "", cx))
                 .child(containers("Containers", &detail.containers, cx))
@@ -93,7 +89,7 @@ pub fn render_detail(
     detail_shell(header, body, compact, cx)
 }
 
-fn actions(detail: &PodDetail) -> AnyElement {
+fn actions(detail: &PodDetail, view: Entity<PodsView>) -> AnyElement {
     let containers: Vec<String> = detail
         .containers
         .iter()
@@ -102,6 +98,7 @@ fn actions(detail: &PodDetail) -> AnyElement {
     let namespace = detail.namespace.clone();
     let name = detail.name.clone();
 
+    let logs_view = view.clone();
     let logs_namespace = namespace.clone();
     let logs_name = name.clone();
     let logs_containers = containers.clone();
@@ -111,32 +108,20 @@ fn actions(detail: &PodDetail) -> AnyElement {
         .icon(IconName::ScrollText)
         .label("Logs")
         .tooltip("Stream container logs")
-        .on_click(move |_, window, cx| {
-            let vm = cx.new(|cx| {
-                PodLogsViewModel::new(
+        .on_click(move |_, _, cx| {
+            logs_view.update(cx, |view, cx| {
+                view.open_logs(
                     logs_namespace.clone(),
                     logs_name.clone(),
                     logs_containers.clone(),
                     cx,
-                )
-            });
-            let sheet_vm = vm.clone();
-            let view = cx.new(|cx| PodLogsView::new(vm, cx));
-            let title = format!("Logs · {}", logs_name);
-            window.open_sheet(cx, move |sheet, _, _| {
-                let close_vm = sheet_vm.clone();
-                sheet
-                    .title(div().child(title.clone()))
-                    .size(px(820.))
-                    .on_close(move |_, _, cx| {
-                        close_vm.update(cx, |vm, _| vm.shutdown());
-                    })
-                    .child(view.clone())
+                );
             });
         });
 
+    let exec_view = view;
     let exec_namespace = namespace;
-    let exec_name = name.clone();
+    let exec_name = name;
     let exec_containers = containers;
     let exec = Button::new("pod-open-exec")
         .outline()
@@ -146,29 +131,15 @@ fn actions(detail: &PodDetail) -> AnyElement {
         .tooltip("Open a shell in a container")
         .on_click(move |_, window, cx| {
             let container = exec_containers.first().cloned().unwrap_or_default();
-            let vm = cx.new(|cx| {
-                PodExecViewModel::new(
+            exec_view.update(cx, |view, cx| {
+                view.open_exec(
                     exec_namespace.clone(),
                     exec_name.clone(),
                     exec_containers.clone(),
                     container,
-                    "sh".to_string(),
                     window,
                     cx,
-                )
-            });
-            let sheet_vm = vm.clone();
-            let view = cx.new(|cx| PodExecView::new(vm, window, cx));
-            let title = format!("Exec · {}", exec_name);
-            window.open_sheet(cx, move |sheet, _, _| {
-                let close_vm = sheet_vm.clone();
-                sheet
-                    .title(div().child(title.clone()))
-                    .size(px(820.))
-                    .on_close(move |_, _, cx| {
-                        close_vm.update(cx, |vm, _| vm.shutdown());
-                    })
-                    .child(view.clone())
+                );
             });
         });
 

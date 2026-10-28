@@ -1,13 +1,13 @@
-//! ViewModel for the application shell: active navigation and namespace scope.
+//! ViewModel for the application shell: the open tabs and the active tab.
 
-use crate::cluster::{self, ClusterState};
-use crate::models::{NamespaceScope, ResourceKind};
+use crate::cluster;
+use crate::models::ResourceKind;
 use gpui_kit::assets::IconName;
-use gpui_kit::component::select::{SearchableVec, SelectEvent, SelectItem, SelectState};
-use gpui_kit::{App, AppContext as _, Context, Entity, SharedString, Subscription, Window};
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::{App, Context, Hsla};
 
 /// Navigation targets shared by the shell and sidebar.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum NavTarget {
     Resource(ResourceKind),
     Settings,
@@ -29,128 +29,302 @@ impl NavTarget {
     }
 }
 
-/// One row in the namespace selector. `name` is empty for the "All namespaces"
-/// sentinel; `value()` distinguishes the scope.
-#[derive(Clone, Debug)]
-pub struct NamespaceItem {
-    name: String,
+/// Accent colors a tab can be marked with. Resolved from the base theme
+/// palette rather than fixed values so both light and dark themes stay legible.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TabColor {
+    Red,
+    Green,
+    Blue,
+    Yellow,
+    Magenta,
+    Cyan,
 }
 
-impl NamespaceItem {
-    fn all() -> Self {
+impl TabColor {
+    pub const ALL: [Self; 6] = [
+        Self::Red,
+        Self::Green,
+        Self::Blue,
+        Self::Yellow,
+        Self::Magenta,
+        Self::Cyan,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Red => "Red",
+            Self::Green => "Green",
+            Self::Blue => "Blue",
+            Self::Yellow => "Yellow",
+            Self::Magenta => "Magenta",
+            Self::Cyan => "Cyan",
+        }
+    }
+
+    pub fn color(self, cx: &App) -> Hsla {
+        match self {
+            Self::Red => cx.theme().red,
+            Self::Green => cx.theme().green,
+            Self::Blue => cx.theme().blue,
+            Self::Yellow => cx.theme().yellow,
+            Self::Magenta => cx.theme().magenta,
+            Self::Cyan => cx.theme().cyan,
+        }
+    }
+}
+
+/// Identity of one open tab. Every tab gets its own id even when two tabs show
+/// the same resource kind.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct TabId(u64);
+
+impl TabId {
+    pub fn get(self) -> u64 {
+        self.0
+    }
+}
+
+/// One open workspace tab. A target can appear in several tabs; each tab owns
+/// its own view model and namespace scope.
+#[derive(Clone, Copy, Debug)]
+pub struct TabInfo {
+    id: TabId,
+    target: NavTarget,
+    color: Option<TabColor>,
+    locked: bool,
+}
+
+impl TabInfo {
+    pub fn id(self) -> TabId {
+        self.id
+    }
+
+    pub fn target(self) -> NavTarget {
+        self.target
+    }
+
+    pub fn color(self) -> Option<TabColor> {
+        self.color
+    }
+
+    /// Whether the user has protected this tab from being closed.
+    pub fn locked(self) -> bool {
+        self.locked
+    }
+}
+
+/// The open tab list and active tab. Kept free of GPUI context so the
+/// open-once rule and close ordering can be tested directly.
+#[derive(Debug)]
+struct TabSet {
+    tabs: Vec<TabInfo>,
+    active: Option<TabId>,
+    next_id: u64,
+}
+
+impl TabSet {
+    fn new(initial: NavTarget) -> Self {
+        let id = TabId(0);
         Self {
-            name: String::new(),
+            tabs: vec![TabInfo {
+                id,
+                target: initial,
+                color: None,
+                locked: false,
+            }],
+            active: Some(id),
+            next_id: 1,
         }
     }
 
-    fn named(name: impl Into<String>) -> Self {
-        Self { name: name.into() }
+    fn active(&self) -> Option<TabId> {
+        self.active
     }
 
-    fn is_all(&self) -> bool {
-        self.name.is_empty()
-    }
-}
-
-impl SelectItem for NamespaceItem {
-    type Value = String;
-
-    fn title(&self) -> SharedString {
-        if self.is_all() {
-            "All namespaces".into()
-        } else {
-            self.name.clone().into()
-        }
+    fn active_tab(&self) -> Option<TabInfo> {
+        self.active.and_then(|id| self.tab(id))
     }
 
-    fn value(&self) -> &Self::Value {
-        &self.name
-    }
-}
-
-/// Build the select items: an "All namespaces" sentinel first, then namespaces.
-fn namespace_items(namespaces: &[String]) -> SearchableVec<NamespaceItem> {
-    let mut items = Vec::with_capacity(namespaces.len() + 1);
-    items.push(NamespaceItem::all());
-    items.extend(namespaces.iter().cloned().map(NamespaceItem::named));
-    SearchableVec::new(items)
-}
-
-pub type NamespaceSelect = SelectState<SearchableVec<NamespaceItem>>;
-
-/// Shell presentation state. The active navigation target and the namespace
-/// dropdown live here rather than in the workspace view; the cluster global
-/// remains the source of truth for the selected namespace scope.
-pub struct ShellViewModel {
-    selected: NavTarget,
-    namespace_select: Entity<NamespaceSelect>,
-    /// Last-synced values mirrored into `namespace_select`; used to avoid
-    /// rebuilding the list on every update, which would discard the user's
-    /// in-progress search filter.
-    synced_namespaces: Vec<String>,
-    synced_scope: NamespaceScope,
-    #[allow(dead_code)] // held for its Drop side-effect: unsubscribes the select event
-    namespace_sub: Subscription,
-    #[allow(dead_code)] // held for its Drop side-effect: unsubscribes the cluster observer
-    cluster_sub: Subscription,
-}
-
-impl ShellViewModel {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let namespace_select = cx.new(|cx| {
-            let state = cx.global::<ClusterState>();
-            let items = namespace_items(state.namespaces());
-            let selected = state.scope().namespace().map(str::to_string);
-            let mut select = SelectState::new(items, None, window, cx).searchable(true);
-            if let Some(selected) = selected {
-                select.set_selected_value(&selected, window, cx);
-            }
-            select
-        });
-        let namespace_sub = cx.subscribe(
-            &namespace_select,
-            |_, _, event: &SelectEvent<SearchableVec<NamespaceItem>>, cx| {
-                let SelectEvent::Confirm(value) = event;
-                let scope = match value {
-                    Some(namespace) if !namespace.is_empty() => {
-                        NamespaceScope::One(namespace.clone())
-                    }
-                    _ => NamespaceScope::All,
-                };
-                cluster::set_namespace_scope(cx, scope);
-            },
-        );
-        let cluster_sub = cx.observe_global_in::<ClusterState>(window, |this, window, cx| {
-            this.sync_namespace_select(window, cx);
-            cx.notify();
-        });
-        let state = cx.global::<ClusterState>();
-        Self {
-            selected: NavTarget::Resource(ResourceKind::Pods),
-            namespace_select,
-            synced_namespaces: state.namespaces().to_vec(),
-            synced_scope: state.scope().clone(),
-            namespace_sub,
-            cluster_sub,
-        }
+    fn tab(&self, id: TabId) -> Option<TabInfo> {
+        self.tabs.iter().find(|tab| tab.id == id).copied()
     }
 
-    pub fn selected(&self) -> NavTarget {
-        self.selected
+    fn tabs(&self) -> &[TabInfo] {
+        &self.tabs
     }
 
-    /// Switch the active navigation target. Returns whether it changed.
-    pub fn select(&mut self, target: NavTarget, cx: &mut Context<Self>) -> bool {
-        if target == self.selected {
+    fn activate(&mut self, id: TabId) -> bool {
+        if self.active == Some(id) || self.tab(id).is_none() {
             return false;
         }
-        self.selected = target;
-        cx.notify();
+        self.active = Some(id);
         true
     }
 
-    pub fn namespace_select(&self) -> &Entity<NamespaceSelect> {
-        &self.namespace_select
+    /// Focus the current or first tab for `target`, opening one when none exists.
+    fn focus_or_open(&mut self, target: NavTarget) -> TabId {
+        if let Some(active) = self.active_tab()
+            && active.target == target
+        {
+            return active.id;
+        }
+        match self.tabs.iter().find(|tab| tab.target == target) {
+            Some(tab) => {
+                self.active = Some(tab.id);
+                tab.id
+            }
+            None => self.open_new(target),
+        }
+    }
+
+    /// Open a new tab even when the same resource is already open.
+    fn open_new(&mut self, target: NavTarget) -> TabId {
+        let id = TabId(self.next_id);
+        self.next_id = self.next_id.wrapping_add(1);
+        self.tabs.push(TabInfo {
+            id,
+            target,
+            color: None,
+            locked: false,
+        });
+        self.active = Some(id);
+        id
+    }
+
+    /// Close a tab. Locked tabs refuse to close. When it was active, the tab to
+    /// its right becomes active, falling back to the one on its left. Returns
+    /// whether the active tab changed.
+    fn close(&mut self, id: TabId) -> bool {
+        let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else {
+            return false;
+        };
+        if self.tabs[index].locked {
+            return false;
+        }
+        let was_active = self.active == Some(id);
+        self.tabs.remove(index);
+        if was_active {
+            self.active = if self.tabs.is_empty() {
+                None
+            } else {
+                Some(self.tabs[index.min(self.tabs.len() - 1)].id)
+            };
+        }
+        was_active
+    }
+
+    /// Protect a tab from being closed, or allow closing it again.
+    /// Returns whether anything changed.
+    fn set_locked(&mut self, id: TabId, locked: bool) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return false;
+        };
+        if tab.locked == locked {
+            return false;
+        }
+        tab.locked = locked;
+        true
+    }
+
+    /// Assign or clear a tab's accent color. Returns whether anything changed.
+    fn set_color(&mut self, id: TabId, color: Option<TabColor>) -> bool {
+        let Some(tab) = self.tabs.iter_mut().find(|tab| tab.id == id) else {
+            return false;
+        };
+        if tab.color == color {
+            return false;
+        }
+        tab.color = color;
+        true
+    }
+}
+
+/// Shell presentation state: which tabs are open and which one is shown.
+pub struct ShellViewModel {
+    tabs: TabSet,
+}
+
+impl ShellViewModel {
+    pub fn new(_cx: &mut Context<Self>) -> Self {
+        Self {
+            tabs: TabSet::new(NavTarget::Resource(ResourceKind::Pods)),
+        }
+    }
+
+    /// The tab currently shown, or `None` when every tab has been closed.
+    pub fn active(&self) -> Option<TabId> {
+        self.tabs.active()
+    }
+
+    pub fn active_tab(&self) -> Option<TabInfo> {
+        self.tabs.active_tab()
+    }
+
+    pub fn tab(&self, id: TabId) -> Option<TabInfo> {
+        self.tabs.tab(id)
+    }
+
+    pub fn tabs(&self) -> &[TabInfo] {
+        self.tabs.tabs()
+    }
+
+    /// Focus the first tab for `target`, opening a new one when needed.
+    pub fn focus_or_open(&mut self, target: NavTarget, cx: &mut Context<Self>) -> TabId {
+        let previous = self.tabs.active();
+        let id = self.tabs.focus_or_open(target);
+        if previous != Some(id) {
+            cx.notify();
+        }
+        id
+    }
+
+    /// Always open a new tab, even when the same resource is already open.
+    pub fn open_new(&mut self, target: NavTarget, cx: &mut Context<Self>) -> TabId {
+        let id = self.tabs.open_new(target);
+        cx.notify();
+        id
+    }
+
+    pub fn activate(&mut self, id: TabId, cx: &mut Context<Self>) -> bool {
+        let changed = self.tabs.activate(id);
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// Close a tab. Returns whether the active tab changed.
+    pub fn close(&mut self, id: TabId, cx: &mut Context<Self>) -> bool {
+        let changed = self.tabs.close(id);
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// Assign or clear a tab's accent color. Returns whether anything changed.
+    pub fn set_color(
+        &mut self,
+        id: TabId,
+        color: Option<TabColor>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let changed = self.tabs.set_color(id, color);
+        if changed {
+            cx.notify();
+        }
+        changed
+    }
+
+    /// Protect a tab from being closed, or allow closing it again.
+    /// Returns whether anything changed.
+    pub fn set_locked(&mut self, id: TabId, locked: bool, cx: &mut Context<Self>) -> bool {
+        let changed = self.tabs.set_locked(id, locked);
+        if changed {
+            cx.notify();
+        }
+        changed
     }
 
     pub fn switch_context(&mut self, id: &str, cx: &mut Context<Self>) -> Result<(), &'static str> {
@@ -159,39 +333,154 @@ impl ShellViewModel {
         Ok(())
     }
 
-    /// Sync the namespace select from the cluster global, but only when the
-    /// namespaces list or the scope actually changed. `set_items` rebuilds the
-    /// delegate and would drop the in-progress search filter, so we avoid
-    /// calling it on every update.
-    fn sync_namespace_select(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let state = cx.global::<ClusterState>();
-        let namespaces = state.namespaces().to_vec();
-        let scope = state.scope().clone();
-
-        let namespaces_changed = namespaces != self.synced_namespaces;
-        let scope_changed = scope != self.synced_scope;
-        if !namespaces_changed && !scope_changed {
-            return;
-        }
-
-        self.synced_namespaces = namespaces.clone();
-        self.synced_scope = scope.clone();
-
-        self.namespace_select.update(cx, |select, cx| {
-            if namespaces_changed {
-                select.set_items(namespace_items(&namespaces), window, cx);
-            }
-            let value = scope.namespace().map(str::to_string).unwrap_or_default();
-            if select.selected_value() != Some(&value) {
-                select.set_selected_value(&value, window, cx);
-            }
-        });
-    }
-
     pub fn context_label(&self, cx: &App) -> String {
-        cx.global::<ClusterState>()
+        cx.global::<cluster::ClusterState>()
             .context()
             .unwrap_or("No context")
             .to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pods() -> NavTarget {
+        NavTarget::Resource(ResourceKind::Pods)
+    }
+
+    fn deployments() -> NavTarget {
+        NavTarget::Resource(ResourceKind::Deployments)
+    }
+
+    fn services() -> NavTarget {
+        NavTarget::Resource(ResourceKind::Services)
+    }
+
+    #[test]
+    fn opening_an_open_tab_focuses_it_without_duplicating() {
+        let mut tabs = TabSet::new(pods());
+        tabs.focus_or_open(deployments());
+        tabs.focus_or_open(pods());
+
+        assert_eq!(tabs.tabs().len(), 2);
+        assert_eq!(tabs.active(), Some(TabId(0)));
+    }
+
+    #[test]
+    fn focusing_a_kind_keeps_the_active_tab_of_that_kind() {
+        let mut tabs = TabSet::new(pods());
+        let second = tabs.open_new(pods());
+        let first = tabs.tabs()[0].id();
+
+        assert_eq!(tabs.active(), Some(second));
+        assert_eq!(tabs.focus_or_open(pods()), second);
+        assert_eq!(tabs.active(), Some(second));
+
+        let deployments_tab = tabs.focus_or_open(deployments());
+        assert_eq!(tabs.active(), Some(deployments_tab));
+        assert_eq!(tabs.active_tab().map(TabInfo::target), Some(deployments()));
+        assert_eq!(tabs.focus_or_open(pods()), first);
+        assert_eq!(tabs.active(), Some(first));
+    }
+
+    #[test]
+    fn the_same_resource_can_be_opened_in_two_tabs_at_once() {
+        let mut tabs = TabSet::new(pods());
+        let first = tabs.active().unwrap();
+        let second = tabs.open_new(pods());
+
+        assert_ne!(first, second);
+        assert_eq!(tabs.tabs().len(), 2);
+        assert_eq!(tabs.active(), Some(second));
+        assert!(tabs.tabs().iter().all(|tab| tab.target() == pods()));
+        assert_eq!(tabs.tab(first).unwrap().id(), first);
+    }
+
+    #[test]
+    fn closing_the_active_tab_activates_the_next_tab() {
+        let mut tabs = TabSet::new(pods());
+        tabs.focus_or_open(deployments());
+        tabs.focus_or_open(services());
+        let deployments = tabs
+            .tabs()
+            .iter()
+            .find(|tab| tab.target() == deployments())
+            .unwrap()
+            .id();
+        tabs.activate(deployments);
+
+        assert!(tabs.close(deployments));
+        assert_eq!(tabs.active_tab().map(TabInfo::target), Some(services()));
+        assert_eq!(tabs.tabs().len(), 2);
+    }
+
+    #[test]
+    fn closing_the_last_active_tab_activates_the_previous_tab() {
+        let mut tabs = TabSet::new(pods());
+        let deployments = tabs.focus_or_open(deployments());
+
+        assert!(tabs.close(deployments));
+        assert_eq!(tabs.active_tab().map(TabInfo::target), Some(pods()));
+    }
+
+    #[test]
+    fn closing_an_inactive_tab_keeps_the_active_tab() {
+        let mut tabs = TabSet::new(pods());
+        let deployments = tabs.focus_or_open(deployments());
+        let inactive = tabs.tabs()[0].id();
+
+        assert!(!tabs.close(TabId(99)));
+        assert!(!tabs.close(inactive));
+        assert_eq!(tabs.active(), Some(deployments));
+        assert_eq!(tabs.tabs().len(), 1);
+    }
+
+    #[test]
+    fn closing_every_tab_leaves_no_active_tab() {
+        let mut tabs = TabSet::new(pods());
+        let id = tabs.active().unwrap();
+
+        assert!(tabs.close(id));
+        assert_eq!(tabs.active(), None);
+        assert!(tabs.tabs().is_empty());
+    }
+
+    #[test]
+    fn tab_colors_can_be_set_and_cleared() {
+        let mut tabs = TabSet::new(pods());
+        let id = tabs.active().unwrap();
+
+        assert!(tabs.set_color(id, Some(TabColor::Green)));
+        assert_eq!(tabs.tab(id).unwrap().color(), Some(TabColor::Green));
+        assert!(!tabs.set_color(id, Some(TabColor::Green)));
+        assert!(tabs.set_color(id, None));
+        assert_eq!(tabs.tab(id).unwrap().color(), None);
+        assert!(!tabs.set_color(TabId(99), Some(TabColor::Red)));
+    }
+
+    #[test]
+    fn locked_tabs_refuse_to_close_until_unlocked() {
+        let mut tabs = TabSet::new(pods());
+        let id = tabs.focus_or_open(deployments());
+
+        assert!(tabs.set_locked(id, true));
+        assert!(tabs.tab(id).unwrap().locked());
+        assert!(!tabs.close(id));
+        assert_eq!(tabs.tabs().len(), 2);
+        assert_eq!(tabs.active(), Some(id));
+
+        assert!(tabs.set_locked(id, false));
+        assert!(tabs.close(id));
+        assert_eq!(tabs.tabs().len(), 1);
+        assert_eq!(tabs.active_tab().map(TabInfo::target), Some(pods()));
+    }
+
+    #[test]
+    fn locking_an_unknown_tab_changes_nothing() {
+        let mut tabs = TabSet::new(pods());
+
+        assert!(!tabs.set_locked(TabId(99), true));
+        assert!(!tabs.tabs()[0].locked());
     }
 }

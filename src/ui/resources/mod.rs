@@ -14,6 +14,7 @@ pub mod detail_common;
 pub mod ingresses;
 pub mod jobs;
 pub mod list;
+pub mod namespace_filter;
 pub mod namespaces;
 pub mod node;
 pub mod persistent_volume_claims;

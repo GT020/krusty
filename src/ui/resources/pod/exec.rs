@@ -1,6 +1,9 @@
-//! Interactive terminal sheet for a pod exec session.
+//! Interactive terminal for a pod exec session.
 
-use gpui_kit::base::{h_flex, v_flex};
+use std::cell::Cell;
+use std::rc::Rc;
+
+use gpui_kit::base::{ElementExt as _, h_flex, v_flex};
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -22,26 +25,19 @@ pub struct PodExecView {
     vm: Entity<PodExecViewModel>,
     focus: FocusHandle,
     focused_once: bool,
+    last_size: Rc<Cell<(u16, u16)>>,
     _vm_sub: Subscription,
-    _bounds_sub: Subscription,
 }
 
 impl PodExecView {
-    pub fn new(vm: Entity<PodExecViewModel>, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(vm: Entity<PodExecViewModel>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let subscription = cx.observe(&vm, |_, _, cx| cx.notify());
-        let (cols, rows) = terminal_size(window);
-        vm.update(cx, |vm, cx| vm.resize(cols, rows, cx));
-        let resize_vm = vm.clone();
-        let bounds_subscription = cx.observe_window_bounds(window, move |_, window, cx| {
-            let (cols, rows) = terminal_size(window);
-            resize_vm.update(cx, |vm, cx| vm.resize(cols, rows, cx));
-        });
         Self {
             vm,
             focus: cx.focus_handle(),
             focused_once: false,
+            last_size: Rc::new(Cell::new((0, 0))),
             _vm_sub: subscription,
-            _bounds_sub: bounds_subscription,
         }
     }
 
@@ -208,6 +204,8 @@ impl Render for PodExecView {
         let key_terminal = terminal.clone();
         let wheel_terminal = terminal.clone();
         let focus_handle = self.focus.clone();
+        let last_size = self.last_size.clone();
+        let resize_vm = self.vm.clone();
 
         v_flex()
             .size_full()
@@ -237,6 +235,16 @@ impl Render for PodExecView {
                     .p_2()
                     .track_focus(&self.focus)
                     .cursor_text()
+                    .on_prepaint(move |bounds, _, cx| {
+                        let width = (bounds.size.width.as_f32() - 20.).max(80.);
+                        let height = (bounds.size.height.as_f32() - 20.).max(48.);
+                        let cols = ((width / CELL_WIDTH) as u16).clamp(20, 240);
+                        let rows = ((height / CELL_HEIGHT) as u16).clamp(6, 120);
+                        if last_size.get() != (cols, rows) {
+                            last_size.set((cols, rows));
+                            resize_vm.update(cx, |vm, cx| vm.resize(cols, rows, cx));
+                        }
+                    })
                     .on_mouse_down(MouseButton::Left, move |_, window, cx| {
                         window.focus(&focus_handle, cx);
                         cx.stop_propagation();
@@ -264,15 +272,6 @@ impl Render for PodExecView {
                     .child(v_flex().gap_0().children(rows)),
             )
     }
-}
-
-fn terminal_size(window: &Window) -> (u16, u16) {
-    let width = (window.viewport_size().width.as_f32().min(820.) - 48.).max(160.);
-    let height = (window.viewport_size().height.as_f32() - 220.).max(96.);
-    (
-        ((width / CELL_WIDTH) as u16).clamp(20, 240),
-        ((height / CELL_HEIGHT) as u16).clamp(6, 120),
-    )
 }
 
 fn render_row(

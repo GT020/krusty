@@ -14,7 +14,7 @@ use gpui_kit::{
     SharedString, Styled as _, Subscription, Window, div, px,
 };
 
-use crate::models::SnapshotPhase;
+use crate::models::{NamespaceScope, SnapshotPhase};
 use crate::view_models::resources::node::NodesViewModel;
 
 const LIST_MIN_WIDTH: Pixels = px(320.);
@@ -38,20 +38,14 @@ pub struct NodesView {
 }
 
 impl NodesView {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let vm = cx.new(|cx| NodesViewModel::new(window, cx));
+    pub fn new(scope: NamespaceScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let vm = cx.new(|cx| NodesViewModel::new(scope, window, cx));
         let sub = cx.observe(&vm, |_, _, cx| cx.notify());
         Self { vm, _vm_sub: sub }
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        self.vm.update(cx, |vm, cx| {
-            vm.set_active(active, cx);
-            if active {
-                let table = vm.table().clone();
-                table.update(cx, |table, cx| table.scroll_to_row(0, cx));
-            }
-        });
+        self.vm.update(cx, |vm, cx| vm.set_active(active, cx));
     }
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
@@ -59,7 +53,6 @@ impl NodesView {
     }
 
     fn header(&self, cx: &Context<Self>) -> impl IntoElement {
-        let scope = self.vm.read(cx).scope().label();
         let phase = self.vm.read(cx).phase(cx);
         let count = self.vm.read(cx).item_count(cx);
 
@@ -72,7 +65,7 @@ impl NodesView {
             SnapshotPhase::Ready => div()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(format!("{count} objects · {scope}"))
+                .child(format!("{count} objects"))
                 .into_any_element(),
             SnapshotPhase::Error(message) => div()
                 .text_xs()

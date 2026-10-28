@@ -33,9 +33,8 @@ pub struct NodesViewModel {
 }
 
 impl NodesViewModel {
-    pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(scope: NamespaceScope, _window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = cx.global::<ClusterState>();
-        let scope = state.scope().clone();
         let epoch = state.context_epoch();
         let active = Arc::new(AtomicBool::new(true));
         let model = cx.new(|_| NodesModel::new());
@@ -50,16 +49,13 @@ impl NodesViewModel {
             }
         });
         let cluster_sub = cx.observe_global::<ClusterState>(|this, cx| {
-            let (scope, epoch) = {
-                let state = cx.global::<ClusterState>();
-                (state.scope().clone(), state.context_epoch())
-            };
-            if scope == this.scope && epoch == this.epoch {
+            let epoch = cx.global::<ClusterState>().context_epoch();
+            if epoch == this.epoch {
                 return;
             }
-            this.scope = scope;
             this.epoch = epoch;
             this.subscribe(cx);
+            cx.notify();
         });
         let mut this = Self {
             active,
@@ -83,6 +79,16 @@ impl NodesViewModel {
 
     pub fn scope(&self) -> &NamespaceScope {
         &self.scope
+    }
+
+    /// Switch this tab's namespace filter and restart its watcher.
+    pub fn set_scope(&mut self, scope: NamespaceScope, cx: &mut Context<Self>) {
+        if self.scope == scope {
+            return;
+        }
+        self.scope = scope;
+        self.subscribe(cx);
+        cx.notify();
     }
 
     #[allow(dead_code)]
