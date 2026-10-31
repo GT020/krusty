@@ -42,6 +42,7 @@ fn main() {
 
             let init_started = std::time::Instant::now();
             gpui_kit::init(cx);
+            ui::shell::commands::init(cx);
             tracing::debug!(
                 elapsed_ms = init_started.elapsed().as_millis() as u64,
                 "krusty: gpui_kit initialized"

@@ -25,6 +25,7 @@ fn nav_item(
         .context_menu(move |menu, _, _| {
             let open_handle = menu_handle.clone();
             let new_tab_handle = menu_handle.clone();
+            let side_handle = menu_handle.clone();
             let menu = menu.item(PopupMenuItem::new("Open").on_click(move |_, window, cx| {
                 open_handle.update(cx, |workspace, cx| {
                     workspace.select(target, false, window, cx);
@@ -37,6 +38,13 @@ fn nav_item(
                 PopupMenuItem::new("Open in new tab").on_click(move |_, window, cx| {
                     new_tab_handle.update(cx, |workspace, cx| {
                         workspace.select(target, true, window, cx);
+                    });
+                }),
+            )
+            .item(
+                PopupMenuItem::new("Open to the Side").on_click(move |_, window, cx| {
+                    side_handle.update(cx, |workspace, cx| {
+                        workspace.open_to_side(target, window, cx);
                     });
                 }),
             )

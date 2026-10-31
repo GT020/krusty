@@ -34,6 +34,7 @@ fn list_default_width(viewport_width: f32) -> Pixels {
 
 pub struct NodesView {
     vm: gpui_kit::Entity<NodesViewModel>,
+    width_share: f32,
     _vm_sub: Subscription,
 }
 
@@ -41,11 +42,25 @@ impl NodesView {
     pub fn new(scope: NamespaceScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let vm = cx.new(|cx| NodesViewModel::new(scope, window, cx));
         let sub = cx.observe(&vm, |_, _, cx| cx.notify());
-        Self { vm, _vm_sub: sub }
+        Self {
+            vm,
+            width_share: 1.0,
+            _vm_sub: sub,
+        }
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.vm.update(cx, |vm, cx| vm.set_active(active, cx));
+    }
+
+    /// Fraction of the window width this editor group occupies.
+    pub fn set_width_share(&mut self, share: f32, cx: &mut Context<Self>) {
+        let share = share.clamp(0.1, 1.0);
+        if (self.width_share - share).abs() < f32::EPSILON {
+            return;
+        }
+        self.width_share = share;
+        cx.notify();
     }
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
@@ -149,7 +164,7 @@ impl Render for NodesView {
                 .into_any_element();
         }
 
-        let viewport_width = window.viewport_size().width.as_f32();
+        let viewport_width = window.viewport_size().width.as_f32() * self.width_share;
         let split = viewport_width >= SPLIT_MIN_VIEWPORT_WIDTH;
         let usage = self.vm.read(cx).usage(cx);
         let usage_error = self.vm.read(cx).usage_error(cx);
