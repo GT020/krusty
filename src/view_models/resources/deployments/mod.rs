@@ -1,8 +1,6 @@
-//! ViewModel for Deployments: subscription pump + column definitions.
+//! ViewModel for Deployments: subscription pump, columns, and actions.
 
-pub mod detail;
-
-pub use detail::DeploymentsDetailViewModel;
+pub mod actions;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

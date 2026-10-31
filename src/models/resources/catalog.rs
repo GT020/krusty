@@ -2,7 +2,9 @@ use std::sync::{Mutex, OnceLock};
 
 type Icon = gpui_kit::assets::IconName;
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(
+    Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, serde::Serialize, serde::Deserialize,
+)]
 pub enum ResourceKind {
     Pods,
     Deployments,

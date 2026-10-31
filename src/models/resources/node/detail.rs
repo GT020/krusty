@@ -90,9 +90,6 @@ pub struct NodeImage {
     pub size_bytes: i64,
 }
 
-/// One point of live node usage, sampled from metrics-server.
-pub use crate::models::resources::usage::{UsageHistory, UsageSample as NodeUsage};
-
 /// Presentation-agnostic state for the open node detail pane.
 #[derive(Clone, Debug, Default)]
 pub enum NodeDetailState {
@@ -129,9 +126,5 @@ pub enum NodeDetailUpdate {
     Detail {
         node: String,
         result: Result<Box<NodeDetail>, String>,
-    },
-    Usage {
-        node: String,
-        result: Result<NodeUsage, String>,
     },
 }

@@ -1,9 +1,12 @@
 //! Pod workspace: list, detail, and a per-tab logs/exec session panel.
 
 mod detail;
-mod exec;
-mod logs;
+pub mod exec;
+pub mod list;
+pub mod logs;
+pub mod section;
 mod sessions;
+pub mod usage;
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::tab::{Tab, TabBar};
@@ -19,16 +22,17 @@ use gpui_kit::{
     Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 
+use crate::models::dashboard::{PodWidgetSource, WidgetSource};
 use crate::models::{NamespaceScope, SnapshotPhase};
+use crate::ui::dashboard::pinnable_sized;
 use crate::ui::resources::namespace_filter::{
     NamespaceFilter, NamespaceFilterEvent, render as render_namespace_filter,
 };
-use crate::ui::resources::pod::exec::PodExecView;
-use crate::ui::resources::pod::logs::PodLogsView;
+use crate::ui::resources::pod::exec::{PodExecArgs, PodExecWidget};
+use crate::ui::resources::pod::logs::{PodLogsArgs, PodLogsWidget};
 use crate::ui::resources::pod::sessions::{PodSession, PodSessions, SessionKey};
+use crate::ui::resources::pod::usage::{PodUsageArgs, PodUsageWidget};
 use crate::view_models::resources::pod::PodsViewModel;
-use crate::view_models::resources::pod::exec::PodExecViewModel;
-use crate::view_models::resources::pod::logs::PodLogsViewModel;
 
 const LIST_MIN_WIDTH: Pixels = px(340.);
 const LIST_MAX_WIDTH: Pixels = px(800.);
@@ -53,6 +57,8 @@ pub struct PodsView {
     vm: gpui_kit::Entity<PodsViewModel>,
     namespace_filter: gpui_kit::Entity<NamespaceFilter>,
     sessions: PodSessions,
+    usage: Option<PodUsageWidget>,
+    usage_target: Option<(String, String)>,
     _vm_sub: Subscription,
     _namespace_sub: Subscription,
 }
@@ -60,7 +66,10 @@ pub struct PodsView {
 impl PodsView {
     pub fn new(scope: NamespaceScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let vm = cx.new(|cx| PodsViewModel::new(scope, window, cx));
-        let vm_sub = cx.observe(&vm, |_, _, cx| cx.notify());
+        let vm_sub = cx.observe(&vm, |this, _, cx| {
+            this.sync_usage(cx);
+            cx.notify();
+        });
         let namespace_filter = cx.new(|cx| NamespaceFilter::new(window, cx));
         let namespace_sub = cx.subscribe(
             &namespace_filter,
@@ -76,9 +85,48 @@ impl PodsView {
             vm,
             namespace_filter,
             sessions: PodSessions::default(),
+            usage: None,
+            usage_target: None,
             _vm_sub: vm_sub,
             _namespace_sub: namespace_sub,
         }
+    }
+
+    /// Create or replace the usage widget when the selected pod changes.
+    /// Widgets are created here, never in render.
+    fn sync_usage(&mut self, cx: &mut Context<Self>) {
+        let target = {
+            let detail = self.vm.read(cx).detail(cx);
+            if detail.is_open() {
+                detail
+                    .identity()
+                    .map(|(namespace, name)| (namespace.to_string(), name.to_string()))
+            } else {
+                None
+            }
+        };
+        if self.usage_target == target {
+            return;
+        }
+        if let Some(usage) = self.usage.take() {
+            usage.shutdown(cx);
+        }
+        self.usage = target.as_ref().map(|(namespace, name)| {
+            PodUsageWidget::mount(
+                PodUsageArgs {
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    id_prefix: format!("pod-detail-usage-{namespace}-{name}").into(),
+                    compact: false,
+                    show_header: true,
+                },
+                cx,
+            )
+        });
+        if let Some(usage) = &self.usage {
+            usage.set_active(self.vm.read(cx).is_active(), cx);
+        }
+        self.usage_target = target;
     }
     pub fn scope_label(&self, cx: &App) -> String {
         self.vm.read(cx).scope().label()
@@ -90,9 +138,17 @@ impl PodsView {
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.vm.update(cx, |vm, cx| vm.set_active(active, cx));
+        if let Some(usage) = &self.usage {
+            usage.set_active(active, cx);
+        }
+        self.sessions.set_active_state(active, cx);
     }
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
+        if let Some(usage) = self.usage.take() {
+            usage.shutdown(cx);
+        }
+        self.usage_target = None;
         self.vm.update(cx, |vm, cx| vm.close_detail(cx));
     }
 
@@ -109,9 +165,18 @@ impl PodsView {
             cx.notify();
             return;
         }
-        let vm = cx.new(|cx| PodLogsViewModel::new(namespace, name, containers, cx));
-        let view = cx.new(|cx| PodLogsView::new(vm.clone(), cx));
-        self.sessions.push(PodSession::logs(key, view, vm));
+        let widget = PodLogsWidget::mount(
+            PodLogsArgs {
+                namespace,
+                name,
+                containers,
+                container: None,
+                follow: true,
+                id_prefix: format!("pod-logs-{}", key.id()).into(),
+            },
+            cx,
+        );
+        self.sessions.push(PodSession::logs(key, widget));
         cx.notify();
     }
 
@@ -130,19 +195,21 @@ impl PodsView {
             cx.notify();
             return;
         }
-        let vm = cx.new(|cx| {
-            PodExecViewModel::new(
+        let widget = PodExecWidget::mount(
+            PodExecArgs {
                 namespace,
                 name,
                 containers,
                 container,
-                "sh".to_string(),
-                window,
-                cx,
-            )
-        });
-        let view = cx.new(|cx| PodExecView::new(vm.clone(), window, cx));
-        self.sessions.push(PodSession::exec(key, view, vm));
+                shell: "sh".to_string(),
+                id_prefix: format!("pod-exec-{}", key.id()).into(),
+                auto_connect: true,
+                focus_on_mount: true,
+            },
+            window,
+            cx,
+        );
+        self.sessions.push(PodSession::exec(key, widget));
         cx.notify();
     }
 
@@ -210,19 +277,27 @@ impl PodsView {
 
     fn list(&self, cx: &Context<Self>) -> gpui_kit::AnyElement {
         let table = self.vm.read(cx).table().clone();
-        v_flex()
-            .size_full()
-            .min_w_0()
-            .child(self.header(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .px_4()
-                    .py_3()
-                    .child(DataTable::new(&table)),
-            )
-            .into_any_element()
+        let scope = self.vm.read(cx).scope().clone();
+        let source = WidgetSource::Pod(PodWidgetSource::List {
+            namespace: scope.namespace().map(str::to_string),
+        });
+        pinnable_sized(
+            format!("pod-list-{}", scope.label()),
+            v_flex()
+                .size_full()
+                .min_w_0()
+                .child(self.header(cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .px_4()
+                        .py_3()
+                        .child(DataTable::new(&table)),
+                )
+                .into_any_element(),
+            source,
+        )
     }
 }
 
@@ -242,12 +317,9 @@ impl PodsView {
 
         let viewport_width = window.viewport_size().width.as_f32();
         let split = viewport_width >= SPLIT_MIN_VIEWPORT_WIDTH;
-        let usage = self.vm.read(cx).usage(cx);
-        let usage_error = self.vm.read(cx).usage_error(cx);
         let detail = detail::render_detail(
             detail_state,
-            usage,
-            usage_error,
+            self.usage.as_ref(),
             cx.entity().clone(),
             !split,
             cx,
@@ -318,7 +390,7 @@ impl PodsView {
                 div()
                     .flex_1()
                     .min_h_0()
-                    .child(self.sessions.active_element()),
+                    .child(self.sessions.active_element(cx)),
             )
             .into_any_element()
     }

@@ -2,6 +2,7 @@
 //! snapshots. UI threads never perform network I/O or mutate the store.
 
 pub mod custom_resources;
+pub mod dashboard_store;
 pub mod resources;
 
 pub use resources::namespace_names;

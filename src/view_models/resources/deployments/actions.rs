@@ -1,88 +1,66 @@
-//! Deployment detail actions: scale, restart, edit, and delete.
+//! Standalone deployment actions: scale, restart, edit, and delete.
+//!
+//! This view model has a fixed target and no dependency on a detail pane. The
+//! deployment detail and the dashboard both mount it through
+//! `DeploymentActionsWidget`.
 
 use std::future::Future;
 
-use kube::Client;
-
-use crate::cluster::ClusterState;
-use crate::repository;
-use crate::view_models::resources::detail::ResourceDetailViewModel;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::input::{Editor, EditorState, Input, InputState};
 use gpui_kit::{
-    App, AppContext as _, ClickEvent, Context, ParentElement as _, WeakEntity, Window, px,
+    App, AppContext as _, ClickEvent, Context, EventEmitter, ParentElement as _, Window, px,
 };
+use kube::Client;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ActionStatus {
-    Pending,
-    Success,
-    Error,
+use crate::cluster::ClusterState;
+use crate::models::resources::deployments::actions::{
+    ActionFeedback, DeploymentActionEvent, DeploymentActionsModel,
+};
+use crate::repository;
+
+pub struct DeploymentActionsViewModel {
+    namespace: String,
+    name: String,
+    model: DeploymentActionsModel,
+    cancel: Option<tokio::sync::watch::Sender<bool>>,
+    generation: u64,
 }
 
-#[derive(Clone, Debug)]
-pub struct ActionFeedback {
-    status: ActionStatus,
-    message: String,
-}
+impl EventEmitter<DeploymentActionEvent> for DeploymentActionsViewModel {}
 
-impl ActionFeedback {
-    fn pending(message: String) -> Self {
-        Self {
-            status: ActionStatus::Pending,
-            message,
-        }
+impl DeploymentActionsViewModel {
+    pub fn new(namespace: String, name: String, cx: &mut Context<Self>) -> Self {
+        let mut this = Self {
+            namespace,
+            name,
+            model: DeploymentActionsModel::new(),
+            cancel: None,
+            generation: 0,
+        };
+        this.refresh_summary(cx);
+        this
     }
 
-    fn success(message: String) -> Self {
-        Self {
-            status: ActionStatus::Success,
-            message,
-        }
+    pub fn namespace(&self) -> &str {
+        &self.namespace
     }
 
-    fn error(message: String) -> Self {
-        Self {
-            status: ActionStatus::Error,
-            message,
-        }
-    }
-
-    pub fn status(&self) -> ActionStatus {
-        self.status
-    }
-
-    pub fn message(&self) -> &str {
-        &self.message
-    }
-}
-
-pub struct DeploymentsDetailViewModel {
-    detail: WeakEntity<ResourceDetailViewModel>,
-    feedback: Option<ActionFeedback>,
-}
-
-impl DeploymentsDetailViewModel {
-    pub fn new(detail: WeakEntity<ResourceDetailViewModel>) -> Self {
-        Self {
-            detail,
-            feedback: None,
-        }
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn feedback(&self) -> Option<&ActionFeedback> {
-        self.feedback.as_ref()
+        self.model.feedback()
     }
 
-    pub fn scale(
-        &mut self,
-        namespace: String,
-        name: String,
-        replicas: i32,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn replicas(&self) -> Option<i32> {
+        self.model.replicas()
+    }
+
+    pub fn scale(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let replicas = self.model.replicas().unwrap_or(1);
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("Replicas")
@@ -96,6 +74,8 @@ impl DeploymentsDetailViewModel {
                 })
         });
         let this = cx.entity().downgrade();
+        let namespace = self.namespace.clone();
+        let name = self.name.clone();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let input = input.clone();
             let this = this.clone();
@@ -125,14 +105,15 @@ impl DeploymentsDetailViewModel {
         });
     }
 
-    pub fn restart(&mut self, namespace: String, name: String, cx: &mut Context<Self>) {
-        let pending = format!("Restarting deployment “{name}”…");
-        let success = format!("Restarted deployment “{name}”.");
+    pub fn restart(&mut self, cx: &mut Context<Self>) {
+        let pending = format!("Restarting deployment “{}”…", self.name);
+        let success = format!("Restarted deployment “{}”.", self.name);
+        let namespace = self.namespace.clone();
+        let name = self.name.clone();
         self.run_action(
-            (namespace.clone(), name.clone()),
             pending,
             success,
-            false,
+            DeploymentActionEvent::Changed,
             move |client| async move {
                 repository::resources::deployments::restart(client, namespace, name).await
             },
@@ -140,14 +121,10 @@ impl DeploymentsDetailViewModel {
         );
     }
 
-    pub fn delete(
-        &mut self,
-        namespace: String,
-        name: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub fn delete(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let this = cx.entity().downgrade();
+        let namespace = self.namespace.clone();
+        let name = self.name.clone();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let this = this.clone();
             let namespace = namespace.clone();
@@ -172,20 +149,20 @@ impl DeploymentsDetailViewModel {
         });
     }
 
-    pub fn edit(
-        &mut self,
-        namespace: String,
-        name: String,
-        manifest: &serde_json::Value,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let yaml = match serde_saphyr::to_string(manifest) {
+    pub fn edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(manifest) = self.model.manifest().cloned() else {
+            self.model.set_feedback(Some(ActionFeedback::error(
+                "The deployment manifest is not loaded yet.".to_string(),
+            )));
+            cx.notify();
+            return;
+        };
+        let yaml = match serde_saphyr::to_string(&manifest) {
             Ok(yaml) => yaml,
             Err(error) => {
-                self.feedback = Some(ActionFeedback::error(format!(
+                self.model.set_feedback(Some(ActionFeedback::error(format!(
                     "Could not render the deployment manifest: {error}"
-                )));
+                ))));
                 cx.notify();
                 return;
             }
@@ -196,6 +173,8 @@ impl DeploymentsDetailViewModel {
                 .language("yaml")
         });
         let this = cx.entity().downgrade();
+        let namespace = self.namespace.clone();
+        let name = self.name.clone();
         window.open_alert_dialog(cx, move |alert, _, _| {
             let editor = editor.clone();
             let this = this.clone();
@@ -225,6 +204,54 @@ impl DeploymentsDetailViewModel {
         });
     }
 
+    pub fn shutdown(&mut self) {
+        if let Some(cancel) = self.cancel.take() {
+            let _ = cancel.send(true);
+        }
+    }
+
+    fn refresh_summary(&mut self, cx: &mut Context<Self>) {
+        self.shutdown();
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let subscription = match repository::resources::deployments::summary::subscribe_summary(
+            cx,
+            &self.namespace,
+            &self.name,
+        ) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                self.model.set_feedback(Some(ActionFeedback::error(format!(
+                    "Could not load deployment: {error}"
+                ))));
+                cx.notify();
+                return;
+            }
+        };
+        self.cancel = Some(subscription.cancel_handle());
+        let mut subscription = subscription;
+        cx.spawn(async move |this, cx| {
+            if let Some(result) = subscription.next().await {
+                let _ = this.update(cx, |this, cx| {
+                    if this.generation != generation {
+                        return;
+                    }
+                    match result {
+                        Ok(summary) => {
+                            this.model.set_replicas(summary.replicas);
+                            this.model.set_manifest(summary.manifest);
+                        }
+                        Err(error) => {
+                            this.model.set_feedback(Some(ActionFeedback::error(error)));
+                        }
+                    }
+                    cx.notify();
+                });
+            }
+        })
+        .detach();
+    }
+
     fn perform_scale(
         &mut self,
         namespace: String,
@@ -235,10 +262,9 @@ impl DeploymentsDetailViewModel {
         let pending = format!("Scaling deployment “{name}” to {replicas} replicas…");
         let success = format!("Scaled deployment “{name}” to {replicas} replicas.");
         self.run_action(
-            (namespace.clone(), name.clone()),
             pending,
             success,
-            false,
+            DeploymentActionEvent::Changed,
             move |client| async move {
                 repository::resources::deployments::scale(client, namespace, name, replicas).await
             },
@@ -250,10 +276,9 @@ impl DeploymentsDetailViewModel {
         let pending = format!("Deleting deployment “{name}”…");
         let success = format!("Deleted deployment “{name}”.");
         self.run_action(
-            (namespace.clone(), name.clone()),
             pending,
             success,
-            true,
+            DeploymentActionEvent::Deleted,
             move |client| async move {
                 repository::resources::deployments::delete(client, namespace, name).await
             },
@@ -271,10 +296,9 @@ impl DeploymentsDetailViewModel {
         let pending = format!("Updating deployment “{name}”…");
         let success = format!("Updated deployment “{name}”.");
         self.run_action(
-            (namespace.clone(), name.clone()),
             pending,
             success,
-            false,
+            DeploymentActionEvent::Changed,
             move |client| async move {
                 repository::resources::deployments::replace(client, namespace, name, yaml).await
             },
@@ -282,30 +306,11 @@ impl DeploymentsDetailViewModel {
         );
     }
 
-    fn reload(&self, cx: &mut Context<Self>) {
-        let Some(detail) = self.detail.upgrade() else {
-            return;
-        };
-        let Some((kind, namespace, name)) = detail
-            .read(cx)
-            .state()
-            .identity()
-            .map(|(kind, namespace, name)| (kind, namespace.to_string(), name.to_string()))
-        else {
-            return;
-        };
-        detail.update(cx, |detail, cx| {
-            detail.close(cx);
-            detail.open(kind, namespace, name, cx);
-        });
-    }
-
     fn run_action<F, Fut>(
         &mut self,
-        target: (String, String),
         pending: String,
         success: String,
-        close_on_success: bool,
+        event: DeploymentActionEvent,
         operation: F,
         cx: &mut Context<Self>,
     ) where
@@ -313,9 +318,9 @@ impl DeploymentsDetailViewModel {
         Fut: Future<Output = Result<(), String>> + Send + 'static,
     {
         let Some(client) = cx.global::<ClusterState>().client() else {
-            self.feedback = Some(ActionFeedback::error(
+            self.model.set_feedback(Some(ActionFeedback::error(
                 "Not connected to a cluster.".to_string(),
-            ));
+            )));
             cx.notify();
             return;
         };
@@ -324,43 +329,37 @@ impl DeploymentsDetailViewModel {
         tokio.spawn(async move {
             let _ = sender.send(operation(client).await);
         });
-        self.feedback = Some(ActionFeedback::pending(pending));
+        self.model
+            .set_feedback(Some(ActionFeedback::pending(pending)));
         cx.notify();
         let this = cx.entity().downgrade();
-        cx.spawn(async move |_, cx: &mut gpui_kit::AsyncApp| {
+        cx.spawn(async move |_, cx| {
             let result = match receiver.await {
                 Ok(result) => result,
                 Err(_) => Err("The cluster operation was cancelled.".to_string()),
             };
-            let _ = this.update(cx, |this, cx| {
-                let current = this.detail.upgrade().and_then(|detail| {
-                    detail
-                        .read(cx)
-                        .state()
-                        .identity()
-                        .map(|(_, namespace, name)| (namespace.to_string(), name.to_string()))
-                });
-                if current.as_ref() != Some(&target) {
-                    return;
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => {
+                    this.model
+                        .set_feedback(Some(ActionFeedback::success(success)));
+                    cx.emit(event);
+                    if event != DeploymentActionEvent::Deleted {
+                        this.refresh_summary(cx);
+                    }
                 }
-                match result {
-                    Ok(()) => {
-                        this.feedback = Some(ActionFeedback::success(success));
-                        if close_on_success {
-                            if let Some(detail) = this.detail.upgrade() {
-                                detail.update(cx, |detail, cx| detail.close(cx));
-                            }
-                        } else {
-                            this.reload(cx);
-                        }
-                    }
-                    Err(message) => {
-                        this.feedback = Some(ActionFeedback::error(message));
-                        cx.notify();
-                    }
+                Err(message) => {
+                    this.model
+                        .set_feedback(Some(ActionFeedback::error(message)));
+                    cx.notify();
                 }
             });
         })
         .detach();
+    }
+}
+
+impl Drop for DeploymentActionsViewModel {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

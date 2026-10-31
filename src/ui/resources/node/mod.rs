@@ -1,6 +1,8 @@
 //! Node workspace: list plus a detail pane that opens on row selection.
 
 mod detail;
+pub mod section;
+pub mod usage;
 
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
@@ -15,6 +17,7 @@ use gpui_kit::{
 };
 
 use crate::models::{NamespaceScope, SnapshotPhase};
+use crate::ui::resources::node::usage::{NodeUsageArgs, NodeUsageWidget};
 use crate::view_models::resources::node::NodesViewModel;
 
 const LIST_MIN_WIDTH: Pixels = px(320.);
@@ -34,21 +37,71 @@ fn list_default_width(viewport_width: f32) -> Pixels {
 
 pub struct NodesView {
     vm: gpui_kit::Entity<NodesViewModel>,
+    usage: Option<NodeUsageWidget>,
+    usage_target: Option<String>,
     _vm_sub: Subscription,
 }
 
 impl NodesView {
     pub fn new(scope: NamespaceScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let vm = cx.new(|cx| NodesViewModel::new(scope, window, cx));
-        let sub = cx.observe(&vm, |_, _, cx| cx.notify());
-        Self { vm, _vm_sub: sub }
+        let sub = cx.observe(&vm, |this, _, cx| {
+            this.sync_usage(cx);
+            cx.notify();
+        });
+        Self {
+            vm,
+            usage: None,
+            usage_target: None,
+            _vm_sub: sub,
+        }
+    }
+
+    /// Create or replace the usage widget when the selected node changes.
+    fn sync_usage(&mut self, cx: &mut Context<Self>) {
+        let target = {
+            let detail = self.vm.read(cx).detail(cx);
+            if detail.is_open() {
+                detail.node().map(str::to_string)
+            } else {
+                None
+            }
+        };
+        if self.usage_target == target {
+            return;
+        }
+        if let Some(usage) = self.usage.take() {
+            usage.shutdown(cx);
+        }
+        self.usage = target.as_ref().map(|node| {
+            NodeUsageWidget::mount(
+                NodeUsageArgs {
+                    node: node.clone(),
+                    id_prefix: format!("node-detail-usage-{node}").into(),
+                    compact: false,
+                    show_header: true,
+                },
+                cx,
+            )
+        });
+        if let Some(usage) = &self.usage {
+            usage.set_active(self.vm.read(cx).is_active(), cx);
+        }
+        self.usage_target = target;
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.vm.update(cx, |vm, cx| vm.set_active(active, cx));
+        if let Some(usage) = &self.usage {
+            usage.set_active(active, cx);
+        }
     }
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
+        if let Some(usage) = self.usage.take() {
+            usage.shutdown(cx);
+        }
+        self.usage_target = None;
         self.vm.update(cx, |vm, cx| vm.close_detail(cx));
     }
 
@@ -140,12 +193,9 @@ impl Render for NodesView {
 
         let viewport_width = window.viewport_size().width.as_f32();
         let split = viewport_width >= SPLIT_MIN_VIEWPORT_WIDTH;
-        let usage = self.vm.read(cx).usage(cx);
-        let usage_error = self.vm.read(cx).usage_error(cx);
         let detail = detail::render_detail(
             detail_state,
-            usage,
-            usage_error,
+            self.usage.as_ref(),
             cx.entity().clone(),
             !split,
             cx,

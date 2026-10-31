@@ -1,11 +1,12 @@
 //! Generic resource list view: header, virtualized table, and detail pane.
 
+use crate::models::resources::deployments::actions::DeploymentActionEvent;
 use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
+use crate::ui::resources::deployments::actions::{DeploymentActionsArgs, DeploymentActionsWidget};
 use crate::ui::resources::namespace_filter::{
     NamespaceFilter, NamespaceFilterEvent, render as render_namespace_filter,
 };
 use crate::view_models::ResourceViewModel;
-use crate::view_models::resources::deployments::DeploymentsDetailViewModel;
 use crate::view_models::resources::detail::ResourceDetailViewModel;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::{
@@ -39,10 +40,12 @@ pub struct ResourceListView {
     vm: ResourceViewModel,
     namespace_filter: gpui_kit::Entity<NamespaceFilter>,
     detail: gpui_kit::Entity<ResourceDetailViewModel>,
-    deployment_actions: gpui_kit::Entity<DeploymentsDetailViewModel>,
+    deployment_actions: Option<DeploymentActionsWidget>,
+    deployment_target: Option<(String, String)>,
     _vm_sub: Subscription,
     _namespace_sub: Subscription,
     _detail_sub: Subscription,
+    _action_sub: Option<Subscription>,
     _row_sub: Subscription,
 }
 
@@ -65,8 +68,10 @@ impl ResourceListView {
             },
         );
         let detail = cx.new(ResourceDetailViewModel::new);
-        let deployment_actions = cx.new(|_| DeploymentsDetailViewModel::new(detail.downgrade()));
-        let detail_sub = cx.observe(&detail, |_, _, cx| cx.notify());
+        let detail_sub = cx.observe(&detail, |this, _, cx| {
+            this.sync_deployment_actions(cx);
+            cx.notify();
+        });
         let detail_handle = detail.clone();
         let row_sub = vm.observe_row_selected(cx, move |this, row, cx| {
             let Some(item) = this.vm.item_at(row, cx) else {
@@ -82,12 +87,57 @@ impl ResourceListView {
             vm,
             namespace_filter,
             detail,
-            deployment_actions,
+            deployment_actions: None,
+            deployment_target: None,
             _vm_sub: vm_sub,
             _namespace_sub: namespace_sub,
             _detail_sub: detail_sub,
+            _action_sub: None,
             _row_sub: row_sub,
         }
+    }
+
+    /// Mount the deployment actions widget when the deployment detail opens.
+    /// Widgets are created here, never in render.
+    fn sync_deployment_actions(&mut self, cx: &mut Context<Self>) {
+        let target = self
+            .detail
+            .read(cx)
+            .state()
+            .identity()
+            .filter(|(kind, _, _)| *kind == ResourceKind::Deployments)
+            .map(|(_, namespace, name)| (namespace.to_string(), name.to_string()));
+        if self.deployment_target == target {
+            return;
+        }
+        self.deployment_actions = None;
+        self._action_sub = None;
+        let widget = target.as_ref().map(|(namespace, name)| {
+            DeploymentActionsWidget::mount(
+                DeploymentActionsArgs {
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    id_prefix: format!("deployment-actions-{namespace}-{name}").into(),
+                },
+                cx,
+            )
+        });
+        if let Some(widget) = &widget {
+            let vm = widget.vm().clone();
+            self._action_sub = Some(cx.subscribe(
+                &vm,
+                |this, _, event: &DeploymentActionEvent, cx| match event {
+                    DeploymentActionEvent::Changed => this.reload_detail(cx),
+                    DeploymentActionEvent::Deleted => this.close_detail(cx),
+                },
+            ));
+        }
+        self.deployment_actions = widget;
+        self.deployment_target = target;
+    }
+
+    fn reload_detail(&mut self, cx: &mut Context<Self>) {
+        self.detail.update(cx, |detail, cx| detail.reload(cx));
     }
 
     pub fn scope_label(&self, cx: &App) -> String {
@@ -103,6 +153,9 @@ impl ResourceListView {
     }
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
+        self.deployment_actions = None;
+        self._action_sub = None;
+        self.deployment_target = None;
         self.detail.update(cx, |detail, cx| detail.close(cx));
     }
 
@@ -189,7 +242,7 @@ impl Render for ResourceListView {
         let detail = if self.kind == ResourceKind::Deployments {
             crate::ui::resources::deployments::detail::render(
                 detail_state,
-                self.deployment_actions.clone(),
+                self.deployment_actions.as_ref(),
                 cx.entity().clone(),
                 !split,
                 ResourceListView::close_detail,

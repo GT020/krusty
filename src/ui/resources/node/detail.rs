@@ -6,20 +6,20 @@ use gpui_kit::{
     AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _, div,
 };
 
-use crate::models::resources::node::detail::{
-    NodeCondition, NodeDetail, NodeDetailState, UsageHistory,
-};
+use crate::models::dashboard::{NodeSection, NodeWidgetSource, WidgetSource};
+use crate::models::resources::node::detail::{NodeCondition, NodeDetail, NodeDetailState};
 use crate::ui::components::detail::{
-    SelectableTextStyle, age, detail_header, detail_shell, empty_row, error_body, field,
-    field_colored, field_with_id, key_values, loading_body, raw_manifest, section, selectable_text,
-    usage_section, value_pair,
+    ConditionTone, ConditionView, SelectableTextStyle, age, condition_row, detail_header,
+    detail_shell, empty_row, error_body, field, field_colored, field_with_id, key_values,
+    loading_body, raw_manifest, section, selectable_text, value_pair,
 };
+use crate::ui::dashboard::pinnable;
 use crate::ui::resources::node::NodesView;
+use crate::ui::resources::node::usage::NodeUsageWidget;
 
 pub fn render_detail(
     state: NodeDetailState,
-    usage: UsageHistory,
-    usage_error: Option<String>,
+    usage: Option<&NodeUsageWidget>,
     view: Entity<NodesView>,
     compact: bool,
     cx: &mut Context<NodesView>,
@@ -58,33 +58,77 @@ pub fn render_detail(
         NodeDetailState::Error { node: _, message } => {
             error_body("Could not load this node", &message, cx)
         }
-        NodeDetailState::Ready(detail) => v_flex()
-            .gap_6()
-            .p_4()
-            .child(overview(&detail, cx))
-            .child(usage_section(
-                &usage,
-                usage_error.as_deref(),
-                "allocatable",
-                cx,
+        NodeDetailState::Ready(detail) => {
+            let section = |section: NodeSection| {
+                WidgetSource::Node(NodeWidgetSource::Section {
+                    name: detail.name.clone(),
+                    section,
+                })
+            };
+            let id = |part: &str| format!("node-section-{}-{part}", detail.name);
+
+            let mut body = v_flex().gap_6().p_4().child(pinnable(
+                id("overview"),
+                overview(&detail, cx),
+                section(NodeSection::Overview),
+            ));
+            if let Some(usage) = usage {
+                body = body.child(usage.element(cx));
+            }
+            body.child(pinnable(
+                id("capacity"),
+                capacity(&detail, cx),
+                section(NodeSection::Capacity),
             ))
-            .child(capacity(&detail, cx))
-            .child(conditions(&detail, cx))
-            .child(system(&detail, cx))
-            .child(addresses(&detail, cx))
-            .child(taints(&detail, cx))
-            .child(key_values("Labels", &detail.labels, cx))
-            .child(key_values("Annotations", &detail.annotations, cx))
-            .child(images(&detail, cx))
-            .child(raw_manifest(&detail.raw_json, cx))
-            .into_any_element(),
+            .child(pinnable(
+                id("conditions"),
+                conditions(&detail, cx),
+                section(NodeSection::Conditions),
+            ))
+            .child(pinnable(
+                id("system"),
+                system(&detail, cx),
+                section(NodeSection::System),
+            ))
+            .child(pinnable(
+                id("addresses"),
+                addresses(&detail, cx),
+                section(NodeSection::Addresses),
+            ))
+            .child(pinnable(
+                id("taints"),
+                taints(&detail, cx),
+                section(NodeSection::Taints),
+            ))
+            .child(pinnable(
+                id("labels"),
+                key_values("Labels", &detail.labels, cx),
+                section(NodeSection::Labels),
+            ))
+            .child(pinnable(
+                id("annotations"),
+                key_values("Annotations", &detail.annotations, cx),
+                section(NodeSection::Annotations),
+            ))
+            .child(pinnable(
+                id("images"),
+                images(&detail, cx),
+                section(NodeSection::Images),
+            ))
+            .child(pinnable(
+                id("manifest"),
+                raw_manifest(&detail.raw_json, cx),
+                section(NodeSection::Manifest),
+            ))
+            .into_any_element()
+        }
         NodeDetailState::Closed => return div().into_any_element(),
     };
 
     detail_shell(header, body, compact, cx)
 }
 
-fn overview(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
+pub(crate) fn overview<T: 'static>(detail: &NodeDetail, cx: &mut Context<T>) -> AnyElement {
     let mut body = v_flex();
     body = body
         .child(field("Name", &detail.name, cx))
@@ -115,7 +159,7 @@ fn overview(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
     section("Overview", body, cx)
 }
 
-fn capacity(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
+pub(crate) fn capacity<T: 'static>(detail: &NodeDetail, cx: &mut Context<T>) -> AnyElement {
     let mut keys: Vec<String> = detail
         .capacity
         .keys()
@@ -161,80 +205,50 @@ fn capacity(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
     section("Capacity and allocatable", body, cx)
 }
 
-fn conditions(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
+pub(crate) fn conditions<T: 'static>(detail: &NodeDetail, cx: &mut Context<T>) -> AnyElement {
     let mut body = v_flex();
     if detail.conditions.is_empty() {
         body = body.child(empty_row("No conditions reported", cx));
     }
     for condition in &detail.conditions {
-        let status_color = condition_color(condition, cx);
+        let tone = condition_tone(condition);
         let heartbeat = format!(
             "Heartbeat {} · Changed {}",
             age(condition.last_heartbeat),
             age(condition.last_transition)
         );
-        let mut block = v_flex()
-            .w_full()
-            .min_w_0()
-            .gap_1()
-            .py_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(selectable_text(
-                        format!("node-condition-{}-type", condition.type_),
-                        condition.type_.clone(),
-                        SelectableTextStyle::xs().weight(FontWeight::MEDIUM),
-                    ))
-                    .child(selectable_text(
-                        format!("node-condition-{}-status", condition.type_),
-                        condition.status.clone(),
-                        SelectableTextStyle::xs().color(status_color),
-                    ))
-                    .child(div().flex_1().min_w_0().text_right().child(selectable_text(
-                        format!("node-condition-{}-heartbeat", condition.type_),
-                        heartbeat,
-                        SelectableTextStyle::xs().color(cx.theme().muted_foreground),
-                    ))),
-            );
-        if !condition.reason.is_empty() {
-            block = block.child(div().w_full().min_w_0().child(selectable_text(
-                format!("node-condition-{}-reason", condition.type_),
-                condition.reason.clone(),
-                SelectableTextStyle::xs().color(cx.theme().muted_foreground),
-            )));
-        }
-        if !condition.message.is_empty() {
-            block = block.child(div().w_full().min_w_0().child(selectable_text(
-                format!("node-condition-{}-message", condition.type_),
-                condition.message.clone(),
-                SelectableTextStyle::xs(),
-            )));
-        }
-        body = body.child(block);
+        body = body.child(condition_row(
+            &format!("node-condition-{}", condition.type_),
+            ConditionView {
+                kind: &condition.type_,
+                status: &condition.status,
+                reason: &condition.reason,
+                message: &condition.message,
+                timestamp: &heartbeat,
+                tone,
+            },
+            cx,
+        ));
     }
     section("Conditions", body, cx)
 }
 
-fn condition_color(condition: &NodeCondition, cx: &Context<NodesView>) -> gpui_kit::Hsla {
+fn condition_tone(condition: &NodeCondition) -> ConditionTone {
     let negative = matches!(
         condition.type_.as_str(),
         "MemoryPressure" | "DiskPressure" | "PIDPressure" | "NetworkUnavailable"
     );
     match condition.status.as_str() {
-        "True" if negative => cx.theme().danger,
-        "True" => cx.theme().success,
-        "False" if condition.type_ == "Ready" => cx.theme().danger,
-        "False" if negative => cx.theme().success,
-        "Unknown" => cx.theme().warning,
-        _ => cx.theme().muted_foreground,
+        "True" if negative => ConditionTone::Danger,
+        "True" => ConditionTone::Success,
+        "False" if condition.type_ == "Ready" => ConditionTone::Danger,
+        "False" if negative => ConditionTone::Success,
+        "Unknown" => ConditionTone::Warning,
+        _ => ConditionTone::Muted,
     }
 }
 
-fn system(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
+pub(crate) fn system<T: 'static>(detail: &NodeDetail, cx: &mut Context<T>) -> AnyElement {
     let info = &detail.node_info;
     let body = v_flex()
         .child(field("Operating system", dash(&info.operating_system), cx))
@@ -258,7 +272,7 @@ fn system(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
     section("System", body, cx)
 }
 
-fn addresses(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
+pub(crate) fn addresses<T: 'static>(detail: &NodeDetail, cx: &mut Context<T>) -> AnyElement {
     let mut body = v_flex();
     if detail.addresses.is_empty() {
         body = body.child(empty_row("No addresses reported", cx));
@@ -274,7 +288,7 @@ fn addresses(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
     section("Addresses", body, cx)
 }
 
-fn taints(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
+pub(crate) fn taints<T: 'static>(detail: &NodeDetail, cx: &mut Context<T>) -> AnyElement {
     let mut body = v_flex();
     if detail.taints.is_empty() {
         body = body.child(empty_row("No taints", cx));
@@ -295,7 +309,7 @@ fn taints(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
     section("Taints", body, cx)
 }
 
-fn images(detail: &NodeDetail, cx: &mut Context<NodesView>) -> AnyElement {
+pub(crate) fn images<T: 'static>(detail: &NodeDetail, cx: &mut Context<T>) -> AnyElement {
     let mut body = v_flex();
     if detail.images.is_empty() {
         body = body.child(empty_row("No images reported", cx));

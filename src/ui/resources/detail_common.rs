@@ -2,18 +2,15 @@
 
 use std::collections::BTreeMap;
 
-use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::ActiveTheme as _;
-use gpui_kit::{
-    AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _, div,
-};
+use gpui_kit::base::v_flex;
+use gpui_kit::{AnyElement, Context, Entity, IntoElement, ParentElement as _, Styled as _, div};
 use serde_json::Value;
 
 use crate::models::ResourceKind;
 use crate::models::resources::detail::{ResourceDetail, ResourceDetailState};
 use crate::ui::components::detail::{
-    SelectableTextStyle, age, detail_header, detail_shell, empty_row, error_body, field_with_id,
-    key_values, loading_body, raw_manifest, section, selectable_text,
+    ConditionTone, ConditionView, age, condition_row, detail_header, detail_shell, empty_row,
+    error_body, field_with_id, key_values, loading_body, raw_manifest, section,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -183,10 +180,10 @@ pub fn conditions_section<T: 'static>(
     for condition in items {
         let status = text(condition.get("status"));
         let condition_type = text(condition.get("type"));
-        let status_color = match status.as_str() {
-            "True" => cx.theme().success,
-            "Unknown" => cx.theme().warning,
-            _ => cx.theme().muted_foreground,
+        let tone = match status.as_str() {
+            "True" => ConditionTone::Success,
+            "Unknown" => ConditionTone::Warning,
+            _ => ConditionTone::Muted,
         };
         let changed = format!(
             "Changed {}",
@@ -197,50 +194,20 @@ pub fn conditions_section<T: 'static>(
                     .or_else(|| condition.get("lastProbeTime"))
             )
         );
-        let mut block = v_flex()
-            .w_full()
-            .min_w_0()
-            .gap_1()
-            .py_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(selectable_text(
-                        format!("condition-{condition_type}-type"),
-                        condition_type.clone(),
-                        SelectableTextStyle::xs().weight(FontWeight::MEDIUM),
-                    ))
-                    .child(selectable_text(
-                        format!("condition-{condition_type}-status"),
-                        status,
-                        SelectableTextStyle::xs().color(status_color),
-                    ))
-                    .child(div().flex_1().min_w_0().text_right().child(selectable_text(
-                        format!("condition-{condition_type}-changed"),
-                        changed,
-                        SelectableTextStyle::xs().color(cx.theme().muted_foreground),
-                    ))),
-            );
         let reason = text(condition.get("reason"));
-        if reason != "—" {
-            block = block.child(div().w_full().min_w_0().child(selectable_text(
-                format!("condition-{condition_type}-reason"),
-                reason,
-                SelectableTextStyle::xs().color(cx.theme().muted_foreground),
-            )));
-        }
         let message = text(condition.get("message"));
-        if message != "—" {
-            block = block.child(div().w_full().min_w_0().child(selectable_text(
-                format!("condition-{condition_type}-message"),
-                message,
-                SelectableTextStyle::xs(),
-            )));
-        }
-        body = body.child(block);
+        body = body.child(condition_row(
+            &format!("condition-{condition_type}"),
+            ConditionView {
+                kind: &condition_type,
+                status: &status,
+                reason: &reason,
+                message: &message,
+                timestamp: &changed,
+                tone,
+            },
+            cx,
+        ));
     }
     section("Conditions", body, cx)
 }
@@ -300,7 +267,7 @@ pub fn pod_template_sections<T: 'static>(
     sections
 }
 
-pub fn flatten(prefix: &str, value: &Value, out: &mut Vec<(String, String)>) {
+pub(crate) fn flatten(prefix: &str, value: &Value, out: &mut Vec<(String, String)>) {
     match value {
         Value::Object(map) => {
             if map.is_empty() {
@@ -328,7 +295,7 @@ pub fn flatten(prefix: &str, value: &Value, out: &mut Vec<(String, String)>) {
     }
 }
 
-pub fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
+pub(crate) fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
     value
         .and_then(Value::as_object)
         .map(|map| {
@@ -347,7 +314,7 @@ fn age_from_timestamp(value: Option<&Value>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn namespace_label(namespace: &str) -> &str {
+pub(crate) fn namespace_label(namespace: &str) -> &str {
     if namespace.is_empty() {
         "Cluster-scoped"
     } else {

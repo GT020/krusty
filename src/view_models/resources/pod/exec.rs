@@ -1,27 +1,20 @@
 //! ViewModel for an interactive TTY exec session in a pod container.
 
-use std::num::NonZeroU16;
-
 use gpui_kit::Context;
 use tokio::sync::{mpsc, watch};
 
+use crate::models::resources::pod::exec::PodExecModel;
 use crate::repository::resources::pods;
 
-const SCROLLBACK_LINES: usize = 5_000;
-const DEFAULT_COLS: u16 = 80;
-const DEFAULT_ROWS: u16 = 24;
-
-pub const SHELLS: [&str; 2] = ["sh", "bash"];
+pub use crate::models::resources::pod::exec::SHELLS;
 
 pub struct PodExecViewModel {
     namespace: String,
     name: String,
     containers: Vec<String>,
-    container: String,
-    shell: String,
-    parser: vt100::Parser,
-    status: String,
-    error: Option<String>,
+    model: PodExecModel,
+    auto_connect: bool,
+    active: bool,
     input_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     resize_tx: Option<mpsc::UnboundedSender<(u16, u16)>>,
     generation: u64,
@@ -29,36 +22,42 @@ pub struct PodExecViewModel {
 }
 
 impl PodExecViewModel {
-    pub fn new(
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with(
         namespace: String,
         name: String,
         containers: Vec<String>,
         container: String,
         shell: String,
+        auto_connect: bool,
         _window: &mut gpui_kit::Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let parser = vt100::Parser::new(
-            NonZeroU16::new(DEFAULT_ROWS).unwrap_or(NonZeroU16::MIN),
-            NonZeroU16::new(DEFAULT_COLS).unwrap_or(NonZeroU16::MIN),
-            SCROLLBACK_LINES,
-        );
+        let model = PodExecModel::new(container, shell);
         let mut this = Self {
             namespace,
             name,
             containers,
-            container,
-            shell,
-            parser,
-            status: "Connecting…".to_string(),
-            error: None,
+            model,
+            auto_connect,
+            active: true,
             input_tx: None,
             resize_tx: None,
             generation: 0,
             cancel: None,
         };
-        this.start_session(cx);
+        if auto_connect {
+            this.start_session(cx);
+        }
         this
+    }
+
+    pub fn namespace(&self) -> &str {
+        &self.namespace
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
     }
 
     pub fn containers(&self) -> &[String] {
@@ -66,43 +65,56 @@ impl PodExecViewModel {
     }
 
     pub fn container(&self) -> &str {
-        &self.container
+        self.model.container()
     }
 
     pub fn shell(&self) -> &str {
-        &self.shell
+        self.model.shell()
     }
 
     pub fn screen(&self) -> &vt100::Screen {
-        self.parser.screen()
+        self.model.screen()
     }
 
     pub fn application_cursor(&self) -> bool {
-        self.parser.screen().application_cursor()
+        self.model.application_cursor()
     }
 
     pub fn status(&self) -> &str {
-        &self.status
+        self.model.status()
     }
 
     pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+        self.model.error()
+    }
+
+    pub fn is_connected(&self) -> bool {
+        self.cancel.is_some()
     }
 
     pub fn set_container(&mut self, container: String, cx: &mut Context<Self>) {
-        if container == self.container {
+        if container == self.model.container() {
             return;
         }
-        self.container = container;
+        self.model.set_container(container);
         self.restart(cx);
     }
 
     pub fn set_shell(&mut self, shell: String, cx: &mut Context<Self>) {
-        if shell == self.shell {
+        if shell == self.model.shell() {
             return;
         }
-        self.shell = shell;
+        self.model.set_shell(shell);
         self.restart(cx);
+    }
+
+    /// Connect a widget that was restored in a disconnected state.
+    pub fn connect(&mut self, cx: &mut Context<Self>) {
+        if self.is_connected() {
+            return;
+        }
+        self.auto_connect = true;
+        self.start_session(cx);
     }
 
     /// Send raw terminal input bytes to the shell.
@@ -112,43 +124,41 @@ impl PodExecViewModel {
         }
         if let Some(input) = &self.input_tx {
             if input.send(bytes).is_err() {
-                self.error = Some("Exec session is no longer connected.".to_string());
+                self.model
+                    .set_error(Some("Exec session is no longer connected.".to_string()));
             }
         } else {
-            self.error = Some("Exec session is not connected yet.".to_string());
+            self.model
+                .set_error(Some("Exec session is not connected yet.".to_string()));
         }
         cx.notify();
     }
 
     /// Resize the terminal grid and tell the remote TTY about it.
     pub fn resize(&mut self, cols: u16, rows: u16, cx: &mut Context<Self>) {
-        if cols == 0 || rows == 0 {
+        let Some((cols, rows)) = self.model.resize(cols, rows) else {
             return;
-        }
-        let (current_rows, current_cols) = self.parser.screen().size();
-        if current_rows.get() == rows && current_cols.get() == cols {
-            return;
-        }
-        let rows = NonZeroU16::new(rows).unwrap_or(NonZeroU16::MIN);
-        let cols = NonZeroU16::new(cols).unwrap_or(NonZeroU16::MIN);
-        self.parser.set_size(rows, cols);
+        };
         if let Some(resize) = &self.resize_tx {
-            let _ = resize.send((cols.get(), rows.get()));
+            let _ = resize.send((cols, rows));
         }
         cx.notify();
     }
 
     /// Scroll through terminal history. Positive values scroll up.
     pub fn scroll(&mut self, lines: i32, cx: &mut Context<Self>) {
-        if lines == 0 {
+        self.model.scroll(lines);
+        cx.notify();
+    }
+
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.active == active {
             return;
         }
-        let screen = self.parser.screen();
-        let current = screen.scrollback() as i32;
-        let max = screen.scrollback_len() as i32;
-        let target = (current + lines).clamp(0, max);
-        self.parser.screen_mut().set_scrollback(target as usize);
-        cx.notify();
+        self.active = active;
+        if active {
+            cx.notify();
+        }
     }
 
     pub fn shutdown(&mut self) {
@@ -157,12 +167,18 @@ impl PodExecViewModel {
         }
         self.input_tx = None;
         self.resize_tx = None;
+        self.model.set_status("Disconnected".to_string());
     }
 
     fn restart(&mut self, cx: &mut Context<Self>) {
-        let (rows, cols) = self.parser.screen().size();
-        self.parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        self.start_session(cx);
+        self.model.reset_screen();
+        if self.auto_connect {
+            self.start_session(cx);
+        } else {
+            self.model.set_status("Disconnected".to_string());
+            self.model.set_error(None);
+            cx.notify();
+        }
     }
 
     fn start_session(&mut self, cx: &mut Context<Self>) {
@@ -173,22 +189,27 @@ impl PodExecViewModel {
         let generation = self.generation;
         self.input_tx = None;
         self.resize_tx = None;
-        self.error = None;
-        self.status = format!("Starting {} in {}…", self.shell, self.container);
+        self.model.set_error(None);
+        self.model.set_status(format!(
+            "Starting {} in {}…",
+            self.model.shell(),
+            self.model.container()
+        ));
         cx.notify();
 
         let session = match pods::exec_shell(
             cx,
             &self.namespace,
             &self.name,
-            &self.container,
-            &self.shell,
+            self.model.container(),
+            self.model.shell(),
         ) {
             Ok(session) => session,
             Err(error) => {
-                self.status = "Unable to start exec session".to_string();
-                self.error = Some(error.clone());
-                self.process_error(&error);
+                self.model
+                    .set_status("Unable to start exec session".to_string());
+                self.model.set_error(Some(error.clone()));
+                self.model.process_error(&error);
                 cx.notify();
                 return;
             }
@@ -196,10 +217,14 @@ impl PodExecViewModel {
         self.cancel = Some(session.cancel_handle());
         self.input_tx = Some(session.input_handle());
         let resize = session.resize_handle();
-        let (rows, cols) = self.parser.screen().size();
+        let (rows, cols) = self.model.size();
         let _ = resize.send((cols.get(), rows.get()));
         self.resize_tx = Some(resize);
-        self.status = format!("Connecting · {} · {}", self.container, self.shell);
+        self.model.set_status(format!(
+            "Connecting · {} · {}",
+            self.model.container(),
+            self.model.shell()
+        ));
 
         cx.spawn(async move |this, cx| {
             let mut session = session;
@@ -210,18 +235,23 @@ impl PodExecViewModel {
                     }
                     match update {
                         Ok(bytes) => {
-                            this.parser.process(&bytes);
-                            this.error = None;
-                            this.status =
-                                format!("Connected · {} · {}", this.container, this.shell);
+                            this.model.process(&bytes);
+                            this.model.set_error(None);
+                            this.model.set_status(format!(
+                                "Connected · {} · {}",
+                                this.model.container(),
+                                this.model.shell()
+                            ));
                         }
                         Err(error) => {
-                            this.process_error(&error);
-                            this.error = Some(error);
-                            this.status = "Exec session error".to_string();
+                            this.model.process_error(&error);
+                            this.model.set_error(Some(error));
+                            this.model.set_status("Exec session error".to_string());
                         }
                     }
-                    cx.notify();
+                    if this.active {
+                        cx.notify();
+                    }
                     true
                 });
                 match current {
@@ -231,20 +261,18 @@ impl PodExecViewModel {
             }
             let _ = this.update(cx, |this, cx| {
                 if this.generation == generation {
-                    this.parser.process(b"\r\n[session ended]\r\n");
-                    this.status = "Exec session ended".to_string();
+                    this.model.process(b"\r\n[session ended]\r\n");
+                    this.model.set_status("Exec session ended".to_string());
                     this.input_tx = None;
                     this.resize_tx = None;
-                    cx.notify();
+                    this.cancel = None;
+                    if this.active {
+                        cx.notify();
+                    }
                 }
             });
         })
         .detach();
-    }
-
-    fn process_error(&mut self, error: &str) {
-        let text = format!("\r\n\x1b[31m{error}\x1b[0m\r\n");
-        self.parser.process(text.as_bytes());
     }
 }
 

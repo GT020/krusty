@@ -9,19 +9,20 @@ use gpui_kit::{
     AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _, div,
 };
 
-use crate::models::resources::pod::detail::{
-    PodContainer, PodDetail, PodDetailState, UsageHistory,
-};
+use crate::models::dashboard::{PodSection, PodWidgetSource, WidgetSource};
+use crate::models::resources::pod::detail::{PodContainer, PodDetail, PodDetailState};
 use crate::ui::components::detail::{
-    SelectableTextStyle, age, detail_header, detail_shell, empty_row, error_body, field,
-    field_with_id, key_values, loading_body, raw_manifest, section, selectable_text, usage_section,
+    ConditionTone, ConditionView, SelectableTextStyle, age, condition_row, detail_header,
+    detail_shell, empty_row, error_body, field, field_with_id, key_values, loading_body,
+    raw_manifest, section, selectable_text,
 };
+use crate::ui::dashboard::pinnable;
 use crate::ui::resources::pod::PodsView;
+use crate::ui::resources::pod::usage::PodUsageWidget;
 
 pub fn render_detail(
     state: PodDetailState,
-    usage: UsageHistory,
-    usage_error: Option<String>,
+    usage: Option<&PodUsageWidget>,
     view: Entity<PodsView>,
     compact: bool,
     cx: &mut Context<PodsView>,
@@ -64,24 +65,76 @@ pub fn render_detail(
             error_body("Could not load this pod", &message, cx)
         }
         PodDetailState::Ready(detail) => {
+            let section = |section: PodSection| {
+                WidgetSource::Pod(PodWidgetSource::Section {
+                    namespace: detail.namespace.clone(),
+                    name: detail.name.clone(),
+                    section,
+                })
+            };
+            let id =
+                |part: &str| format!("pod-section-{}-{}-{part}", detail.namespace, detail.name);
             let mut body = v_flex()
                 .gap_6()
                 .p_4()
                 .child(actions(&detail, actions_view))
-                .child(overview(&detail, cx))
-                .child(usage_section(&usage, usage_error.as_deref(), "", cx))
-                .child(containers("Containers", &detail.containers, cx))
-                .child(conditions(&detail, cx));
-            if !detail.init_containers.is_empty() {
-                body = body.child(containers("Init containers", &detail.init_containers, cx));
+                .child(pinnable(
+                    id("overview"),
+                    overview(&detail, cx),
+                    section(PodSection::Overview),
+                ));
+            if let Some(usage) = usage {
+                body = body.child(usage.element(cx));
             }
-            body.child(volumes(&detail, cx))
-                .child(tolerations(&detail, cx))
-                .child(owners(&detail, cx))
-                .child(key_values("Labels", &detail.labels, cx))
-                .child(key_values("Annotations", &detail.annotations, cx))
-                .child(raw_manifest(&detail.raw_json, cx))
-                .into_any_element()
+            body = body
+                .child(pinnable(
+                    id("containers"),
+                    containers("Containers", &detail.containers, cx),
+                    section(PodSection::Containers),
+                ))
+                .child(pinnable(
+                    id("conditions"),
+                    conditions(&detail, cx),
+                    section(PodSection::Conditions),
+                ));
+            if !detail.init_containers.is_empty() {
+                body = body.child(pinnable(
+                    id("init-containers"),
+                    containers("Init containers", &detail.init_containers, cx),
+                    section(PodSection::InitContainers),
+                ));
+            }
+            body.child(pinnable(
+                id("volumes"),
+                volumes(&detail, cx),
+                section(PodSection::Volumes),
+            ))
+            .child(pinnable(
+                id("tolerations"),
+                tolerations(&detail, cx),
+                section(PodSection::Tolerations),
+            ))
+            .child(pinnable(
+                id("owners"),
+                owners(&detail, cx),
+                section(PodSection::Owners),
+            ))
+            .child(pinnable(
+                id("labels"),
+                key_values("Labels", &detail.labels, cx),
+                section(PodSection::Labels),
+            ))
+            .child(pinnable(
+                id("annotations"),
+                key_values("Annotations", &detail.annotations, cx),
+                section(PodSection::Annotations),
+            ))
+            .child(pinnable(
+                id("manifest"),
+                raw_manifest(&detail.raw_json, cx),
+                section(PodSection::Manifest),
+            ))
+            .into_any_element()
         }
         PodDetailState::Closed => return div().into_any_element(),
     };
@@ -151,7 +204,7 @@ fn actions(detail: &PodDetail, view: Entity<PodsView>) -> AnyElement {
         .into_any_element()
 }
 
-fn overview(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
+pub(crate) fn overview<T: 'static>(detail: &PodDetail, cx: &mut Context<T>) -> AnyElement {
     let mut body = v_flex();
     body = body
         .child(field("Name", &detail.name, cx))
@@ -196,7 +249,11 @@ fn overview(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
     section("Overview", body, cx)
 }
 
-fn containers(title: &str, containers: &[PodContainer], cx: &mut Context<PodsView>) -> AnyElement {
+pub(crate) fn containers<T: 'static>(
+    title: &str,
+    containers: &[PodContainer],
+    cx: &mut Context<T>,
+) -> AnyElement {
     let mut body = v_flex();
     if containers.is_empty() {
         body = body.child(empty_row("No containers reported", cx));
@@ -348,71 +405,41 @@ fn quantity_map(values: &BTreeMap<String, String>) -> String {
     }
 }
 
-fn conditions(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
+pub(crate) fn conditions<T: 'static>(detail: &PodDetail, cx: &mut Context<T>) -> AnyElement {
     let mut body = v_flex();
     if detail.conditions.is_empty() {
         body = body.child(empty_row("No conditions reported", cx));
     }
     for condition in &detail.conditions {
-        let status_color = if condition.status == "True" {
-            cx.theme().success
+        let tone = if condition.status == "True" {
+            ConditionTone::Success
         } else if condition.status == "Unknown" {
-            cx.theme().warning
+            ConditionTone::Warning
         } else {
-            cx.theme().muted_foreground
+            ConditionTone::Muted
         };
         let probed = format!(
             "Probed {} · Changed {}",
             age(condition.last_probe),
             age(condition.last_transition)
         );
-        let mut block = v_flex()
-            .w_full()
-            .min_w_0()
-            .gap_1()
-            .py_2()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(selectable_text(
-                        format!("pod-condition-{}-type", condition.type_),
-                        condition.type_.clone(),
-                        SelectableTextStyle::xs().weight(FontWeight::MEDIUM),
-                    ))
-                    .child(selectable_text(
-                        format!("pod-condition-{}-status", condition.type_),
-                        condition.status.clone(),
-                        SelectableTextStyle::xs().color(status_color),
-                    ))
-                    .child(div().flex_1().min_w_0().text_right().child(selectable_text(
-                        format!("pod-condition-{}-probed", condition.type_),
-                        probed,
-                        SelectableTextStyle::xs().color(cx.theme().muted_foreground),
-                    ))),
-            );
-        if !condition.reason.is_empty() {
-            block = block.child(div().w_full().min_w_0().child(selectable_text(
-                format!("pod-condition-{}-reason", condition.type_),
-                condition.reason.clone(),
-                SelectableTextStyle::xs().color(cx.theme().muted_foreground),
-            )));
-        }
-        if !condition.message.is_empty() {
-            block = block.child(div().w_full().min_w_0().child(selectable_text(
-                format!("pod-condition-{}-message", condition.type_),
-                condition.message.clone(),
-                SelectableTextStyle::xs(),
-            )));
-        }
-        body = body.child(block);
+        body = body.child(condition_row(
+            &format!("pod-condition-{}", condition.type_),
+            ConditionView {
+                kind: &condition.type_,
+                status: &condition.status,
+                reason: &condition.reason,
+                message: &condition.message,
+                timestamp: &probed,
+                tone,
+            },
+            cx,
+        ));
     }
     section("Conditions", body, cx)
 }
 
-fn volumes(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
+pub(crate) fn volumes<T: 'static>(detail: &PodDetail, cx: &mut Context<T>) -> AnyElement {
     let mut body = v_flex();
     if detail.volumes.is_empty() {
         body = body.child(empty_row("No volumes", cx));
@@ -433,7 +460,7 @@ fn volumes(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
     section("Volumes", body, cx)
 }
 
-fn tolerations(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
+pub(crate) fn tolerations<T: 'static>(detail: &PodDetail, cx: &mut Context<T>) -> AnyElement {
     let mut body = v_flex();
     if detail.tolerations.is_empty() {
         body = body.child(empty_row("No tolerations", cx));
@@ -461,7 +488,7 @@ fn tolerations(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
     section("Tolerations", body, cx)
 }
 
-fn owners(detail: &PodDetail, cx: &mut Context<PodsView>) -> AnyElement {
+pub(crate) fn owners<T: 'static>(detail: &PodDetail, cx: &mut Context<T>) -> AnyElement {
     let mut body = v_flex();
     if detail.owners.is_empty() {
         body = body.child(empty_row("No owner references", cx));

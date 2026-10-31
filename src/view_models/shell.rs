@@ -10,6 +10,7 @@ use gpui_kit::{App, Context, Hsla};
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum NavTarget {
     Resource(ResourceKind),
+    Dashboard,
     Settings,
 }
 
@@ -17,6 +18,7 @@ impl NavTarget {
     pub fn label(self) -> &'static str {
         match self {
             Self::Resource(kind) => kind.label(),
+            Self::Dashboard => "Dashboard",
             Self::Settings => "Settings",
         }
     }
@@ -24,6 +26,7 @@ impl NavTarget {
     pub fn icon(self) -> IconName {
         match self {
             Self::Resource(kind) => kind.icon(),
+            Self::Dashboard => IconName::LayoutDashboard,
             Self::Settings => IconName::Settings,
         }
     }

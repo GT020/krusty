@@ -1,25 +1,24 @@
-//! Repository for Nodes: live list/watch plus one-shot detail and metrics reads.
+//! Repository for Nodes: live list/watch plus one-shot detail reads.
+//!
+//! Metrics polling lives in [`usage`] so a usage widget can run independently.
+
+pub mod usage;
 
 use std::collections::BTreeMap;
-use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Node;
-use kube::api::{Api, DynamicObject};
-use kube::core::{ApiResource, GroupVersionKind};
+use kube::api::Api;
 use kube::{Client, ResourceExt};
 use tokio::sync::{mpsc, watch};
 
 use crate::cluster::ClusterState;
 use crate::models::resources::node::detail::{
     NodeAddress, NodeCondition, NodeDetail, NodeDetailUpdate, NodeImage, NodeSystemInfo, NodeTaint,
-    NodeUsage,
 };
 use crate::models::{NamespaceScope, ResourceKind};
 use gpui_kit::App;
 
 use crate::repository::{Subscription, subscribe_kind};
-
-const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Subscribe to the live Nodes stream.
 /// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
@@ -88,77 +87,10 @@ async fn watch_node_detail(
         }
     };
     let detail = detail_from_node(&fetched);
-    let cpu_capacity = detail
-        .allocatable
-        .get("cpu")
-        .and_then(|quantity| parse_quantity(quantity))
-        .map(|cores| (cores * 1000.0).round() as u64);
-    let memory_capacity = detail
-        .allocatable
-        .get("memory")
-        .and_then(|quantity| parse_quantity(quantity))
-        .map(|bytes| bytes.max(0.0).round() as u64);
-    if updates
-        .send(NodeDetailUpdate::Detail {
-            node: node.clone(),
-            result: Ok(Box::new(detail)),
-        })
-        .is_err()
-    {
-        return;
-    }
-
-    loop {
-        let fetched = tokio::select! {
-            _ = cancel.changed() => return,
-            result = fetch_usage(&client, &node, cpu_capacity, memory_capacity) => result,
-        };
-        if updates
-            .send(NodeDetailUpdate::Usage {
-                node: node.clone(),
-                result: fetched,
-            })
-            .is_err()
-        {
-            return;
-        }
-        tokio::select! {
-            _ = cancel.changed() => return,
-            _ = tokio::time::sleep(METRICS_POLL_INTERVAL) => {}
-        }
-    }
-}
-
-async fn fetch_usage(
-    client: &Client,
-    node: &str,
-    cpu_capacity_millicores: Option<u64>,
-    memory_capacity_bytes: Option<u64>,
-) -> Result<NodeUsage, String> {
-    let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "NodeMetrics");
-    let resource = ApiResource::from_gvk(&gvk);
-    let api: Api<DynamicObject> = Api::all_with(client.clone(), &resource);
-    let metrics = api.get(node).await.map_err(|error| {
-        format!("Node metrics are unavailable. Install metrics-server to see live usage. ({error})")
-    })?;
-    let usage = metrics
-        .data
-        .get("usage")
-        .ok_or_else(|| "Node metrics did not include usage.".to_string())?;
-    let cpu = usage.get("cpu").and_then(|value| value.as_str());
-    let memory = usage.get("memory").and_then(|value| value.as_str());
-
-    Ok(NodeUsage {
-        observed_at: jiff::Timestamp::now().as_second(),
-        cpu_used_millicores: cpu
-            .and_then(parse_quantity)
-            .map(|cores| (cores * 1000.0).round().max(0.0) as u64),
-        cpu_capacity_millicores,
-        memory_used_bytes: memory
-            .and_then(parse_quantity)
-            .map(|bytes| bytes.max(0.0).round() as u64),
-        memory_capacity_bytes,
-    })
+    let _ = updates.send(NodeDetailUpdate::Detail {
+        node,
+        result: Ok(Box::new(detail)),
+    });
 }
 
 fn detail_from_node(node: &Node) -> NodeDetail {
@@ -303,7 +235,7 @@ fn quantities(
 }
 
 /// Parse a Kubernetes resource quantity into a plain number.
-fn parse_quantity(value: &str) -> Option<f64> {
+pub(super) fn parse_quantity(value: &str) -> Option<f64> {
     let value = value.trim();
     if value.is_empty() {
         return None;

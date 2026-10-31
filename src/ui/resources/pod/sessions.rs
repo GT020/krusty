@@ -1,10 +1,8 @@
 //! Bottom-panel sessions owned by one Pods tab: live logs and exec terminals.
 
-use crate::ui::resources::pod::exec::PodExecView;
-use crate::ui::resources::pod::logs::PodLogsView;
-use crate::view_models::resources::pod::exec::PodExecViewModel;
-use crate::view_models::resources::pod::logs::PodLogsViewModel;
-use gpui_kit::{AnyElement, App, Entity, IntoElement, div};
+use crate::ui::resources::pod::exec::PodExecWidget;
+use crate::ui::resources::pod::logs::PodLogsWidget;
+use gpui_kit::{AnyElement, App, IntoElement, div};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SessionKind {
@@ -56,23 +54,21 @@ impl SessionKey {
 pub enum PodSession {
     Logs {
         key: SessionKey,
-        view: Entity<PodLogsView>,
-        vm: Entity<PodLogsViewModel>,
+        widget: PodLogsWidget,
     },
     Exec {
         key: SessionKey,
-        view: Entity<PodExecView>,
-        vm: Entity<PodExecViewModel>,
+        widget: PodExecWidget,
     },
 }
 
 impl PodSession {
-    pub fn logs(key: SessionKey, view: Entity<PodLogsView>, vm: Entity<PodLogsViewModel>) -> Self {
-        Self::Logs { key, view, vm }
+    pub fn logs(key: SessionKey, widget: PodLogsWidget) -> Self {
+        Self::Logs { key, widget }
     }
 
-    pub fn exec(key: SessionKey, view: Entity<PodExecView>, vm: Entity<PodExecViewModel>) -> Self {
-        Self::Exec { key, view, vm }
+    pub fn exec(key: SessionKey, widget: PodExecWidget) -> Self {
+        Self::Exec { key, widget }
     }
 
     pub fn key(&self) -> &SessionKey {
@@ -82,26 +78,31 @@ impl PodSession {
     }
 
     pub fn title(&self) -> String {
-        let key = self.key();
-        let label = match self {
-            Self::Logs { .. } => "Logs",
-            Self::Exec { .. } => "Exec",
-        };
-        format!("{} · {}/{}", label, key.namespace, key.name)
+        match self {
+            Self::Logs { widget, .. } => widget.title(),
+            Self::Exec { widget, .. } => widget.title(),
+        }
     }
 
-    pub fn element(&self) -> AnyElement {
+    pub fn set_active(&self, active: bool, cx: &mut App) {
         match self {
-            Self::Logs { view, .. } => view.clone().into_any_element(),
-            Self::Exec { view, .. } => view.clone().into_any_element(),
+            Self::Logs { widget, .. } => widget.set_active(active, cx),
+            Self::Exec { widget, .. } => widget.set_active(active, cx),
+        }
+    }
+
+    pub fn element(&self, cx: &App) -> AnyElement {
+        match self {
+            Self::Logs { widget, .. } => widget.element(cx),
+            Self::Exec { widget, .. } => widget.element(cx),
         }
     }
 
     /// Cancel the stream or shell before the session is dropped.
     pub fn shutdown(self, cx: &mut App) {
         match self {
-            Self::Logs { vm, .. } => vm.update(cx, |vm, _| vm.shutdown()),
-            Self::Exec { vm, .. } => vm.update(cx, |vm, _| vm.shutdown()),
+            Self::Logs { widget, .. } => widget.shutdown(cx),
+            Self::Exec { widget, .. } => widget.shutdown(cx),
         }
     }
 }
@@ -152,6 +153,12 @@ impl PodSessions {
         }
     }
 
+    pub fn set_active_state(&self, active: bool, cx: &mut App) {
+        for session in &self.sessions {
+            session.set_active(active, cx);
+        }
+    }
+
     /// Close a session and return it so its stream can be shut down.
     pub fn close(&mut self, key: &SessionKey) -> Option<PodSession> {
         let index = self
@@ -169,10 +176,10 @@ impl PodSessions {
         Some(session)
     }
 
-    pub fn active_element(&self) -> AnyElement {
+    pub fn active_element(&self, cx: &App) -> AnyElement {
         self.sessions
             .get(self.active)
-            .map(PodSession::element)
+            .map(|session| session.element(cx))
             .unwrap_or_else(|| div().into_any_element())
     }
 }

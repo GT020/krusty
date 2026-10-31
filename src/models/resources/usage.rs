@@ -51,8 +51,4 @@ impl UsageHistory {
     pub fn latest(&self) -> Option<&UsageSample> {
         self.samples.last()
     }
-
-    pub fn clear(&mut self) {
-        self.samples.clear();
-    }
 }

@@ -1,4 +1,6 @@
-//! Repository for Deployments: subscribe to the live list/watch stream.
+//! Repository for Deployments: live list/watch, actions, and summary reads.
+
+pub mod summary;
 
 use k8s_openapi::api::apps::v1::Deployment;
 use kube::Client;

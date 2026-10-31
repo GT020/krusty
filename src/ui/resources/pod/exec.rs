@@ -10,11 +10,13 @@ use gpui_kit::component::{
     menu::{DropdownMenu as _, PopupMenuItem},
 };
 use gpui_kit::{
-    AnyElement, Context, Entity, FocusHandle, Hsla, InteractiveElement as _, IntoElement,
-    KeyDownEvent, Keystroke, MouseButton, ParentElement as _, Render, ScrollDelta, SharedString,
-    Styled as _, Subscription, Window, div, px, rgb,
+    AnyElement, App, AppContext as _, Context, Entity, FocusHandle, Hsla, InteractiveElement as _,
+    IntoElement, KeyDownEvent, Keystroke, MouseButton, ParentElement as _, Render, ScrollDelta,
+    SharedString, Styled as _, Subscription, Window, div, px, rgb,
 };
 
+use crate::models::dashboard::{PodWidgetSource, WidgetSource};
+use crate::ui::dashboard::pinnable_sized;
 use crate::view_models::resources::pod::exec::{PodExecViewModel, SHELLS};
 
 const CELL_WIDTH: f32 = 7.2;
@@ -23,6 +25,8 @@ const TERMINAL_FONT_SIZE: f32 = 12.0;
 
 pub struct PodExecView {
     vm: Entity<PodExecViewModel>,
+    id_prefix: SharedString,
+    focus_on_mount: bool,
     focus: FocusHandle,
     focused_once: bool,
     last_size: Rc<Cell<(u16, u16)>>,
@@ -30,10 +34,17 @@ pub struct PodExecView {
 }
 
 impl PodExecView {
-    pub fn new(vm: Entity<PodExecViewModel>, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        vm: Entity<PodExecViewModel>,
+        id_prefix: SharedString,
+        focus_on_mount: bool,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let subscription = cx.observe(&vm, |_, _, cx| cx.notify());
         Self {
             vm,
+            id_prefix,
+            focus_on_mount,
             focus: cx.focus_handle(),
             focused_once: false,
             last_size: Rc::new(Cell::new((0, 0))),
@@ -62,6 +73,7 @@ impl PodExecView {
         true
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn toolbar(
         vm: Entity<PodExecViewModel>,
         containers: Vec<String>,
@@ -69,11 +81,13 @@ impl PodExecView {
         shell: String,
         status: String,
         error: Option<String>,
+        connected: bool,
+        id_prefix: &str,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let menu_vm = vm.clone();
         let menu_container = container.clone();
-        let container_button = Button::new("pod-exec-container")
+        let container_button = Button::new(format!("{id_prefix}-container"))
             .ghost()
             .small()
             .label(container)
@@ -93,9 +107,9 @@ impl PodExecView {
                 menu
             });
 
-        let shell_vm = vm;
+        let shell_vm = vm.clone();
         let menu_shell = shell.clone();
-        let shell_button = Button::new("pod-exec-shell")
+        let shell_button = Button::new(format!("{id_prefix}-shell"))
             .ghost()
             .small()
             .label(shell)
@@ -115,6 +129,17 @@ impl PodExecView {
                 menu
             });
 
+        let connect = (!connected).then(|| {
+            let connect_vm = vm.clone();
+            Button::new(format!("{id_prefix}-connect"))
+                .outline()
+                .small()
+                .label("Connect")
+                .on_click(move |_, _, cx| {
+                    connect_vm.update(cx, |vm, cx| vm.connect(cx));
+                })
+        });
+
         let mut status_row = h_flex().gap_2().items_center().child(
             div()
                 .text_xs()
@@ -131,37 +156,40 @@ impl PodExecView {
             );
         }
 
-        v_flex()
-            .gap_2()
+        let mut controls = h_flex()
+            .gap_4()
+            .items_center()
             .child(
                 h_flex()
-                    .gap_4()
+                    .gap_2()
                     .items_center()
                     .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Container"),
-                            )
-                            .child(container_button),
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Container"),
                     )
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Shell"),
-                            )
-                            .child(shell_button),
-                    ),
+                    .child(container_button),
             )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Shell"),
+                    )
+                    .child(shell_button),
+            );
+        if let Some(connect) = connect {
+            controls = controls.child(connect);
+        }
+
+        v_flex()
+            .gap_2()
+            .child(controls)
             .child(status_row)
             .into_any_element()
     }
@@ -171,7 +199,9 @@ impl Render for PodExecView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         if !self.focused_once {
             self.focused_once = true;
-            window.focus(&self.focus, cx);
+            if self.focus_on_mount {
+                window.focus(&self.focus, cx);
+            }
         }
         let vm = self.vm.read(cx);
         let containers = vm.containers().to_vec();
@@ -179,6 +209,14 @@ impl Render for PodExecView {
         let shell = vm.shell().to_string();
         let status = vm.status().to_string();
         let error = vm.error().map(str::to_string);
+        let connected = vm.is_connected();
+        let source = WidgetSource::Pod(PodWidgetSource::Exec {
+            namespace: vm.namespace().to_string(),
+            name: vm.name().to_string(),
+            containers: vm.containers().to_vec(),
+            container: Some(vm.container().to_string()),
+            shell: vm.shell().to_string(),
+        });
         let screen = vm.screen();
         let (rows, cols) = screen.size();
         let cursor = screen.cursor_position();
@@ -207,7 +245,7 @@ impl Render for PodExecView {
         let last_size = self.last_size.clone();
         let resize_vm = self.vm.clone();
 
-        v_flex()
+        let root = v_flex()
             .size_full()
             .min_w_0()
             .gap_3()
@@ -219,11 +257,13 @@ impl Render for PodExecView {
                 shell,
                 status,
                 error,
+                connected,
+                &self.id_prefix,
                 cx,
             ))
             .child(
                 div()
-                    .id("pod-exec-terminal")
+                    .id(SharedString::from(format!("{}-terminal", self.id_prefix)))
                     .flex_1()
                     .min_h_0()
                     .w_full()
@@ -271,6 +311,69 @@ impl Render for PodExecView {
                     })
                     .child(v_flex().gap_0().children(rows)),
             )
+            .into_any_element();
+        pinnable_sized(format!("pod-exec-menu-{}", self.id_prefix), root, source)
+    }
+}
+
+/// Arguments for mounting a pod exec widget in classic mode or on the dashboard.
+pub struct PodExecArgs {
+    pub namespace: String,
+    pub name: String,
+    pub containers: Vec<String>,
+    pub container: String,
+    pub shell: String,
+    pub id_prefix: SharedString,
+    pub auto_connect: bool,
+    pub focus_on_mount: bool,
+}
+
+/// Reusable terminal component. Owns its own exec session and focus handle.
+pub struct PodExecWidget {
+    vm: Entity<PodExecViewModel>,
+    view: Entity<PodExecView>,
+    namespace: String,
+    name: String,
+}
+
+impl PodExecWidget {
+    pub fn mount(args: PodExecArgs, window: &mut Window, cx: &mut App) -> Self {
+        let vm = cx.new(|cx| {
+            PodExecViewModel::new_with(
+                args.namespace.clone(),
+                args.name.clone(),
+                args.containers.clone(),
+                args.container.clone(),
+                args.shell.clone(),
+                args.auto_connect,
+                window,
+                cx,
+            )
+        });
+        let view =
+            cx.new(|cx| PodExecView::new(vm.clone(), args.id_prefix, args.focus_on_mount, cx));
+        Self {
+            vm,
+            view,
+            namespace: args.namespace,
+            name: args.name,
+        }
+    }
+
+    pub fn element(&self, _cx: &App) -> AnyElement {
+        self.view.clone().into_any_element()
+    }
+
+    pub fn set_active(&self, active: bool, cx: &mut App) {
+        self.vm.update(cx, |vm, cx| vm.set_active(active, cx));
+    }
+
+    pub fn shutdown(&self, cx: &mut App) {
+        self.vm.update(cx, |vm, _| vm.shutdown());
+    }
+
+    pub fn title(&self) -> String {
+        format!("Exec · {}/{}", self.namespace, self.name)
     }
 }
 

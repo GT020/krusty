@@ -2,8 +2,6 @@
 
 use std::collections::BTreeMap;
 
-pub use crate::models::resources::usage::{UsageHistory, UsageSample as PodUsage};
-
 #[derive(Clone, Debug, Default)]
 pub struct PodDetail {
     pub name: String,
@@ -157,10 +155,5 @@ pub enum PodDetailUpdate {
         namespace: String,
         name: String,
         result: Result<Box<PodDetail>, String>,
-    },
-    Usage {
-        namespace: String,
-        name: String,
-        result: Result<PodUsage, String>,
     },
 }

@@ -6,6 +6,7 @@ pub mod status_bar;
 
 use crate::cluster::ClusterState;
 use crate::models::{NamespaceScope, ResourceKind};
+use crate::ui::dashboard::{DashboardView, set_handle as set_dashboard_handle};
 use crate::ui::resources::list::ResourceListView;
 use crate::ui::resources::namespace_filter::NamespaceFilterEvent;
 use crate::ui::resources::node::NodesView;
@@ -81,6 +82,7 @@ pub struct Workspace {
     shell: Entity<ShellViewModel>,
     panes: BTreeMap<TabId, WorkspacePane>,
     pane_subs: BTreeMap<TabId, Subscription>,
+    dashboard: Entity<DashboardView>,
     custom_resources: Entity<CustomResourcesView>,
     _shell_subscription: Subscription,
     _cluster_subscription: Subscription,
@@ -95,6 +97,8 @@ impl Workspace {
         let started = std::time::Instant::now();
         tracing::info!("ui: workspace construction start");
         let shell = cx.new(ShellViewModel::new);
+        let dashboard = cx.new(|cx| DashboardView::new(window, cx));
+        set_dashboard_handle(cx, dashboard.clone());
         let shell_subscription = cx.observe(&shell, |_, _, cx| cx.notify());
         let cluster_subscription = cx.observe_global::<ClusterState>(|_, cx| cx.notify());
         let appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
@@ -140,6 +144,7 @@ impl Workspace {
             shell,
             panes: BTreeMap::new(),
             pane_subs: BTreeMap::new(),
+            dashboard,
             custom_resources,
             _shell_subscription: shell_subscription,
             _cluster_subscription: cluster_subscription,
@@ -168,7 +173,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let new_tab = new_tab && target != NavTarget::Settings;
+        let new_tab = new_tab && matches!(target, NavTarget::Resource(_));
         let previous = self.shell.read(cx).active();
         let id = self.shell.update(cx, |shell, cx| {
             if new_tab {
@@ -203,9 +208,18 @@ impl Workspace {
     }
 
     fn close_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let was_dashboard = self
+            .shell
+            .read(cx)
+            .tab(id)
+            .is_some_and(|tab| tab.target() == NavTarget::Dashboard);
         let was_active = self.shell.update(cx, |shell, cx| shell.close(id, cx));
         if self.shell.read(cx).tab(id).is_some() {
             return;
+        }
+        if was_dashboard && was_active {
+            self.dashboard
+                .update(cx, |view, cx| view.set_active(false, cx));
         }
         tracing::info!(id = id.get(), active = was_active, "ui: close tab");
         self.panes.remove(&id);
@@ -252,7 +266,7 @@ impl Workspace {
             NavTarget::Resource(kind) => WorkspacePane::List(
                 cx.new(|cx| ResourceListView::new(kind, NamespaceScope::All, window, cx)),
             ),
-            NavTarget::Settings => return,
+            NavTarget::Dashboard | NavTarget::Settings => return,
         };
         // Re-render the tab labels when this tab's namespace changes.
         if let Some(filter) = pane.namespace_filter(cx) {
@@ -263,6 +277,16 @@ impl Workspace {
     }
 
     fn activate(&mut self, id: TabId, cx: &mut Context<Self>) {
+        if self
+            .shell
+            .read(cx)
+            .tab(id)
+            .is_some_and(|tab| tab.target() == NavTarget::Dashboard)
+        {
+            self.dashboard
+                .update(cx, |view, cx| view.set_active(true, cx));
+            return;
+        }
         if let Some(pane) = self.panes.get(&id) {
             pane.set_active(true, cx);
         }
@@ -271,6 +295,16 @@ impl Workspace {
     /// Stop notifying an inactive view. Its state is kept so switching back to
     /// the tab restores the list, scroll position, and open detail.
     fn deactivate(&mut self, id: TabId, cx: &mut Context<Self>) {
+        if self
+            .shell
+            .read(cx)
+            .tab(id)
+            .is_some_and(|tab| tab.target() == NavTarget::Dashboard)
+        {
+            self.dashboard
+                .update(cx, |view, cx| view.set_active(false, cx));
+            return;
+        }
         if let Some(pane) = self.panes.get(&id) {
             pane.set_active(false, cx);
         }
@@ -447,6 +481,7 @@ impl Workspace {
             NavTarget::Settings => {
                 render_settings(cx, self.custom_resources.clone()).into_any_element()
             }
+            NavTarget::Dashboard => self.dashboard.clone().into_any_element(),
             NavTarget::Resource(_) => self
                 .panes
                 .get(&id)

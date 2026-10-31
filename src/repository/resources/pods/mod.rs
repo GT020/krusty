@@ -1,29 +1,26 @@
 //! Repository for Pods: live list/watch plus one-shot detail and metrics reads.
 
+pub mod usage;
+
 use std::collections::{BTreeMap, HashMap};
-use std::time::Duration;
 
 use futures::{AsyncBufReadExt, SinkExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
     Container, ContainerState, ContainerStatus, EnvVar, Pod, PodStatus, Toleration, Volume,
 };
-use kube::api::{Api, AttachParams, DynamicObject, LogParams, TerminalSize};
-use kube::core::{ApiResource, GroupVersionKind};
+use kube::api::{Api, AttachParams, LogParams, TerminalSize};
 use kube::{Client, ResourceExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
 use crate::cluster::ClusterState;
 use crate::models::resources::pod::detail::{
-    PodCondition, PodContainer, PodDetail, PodDetailUpdate, PodOwner, PodToleration, PodUsage,
-    PodVolume,
+    PodCondition, PodContainer, PodDetail, PodDetailUpdate, PodOwner, PodToleration, PodVolume,
 };
 use crate::models::{NamespaceScope, ResourceKind};
 use gpui_kit::App;
 
 use crate::repository::{Subscription, subscribe_kind};
-
-const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Subscribe to the live Pods stream.
 /// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
@@ -395,7 +392,7 @@ async fn watch_pod_detail(
     updates: mpsc::UnboundedSender<PodDetailUpdate>,
     mut cancel: watch::Receiver<bool>,
 ) {
-    let api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
+    let api: Api<Pod> = Api::namespaced(client, &namespace);
     let fetched = tokio::select! {
         _ = cancel.changed() => return,
         result = api.get(&name) => result,
@@ -412,122 +409,11 @@ async fn watch_pod_detail(
         }
     };
     let detail = detail_from_pod(&fetched);
-    let (cpu_capacity, memory_capacity) = capacity_from_pod(&fetched);
-    if updates
-        .send(PodDetailUpdate::Detail {
-            namespace: namespace.clone(),
-            name: name.clone(),
-            result: Ok(Box::new(detail)),
-        })
-        .is_err()
-    {
-        return;
-    }
-
-    loop {
-        let fetched = tokio::select! {
-            _ = cancel.changed() => return,
-            result = fetch_usage(&client, &namespace, &name, cpu_capacity, memory_capacity) => result,
-        };
-        if updates
-            .send(PodDetailUpdate::Usage {
-                namespace: namespace.clone(),
-                name: name.clone(),
-                result: fetched,
-            })
-            .is_err()
-        {
-            return;
-        }
-        tokio::select! {
-            _ = cancel.changed() => return,
-            _ = tokio::time::sleep(METRICS_POLL_INTERVAL) => {}
-        }
-    }
-}
-
-async fn fetch_usage(
-    client: &Client,
-    namespace: &str,
-    name: &str,
-    cpu_capacity_millicores: Option<u64>,
-    memory_capacity_bytes: Option<u64>,
-) -> Result<PodUsage, String> {
-    let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "PodMetrics");
-    let resource = ApiResource::from_gvk(&gvk);
-    let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &resource);
-    let metrics = api.get(name).await.map_err(|error| {
-        format!("Pod metrics are unavailable. Install metrics-server to see live usage. ({error})")
-    })?;
-    let containers = metrics
-        .data
-        .get("containers")
-        .and_then(|value| value.as_array())
-        .ok_or_else(|| "Pod metrics did not include container usage.".to_string())?;
-
-    let mut cpu = 0.0;
-    let mut memory = 0.0;
-    for container in containers {
-        let usage = container.get("usage");
-        cpu += usage
-            .and_then(|usage| usage.get("cpu"))
-            .and_then(|value| value.as_str())
-            .and_then(parse_quantity)
-            .unwrap_or(0.0);
-        memory += usage
-            .and_then(|usage| usage.get("memory"))
-            .and_then(|value| value.as_str())
-            .and_then(parse_quantity)
-            .unwrap_or(0.0);
-    }
-
-    Ok(PodUsage {
-        observed_at: jiff::Timestamp::now().as_second(),
-        cpu_used_millicores: Some((cpu * 1000.0).round().max(0.0) as u64),
-        cpu_capacity_millicores,
-        memory_used_bytes: Some(memory.max(0.0).round() as u64),
-        memory_capacity_bytes,
-    })
-}
-
-fn capacity_from_pod(pod: &Pod) -> (Option<u64>, Option<u64>) {
-    let Some(spec) = pod.spec.as_ref() else {
-        return (None, None);
-    };
-    let mut cpu = containers_quantity(&spec.containers, "cpu", true);
-    let mut memory = containers_quantity(&spec.containers, "memory", false);
-    if cpu.is_none() || memory.is_none() {
-        let requests_cpu = containers_quantity(&spec.containers, "cpu", false);
-        let requests_memory = containers_quantity(&spec.containers, "memory", false);
-        cpu = cpu.or(requests_cpu);
-        memory = memory.or(requests_memory);
-    }
-    (
-        cpu.map(|value| (value * 1000.0).round() as u64),
-        memory.map(|value| value.round() as u64),
-    )
-}
-
-fn containers_quantity(containers: &[Container], resource: &str, limits: bool) -> Option<f64> {
-    let mut total = 0.0;
-    let mut found = false;
-    for container in containers {
-        let Some(resources) = container.resources.as_ref() else {
-            continue;
-        };
-        let map = if limits {
-            resources.limits.as_ref()
-        } else {
-            resources.requests.as_ref()
-        };
-        if let Some(quantity) = map.and_then(|map| map.get(resource))
-            && let Some(value) = parse_quantity(&quantity.0)
-        {
-            total += value;
-            found = true;
-        }
-    }
-    found.then_some(total)
+    let _ = updates.send(PodDetailUpdate::Detail {
+        namespace,
+        name,
+        result: Ok(Box::new(detail)),
+    });
 }
 
 fn detail_from_pod(pod: &Pod) -> PodDetail {
@@ -897,7 +783,7 @@ fn quantities(
 }
 
 /// Parse a Kubernetes resource quantity into a plain number.
-fn parse_quantity(value: &str) -> Option<f64> {
+pub(super) fn parse_quantity(value: &str) -> Option<f64> {
     let value = value.trim();
     if value.is_empty() {
         return None;

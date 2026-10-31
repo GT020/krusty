@@ -1,19 +1,18 @@
 //! Model for Pods: holds the latest immutable snapshot and the open pod detail.
 
 pub mod detail;
+pub mod exec;
+pub mod logs;
+pub mod usage;
 
 use std::sync::Arc;
 
-use self::detail::{PodDetailState, PodDetailUpdate, UsageHistory};
+use self::detail::{PodDetailState, PodDetailUpdate};
 use crate::models::{ResourceKind, ResourceSnapshot, SnapshotPhase};
-
-const MAX_USAGE_SAMPLES: usize = 60;
 
 pub struct PodsModel {
     snapshot: Arc<ResourceSnapshot>,
     detail: PodDetailState,
-    usage: UsageHistory,
-    usage_error: Option<String>,
 }
 
 impl PodsModel {
@@ -21,8 +20,6 @@ impl PodsModel {
         Self {
             snapshot: Arc::new(ResourceSnapshot::loading()),
             detail: PodDetailState::Closed,
-            usage: UsageHistory::new(MAX_USAGE_SAMPLES),
-            usage_error: None,
         }
     }
 
@@ -51,27 +48,15 @@ impl PodsModel {
         &self.detail
     }
 
-    pub fn usage(&self) -> &UsageHistory {
-        &self.usage
-    }
-
-    pub fn usage_error(&self) -> Option<&str> {
-        self.usage_error.as_deref()
-    }
-
     pub fn begin_detail(&mut self, namespace: impl Into<String>, name: impl Into<String>) {
         self.detail = PodDetailState::Loading {
             namespace: namespace.into(),
             name: name.into(),
         };
-        self.usage.clear();
-        self.usage_error = None;
     }
 
     pub fn close_detail(&mut self) {
         self.detail = PodDetailState::Closed;
-        self.usage.clear();
-        self.usage_error = None;
     }
 
     /// Apply a repository update. Stale updates for a previously selected pod
@@ -94,26 +79,7 @@ impl PodsModel {
                             name,
                             message,
                         };
-                        self.usage.clear();
-                        self.usage_error = None;
                     }
-                }
-                true
-            }
-            PodDetailUpdate::Usage {
-                namespace,
-                name,
-                result,
-            } => {
-                if self.detail.identity() != Some((namespace.as_str(), name.as_str())) {
-                    return false;
-                }
-                match result {
-                    Ok(sample) => {
-                        self.usage.push(sample);
-                        self.usage_error = None;
-                    }
-                    Err(message) => self.usage_error = Some(message),
                 }
                 true
             }
@@ -129,31 +95,8 @@ impl Default for PodsModel {
 
 #[cfg(test)]
 mod tests {
-    use self::detail::{PodDetail, PodDetailUpdate, PodUsage};
+    use self::detail::{PodDetail, PodDetailUpdate};
     use super::*;
-
-    fn usage(at: i64) -> PodUsage {
-        PodUsage {
-            observed_at: at,
-            cpu_used_millicores: Some(25),
-            cpu_capacity_millicores: Some(100),
-            memory_used_bytes: Some(64 * 1024 * 1024),
-            memory_capacity_bytes: Some(256 * 1024 * 1024),
-        }
-    }
-
-    #[test]
-    fn ignores_updates_for_a_previously_selected_pod() {
-        let mut model = PodsModel::new();
-        model.begin_detail("default", "api-a");
-        let stale = PodDetailUpdate::Usage {
-            namespace: "default".into(),
-            name: "api-b".into(),
-            result: Ok(usage(1)),
-        };
-        assert!(!model.apply_update(stale));
-        assert!(model.usage().samples().is_empty());
-    }
 
     #[test]
     fn applies_detail_only_for_the_selected_namespace_and_name() {

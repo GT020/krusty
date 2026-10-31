@@ -58,11 +58,9 @@ pub fn render_sidebar(
             )
         })
         .chain(std::iter::once(
-            SidebarGroup::new("Application").child(nav_item(
-                NavTarget::Settings,
-                selected,
-                &entity,
-            )),
+            SidebarGroup::new("Application")
+                .child(nav_item(NavTarget::Dashboard, selected, &entity))
+                .child(nav_item(NavTarget::Settings, selected, &entity)),
         ))
         .collect::<Vec<_>>();
 

@@ -22,6 +22,7 @@ pub mod persistent_volumes;
 pub mod pod;
 pub mod replica_sets;
 pub mod secrets;
+pub mod section;
 pub mod service_accounts;
 pub mod services;
 pub mod stateful_sets;

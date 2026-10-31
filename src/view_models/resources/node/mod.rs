@@ -13,9 +13,12 @@ use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
 use crate::models::resources::node::NodesModel;
-use crate::models::resources::node::detail::{NodeDetailState, UsageHistory};
+use crate::models::resources::node::detail::NodeDetailState;
 use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase};
 use crate::repository;
+
+pub mod section;
+pub mod usage;
 
 pub struct NodesViewModel {
     active: Arc<AtomicBool>,
@@ -106,14 +109,6 @@ impl NodesViewModel {
 
     pub fn detail(&self, cx: &App) -> NodeDetailState {
         self.model.read(cx).detail().clone()
-    }
-
-    pub fn usage(&self, cx: &App) -> UsageHistory {
-        self.model.read(cx).usage().clone()
-    }
-
-    pub fn usage_error(&self, cx: &App) -> Option<String> {
-        self.model.read(cx).usage_error().map(str::to_string)
     }
 
     pub fn item_at(&self, row: usize, cx: &App) -> Option<crate::models::Item> {

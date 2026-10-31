@@ -1,5 +1,7 @@
 //! Model for DeploymentsModel: holds the latest immutable snapshot.
 
+pub mod actions;
+
 use crate::models::{ResourceKind, ResourceSnapshot, SnapshotPhase};
 use std::sync::Arc;
 

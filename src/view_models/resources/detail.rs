@@ -48,7 +48,19 @@ impl ResourceDetailViewModel {
         name: String,
         cx: &mut Context<Self>,
     ) {
-        if self.state.identity() == Some((kind, namespace.as_str(), name.as_str()))
+        self.open_inner(kind, namespace, name, false, cx);
+    }
+
+    fn open_inner(
+        &mut self,
+        kind: ResourceKind,
+        namespace: String,
+        name: String,
+        force: bool,
+        cx: &mut Context<Self>,
+    ) {
+        if !force
+            && self.state.identity() == Some((kind, namespace.as_str(), name.as_str()))
             && !matches!(self.state, ResourceDetailState::Error { .. })
         {
             return;
@@ -96,6 +108,19 @@ impl ResourceDetailViewModel {
             self.state = ResourceDetailState::Closed;
             cx.notify();
         }
+    }
+
+    /// Refetch the open resource without passing through `Closed`, so hosts do
+    /// not tear down and remount their detail widgets.
+    pub fn reload(&mut self, cx: &mut Context<Self>) {
+        let Some((kind, namespace, name)) = self
+            .state
+            .identity()
+            .map(|(kind, namespace, name)| (kind, namespace.to_string(), name.to_string()))
+        else {
+            return;
+        };
+        self.open_inner(kind, namespace, name, true, cx);
     }
 
     fn apply_update(&mut self, update: ResourceDetailUpdate) -> bool {

@@ -2,6 +2,8 @@
 
 pub mod exec;
 pub mod logs;
+pub mod section;
+pub mod usage;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,19 +11,26 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use gpui_kit::component::table::{Column, TableDelegate, TableEvent, TableState};
 use gpui_kit::px;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Styled as _, Window,
-    div,
+    App, AppContext as _, Context, Entity, EventEmitter, IntoElement, ParentElement as _,
+    Styled as _, Window, div,
 };
 use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
 use crate::models::resources::pod::PodsModel;
-use crate::models::resources::pod::detail::{PodDetailState, PodDetailUpdate, UsageHistory};
+use crate::models::resources::pod::detail::{PodDetailState, PodDetailUpdate};
 use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase};
 use crate::repository;
 
+/// Emitted by a list-only pod view model when the user activates a row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PodListEvent {
+    Activate { namespace: String, name: String },
+}
+
 pub struct PodsViewModel {
     active: Arc<AtomicBool>,
+    detail_enabled: bool,
     scope: NamespaceScope,
     epoch: u64,
     model: Entity<PodsModel>,
@@ -35,8 +44,29 @@ pub struct PodsViewModel {
     table_sub: gpui_kit::Subscription,
 }
 
+impl EventEmitter<PodListEvent> for PodsViewModel {}
+
 impl PodsViewModel {
-    pub fn new(scope: NamespaceScope, _window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(scope: NamespaceScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        Self::new_with(scope, true, window, cx)
+    }
+
+    /// A list-only view model: selecting a row emits [`PodListEvent`] instead of
+    /// starting a detail subscription.
+    pub fn new_list_only(
+        scope: NamespaceScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::new_with(scope, false, window, cx)
+    }
+
+    fn new_with(
+        scope: NamespaceScope,
+        detail_enabled: bool,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let state = cx.global::<ClusterState>();
         let epoch = state.context_epoch();
         let active = Arc::new(AtomicBool::new(true));
@@ -62,6 +92,7 @@ impl PodsViewModel {
         });
         let mut this = Self {
             active,
+            detail_enabled,
             scope,
             epoch,
             model,
@@ -109,14 +140,6 @@ impl PodsViewModel {
 
     pub fn detail(&self, cx: &App) -> PodDetailState {
         self.model.read(cx).detail().clone()
-    }
-
-    pub fn usage(&self, cx: &App) -> UsageHistory {
-        self.model.read(cx).usage().clone()
-    }
-
-    pub fn usage_error(&self, cx: &App) -> Option<String> {
-        self.model.read(cx).usage_error().map(str::to_string)
     }
 
     pub fn item_at(&self, row: usize, cx: &App) -> Option<crate::models::Item> {
@@ -190,6 +213,10 @@ impl PodsViewModel {
         let Some((namespace, name)) = identity else {
             return;
         };
+        if !self.detail_enabled {
+            cx.emit(PodListEvent::Activate { namespace, name });
+            return;
+        }
         if self.current_detail_identity(cx) == Some((namespace.clone(), name.clone())) {
             return;
         }
