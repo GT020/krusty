@@ -2,7 +2,7 @@
 
 A native Kubernetes desktop client written in Rust with [GPUI Kit](https://gpui-kit.com).
 
-![krusty showing tabbed Pods views, per-tab namespace filtering, and live pod logs](assets/screenshot-pods.png)
+![krusty showing two side-by-side editor groups: Cluster Overview with Deployments and Pods tabs on the left, and a live Pods list on the right](assets/screenshot-split.png)
 
 ## What it does
 
