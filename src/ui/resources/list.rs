@@ -109,6 +109,7 @@ impl ResourceListView {
     fn list(&self, cx: &Context<Self>) -> AnyElement {
         let phase = self.vm.phase(cx);
         let count = self.vm.item_count(cx);
+        let mode = self.vm.mode(cx);
 
         let status = match &phase {
             SnapshotPhase::Loading => div()
@@ -137,7 +138,9 @@ impl ResourceListView {
         if self.kind.is_namespaced() {
             header_left = header_left.child(render_namespace_filter(&self.namespace_filter, cx));
         }
-        let header_left = header_left.child(status);
+        let header_left = header_left
+            .child(status)
+            .child(super::watch_mode::render(mode, self.kind, cx));
 
         let table_el = self.vm.render_table(cx);
         let handle = cx.entity().clone();

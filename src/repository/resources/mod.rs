@@ -30,5 +30,3 @@ pub mod services;
 pub mod stateful_sets;
 pub mod storage_classes;
 pub mod watcher;
-
-pub use watcher::namespace_names;

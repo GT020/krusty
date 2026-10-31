@@ -8,6 +8,6 @@ pub use cluster::NamespaceScope;
 pub use resources::{
     ConfigMapsModel, DaemonSetsModel, DeploymentsModel, IngressesModel, Item, JobsModel,
     NodesModel, ObjectKey, PersistentVolumeClaimsModel, PersistentVolumesModel, PodsModel,
-    ResourceDetail, ResourceDetailState, ResourceDetailUpdate, ResourceKind, ResourceSnapshot,
-    ResourceStore, SecretsModel, ServicesModel, SnapshotPhase,
+    PollRate, ResourceDetail, ResourceDetailState, ResourceDetailUpdate, ResourceKind,
+    ResourceSnapshot, ResourceStore, SecretsModel, ServicesModel, SnapshotPhase, WatchMode,
 };
