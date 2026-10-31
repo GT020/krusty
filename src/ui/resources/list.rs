@@ -53,9 +53,9 @@ impl ResourceListView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let vm = ResourceViewModel::new(kind, scope, window, cx);
+        let vm = ResourceViewModel::new(kind, scope.clone(), window, cx);
         let vm_sub = vm.observe(cx, |_, cx| cx.notify());
-        let namespace_filter = cx.new(|cx| NamespaceFilter::new(window, cx));
+        let namespace_filter = cx.new(|cx| NamespaceFilter::with_scope(scope, window, cx));
         let namespace_sub = cx.subscribe(
             &namespace_filter,
             |this, _, event: &NamespaceFilterEvent, cx| {

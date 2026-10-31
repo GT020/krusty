@@ -1,6 +1,7 @@
 //! Tabbed workspace shell: every tab owns its view model and namespace filter.
 
 pub mod nav;
+pub mod session;
 pub mod sidebar;
 pub mod status_bar;
 
@@ -81,6 +82,7 @@ pub struct Workspace {
     shell: Entity<ShellViewModel>,
     panes: BTreeMap<TabId, WorkspacePane>,
     pane_subs: BTreeMap<TabId, Subscription>,
+    tab_scopes: BTreeMap<TabId, NamespaceScope>,
     custom_resources: Entity<CustomResourcesView>,
     _shell_subscription: Subscription,
     _cluster_subscription: Subscription,
@@ -94,7 +96,33 @@ impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let started = std::time::Instant::now();
         tracing::info!("ui: workspace construction start");
-        let shell = cx.new(ShellViewModel::new);
+        let restored = session::load();
+        let (shell, scopes) = if restored.tabs.is_empty() {
+            (cx.new(ShellViewModel::new), vec![NamespaceScope::All])
+        } else {
+            let targets = restored
+                .tabs
+                .iter()
+                .map(|tab| tab.target)
+                .collect::<Vec<_>>();
+            let scopes = restored
+                .tabs
+                .iter()
+                .map(|tab| tab.scope.clone())
+                .collect::<Vec<_>>();
+            let active = restored.active.unwrap_or(0).min(targets.len() - 1);
+            (
+                cx.new(|cx| ShellViewModel::with_tabs(targets, active, cx)),
+                scopes,
+            )
+        };
+        let tab_scopes = shell
+            .read(cx)
+            .tabs()
+            .iter()
+            .map(|tab| tab.id())
+            .zip(scopes)
+            .collect::<BTreeMap<_, _>>();
         let shell_subscription = cx.observe(&shell, |_, _, cx| cx.notify());
         let cluster_subscription = cx.observe_global::<ClusterState>(|_, cx| cx.notify());
         let appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
@@ -140,6 +168,7 @@ impl Workspace {
             shell,
             panes: BTreeMap::new(),
             pane_subs: BTreeMap::new(),
+            tab_scopes,
             custom_resources,
             _shell_subscription: shell_subscription,
             _cluster_subscription: cluster_subscription,
@@ -186,6 +215,7 @@ impl Workspace {
         }
         self.ensure_pane(id, window, cx);
         self.activate(id, cx);
+        self.save_session(cx);
         cx.notify();
     }
 
@@ -199,6 +229,7 @@ impl Workspace {
         }
         self.ensure_pane(id, window, cx);
         self.activate(id, cx);
+        self.save_session(cx);
         cx.notify();
     }
 
@@ -210,9 +241,11 @@ impl Workspace {
         tracing::info!(id = id.get(), active = was_active, "ui: close tab");
         self.panes.remove(&id);
         self.pane_subs.remove(&id);
+        self.tab_scopes.remove(&id);
         if was_active && let Some(active) = self.shell.read(cx).active() {
             self.activate(active, cx);
         }
+        self.save_session(cx);
         cx.notify();
     }
 
@@ -242,24 +275,56 @@ impl Workspace {
         let Some(tab) = self.shell.read(cx).tab(id) else {
             return;
         };
+        let scope = self
+            .tab_scopes
+            .entry(id)
+            .or_insert(NamespaceScope::All)
+            .clone();
         let pane = match tab.target() {
             NavTarget::Resource(ResourceKind::Pods) => {
-                WorkspacePane::Pods(cx.new(|cx| PodsView::new(NamespaceScope::All, window, cx)))
+                WorkspacePane::Pods(cx.new(|cx| PodsView::new(scope, window, cx)))
             }
             NavTarget::Resource(ResourceKind::Nodes) => {
                 WorkspacePane::Nodes(cx.new(|cx| NodesView::new(NamespaceScope::All, window, cx)))
             }
-            NavTarget::Resource(kind) => WorkspacePane::List(
-                cx.new(|cx| ResourceListView::new(kind, NamespaceScope::All, window, cx)),
-            ),
+            NavTarget::Resource(kind) => {
+                WorkspacePane::List(cx.new(|cx| ResourceListView::new(kind, scope, window, cx)))
+            }
             NavTarget::Settings => return,
         };
-        // Re-render the tab labels when this tab's namespace changes.
+        // Re-render the tab labels when this tab's namespace changes, and keep
+        // the saved session in sync with the namespace the user picked.
         if let Some(filter) = pane.namespace_filter(cx) {
-            let sub = cx.subscribe(&filter, |_, _, _: &NamespaceFilterEvent, cx| cx.notify());
+            let sub = cx.subscribe(&filter, move |this, _, event: &NamespaceFilterEvent, cx| {
+                let NamespaceFilterEvent::Changed(scope) = event;
+                this.tab_scopes.insert(id, scope.clone());
+                this.save_session(cx);
+                cx.notify();
+            });
             self.pane_subs.insert(id, sub);
         }
         self.panes.insert(id, pane);
+    }
+
+    /// Persist the open tabs, the active tab, and each tab's namespace scope.
+    fn save_session(&self, cx: &App) {
+        let shell = self.shell.read(cx);
+        let active = shell
+            .active()
+            .and_then(|id| shell.tabs().iter().position(|tab| tab.id() == id));
+        let tabs = shell
+            .tabs()
+            .iter()
+            .map(|tab| session::SessionTab {
+                target: tab.target(),
+                scope: self
+                    .tab_scopes
+                    .get(&tab.id())
+                    .cloned()
+                    .unwrap_or(NamespaceScope::All),
+            })
+            .collect::<Vec<_>>();
+        session::save(&session::WorkspaceSession { tabs, active });
     }
 
     fn activate(&mut self, id: TabId, cx: &mut Context<Self>) {
@@ -430,6 +495,12 @@ impl Workspace {
                 .panes
                 .get(&tab.id())
                 .and_then(|pane| pane.scope_label(cx))
+                .or_else(|| {
+                    self.tab_scopes
+                        .get(&tab.id())
+                        .filter(|scope| **scope != NamespaceScope::All)
+                        .map(NamespaceScope::label)
+                })
         {
             return format!("{} · {}", target.label(), scope);
         }

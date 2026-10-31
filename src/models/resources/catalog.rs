@@ -35,6 +35,38 @@ pub enum ResourceKind {
     Custom(u16),
 }
 
+/// Every built-in kind, in the order used by persisted UI state.
+const BUILTIN_KINDS: [ResourceKind; 28] = [
+    ResourceKind::Pods,
+    ResourceKind::Deployments,
+    ResourceKind::StatefulSets,
+    ResourceKind::ReplicaSets,
+    ResourceKind::ReplicationControllers,
+    ResourceKind::DaemonSets,
+    ResourceKind::Jobs,
+    ResourceKind::CronJobs,
+    ResourceKind::HorizontalPodAutoscalers,
+    ResourceKind::PodDisruptionBudgets,
+    ResourceKind::Services,
+    ResourceKind::Ingresses,
+    ResourceKind::Endpoints,
+    ResourceKind::EndpointSlices,
+    ResourceKind::NetworkPolicies,
+    ResourceKind::PersistentVolumes,
+    ResourceKind::PersistentVolumeClaims,
+    ResourceKind::StorageClasses,
+    ResourceKind::ConfigMaps,
+    ResourceKind::Secrets,
+    ResourceKind::ServiceAccounts,
+    ResourceKind::Namespaces,
+    ResourceKind::Nodes,
+    ResourceKind::Leases,
+    ResourceKind::Events,
+    ResourceKind::ClusterRoles,
+    ResourceKind::Roles,
+    ResourceKind::RoleBindings,
+];
+
 impl ResourceKind {
     pub fn label(self) -> &'static str {
         match self {
@@ -193,6 +225,24 @@ impl ResourceKind {
             _ => true,
         }
     }
+
+    /// Stable identifier used to persist UI state. Custom kinds return `None`
+    /// because their index is process-local; they are persisted by definition
+    /// and resolved back to an index on the next launch.
+    pub fn stable_id(self) -> Option<&'static str> {
+        match self {
+            ResourceKind::Custom(_) => None,
+            _ => Some(self.label()),
+        }
+    }
+
+    /// Resolve an identifier written by [`Self::stable_id`].
+    pub fn from_stable_id(id: &str) -> Option<Self> {
+        BUILTIN_KINDS
+            .iter()
+            .copied()
+            .find(|kind| kind.label() == id)
+    }
 }
 
 /// A user-added custom resource kind discovered from a CRD or entered manually.
@@ -283,4 +333,24 @@ pub fn add_custom_resource(def: CustomResourceDef) -> ResourceKind {
     let def: &'static CustomResourceDef = Box::leak(Box::new(def));
     defs.push(Some(def));
     ResourceKind::Custom((defs.len() - 1) as u16)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn builtin_stable_ids_round_trip() {
+        for kind in BUILTIN_KINDS {
+            let id = kind.stable_id().expect("built-in kind has a stable id");
+            assert_eq!(ResourceKind::from_stable_id(id), Some(kind));
+        }
+    }
+
+    #[test]
+    fn custom_kinds_have_no_stable_id() {
+        assert_eq!(ResourceKind::Custom(0).stable_id(), None);
+        assert_eq!(ResourceKind::from_stable_id("Custom"), None);
+        assert_eq!(ResourceKind::from_stable_id("NotAKind"), None);
+    }
 }
