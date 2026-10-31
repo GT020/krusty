@@ -125,16 +125,32 @@ struct TabSet {
 
 impl TabSet {
     fn new(initial: NavTarget) -> Self {
-        let id = TabId(0);
-        Self {
-            tabs: vec![TabInfo {
-                id,
-                target: initial,
+        Self::with_targets(vec![initial], 0)
+    }
+
+    /// Build a tab list from previously saved targets. `active` is an index
+    /// into `targets`; out-of-range values clamp to the last tab.
+    fn with_targets(targets: Vec<NavTarget>, active: usize) -> Self {
+        let tabs = targets
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| TabInfo {
+                id: TabId(index as u64),
+                target,
                 color: None,
                 locked: false,
-            }],
-            active: Some(id),
-            next_id: 1,
+            })
+            .collect::<Vec<_>>();
+        let active = if tabs.is_empty() {
+            None
+        } else {
+            Some(tabs[active.min(tabs.len() - 1)].id)
+        };
+        let next_id = tabs.len() as u64;
+        Self {
+            tabs,
+            active,
+            next_id,
         }
     }
 
@@ -249,6 +265,13 @@ impl ShellViewModel {
     pub fn new(_cx: &mut Context<Self>) -> Self {
         Self {
             tabs: TabSet::new(NavTarget::Resource(ResourceKind::Pods)),
+        }
+    }
+
+    /// Restore the shell from a saved list of tab targets.
+    pub fn with_tabs(targets: Vec<NavTarget>, active: usize, _cx: &mut Context<Self>) -> Self {
+        Self {
+            tabs: TabSet::with_targets(targets, active),
         }
     }
 
@@ -482,5 +505,27 @@ mod tests {
 
         assert!(!tabs.set_locked(TabId(99), true));
         assert!(!tabs.tabs()[0].locked());
+    }
+
+    #[test]
+    fn restoring_tabs_keeps_their_order_and_active_tab() {
+        let tabs = TabSet::with_targets(vec![pods(), deployments(), services()], 1);
+
+        assert_eq!(tabs.tabs().len(), 3);
+        assert_eq!(tabs.tabs()[0].target(), pods());
+        assert_eq!(tabs.tabs()[1].target(), deployments());
+        assert_eq!(tabs.tabs()[2].target(), services());
+        assert_eq!(tabs.active(), Some(TabId(1)));
+
+        // New tabs keep ids after the restored range.
+        let mut tabs = tabs;
+        assert_eq!(tabs.open_new(pods()), TabId(3));
+    }
+
+    #[test]
+    fn an_out_of_range_restored_active_tab_clamps_to_the_last() {
+        let tabs = TabSet::with_targets(vec![pods(), deployments()], 9);
+
+        assert_eq!(tabs.active(), Some(TabId(1)));
     }
 }

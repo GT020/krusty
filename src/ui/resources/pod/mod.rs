@@ -59,9 +59,9 @@ pub struct PodsView {
 
 impl PodsView {
     pub fn new(scope: NamespaceScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let vm = cx.new(|cx| PodsViewModel::new(scope, window, cx));
+        let vm = cx.new(|cx| PodsViewModel::new(scope.clone(), window, cx));
         let vm_sub = cx.observe(&vm, |_, _, cx| cx.notify());
-        let namespace_filter = cx.new(|cx| NamespaceFilter::new(window, cx));
+        let namespace_filter = cx.new(|cx| NamespaceFilter::with_scope(scope, window, cx));
         let namespace_sub = cx.subscribe(
             &namespace_filter,
             |this, _, event: &NamespaceFilterEvent, cx| {

@@ -80,12 +80,14 @@ pub struct NamespaceFilter {
 impl EventEmitter<NamespaceFilterEvent> for NamespaceFilter {}
 
 impl NamespaceFilter {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    /// Create a filter that starts on `scope`, used when restoring a saved tab.
+    pub fn with_scope(scope: NamespaceScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let namespaces = cx.global::<ClusterState>().namespaces().to_vec();
+        let selected_value = scope.namespace().unwrap_or_default().to_string();
         let select = cx.new(|cx| {
             let mut select =
                 SelectState::new(namespace_items(&namespaces), None, window, cx).searchable(true);
-            select.set_selected_value(&String::new(), window, cx);
+            select.set_selected_value(&selected_value, window, cx);
             select
         });
         let select_sub = cx.subscribe(
@@ -99,7 +101,7 @@ impl NamespaceFilter {
             this.sync(window, cx);
         });
         Self {
-            scope: NamespaceScope::All,
+            scope,
             select,
             synced_namespaces: namespaces,
             select_sub,
