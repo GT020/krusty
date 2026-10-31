@@ -13,7 +13,7 @@ use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
 use crate::models::resources::ingresses::IngressesModel;
-use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase};
+use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository;
 
 pub struct IngressesViewModel {
@@ -85,6 +85,10 @@ impl IngressesViewModel {
 
     pub fn phase(&self, cx: &App) -> SnapshotPhase {
         self.model.read(cx).phase().clone()
+    }
+
+    pub fn mode(&self, cx: &App) -> WatchMode {
+        self.model.read(cx).snapshot().mode()
     }
 
     pub fn item_count(&self, cx: &App) -> usize {

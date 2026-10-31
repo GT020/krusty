@@ -21,6 +21,7 @@ use crate::models::resources::pod::detail::{
 use crate::models::{NamespaceScope, ResourceKind};
 use gpui_kit::App;
 
+use crate::repository::retry::{Retry, RetryAction};
 use crate::repository::{Subscription, subscribe_kind};
 
 const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -113,41 +114,106 @@ async fn watch_logs(
     mut cancel: watch::Receiver<bool>,
 ) {
     let api: Api<Pod> = Api::namespaced(client, &namespace);
-    let params = LogParams {
-        container: Some(container),
-        follow,
-        tail_lines: Some(2_000),
-        ..LogParams::default()
-    };
-    let stream = tokio::select! {
-        _ = cancel.changed() => return,
-        result = api.log_stream(&name, &params) => result,
-    };
-    let stream = match stream {
-        Ok(stream) => stream,
-        Err(error) => {
-            let _ = updates.send(Err(format!("Could not stream logs: {error}")));
-            return;
-        }
-    };
-    let mut lines = stream.lines();
+    let mut retry = Retry::new();
+    // Timestamp of the last streamed line; reconnects resume after it instead
+    // of replaying the tail, so a dropped follow stream does not duplicate
+    // lines. kubectl does the same with --since-time.
+    let mut last_timestamp: Option<jiff::Timestamp> = None;
+
     loop {
-        tokio::select! {
+        let params = LogParams {
+            container: Some(container.clone()),
+            follow,
+            // Timestamps are only needed to resume a dropped follow stream.
+            timestamps: follow,
+            tail_lines: if last_timestamp.is_some() {
+                None
+            } else {
+                Some(2_000)
+            },
+            since_time: last_timestamp,
+            ..LogParams::default()
+        };
+        let timestamps = params.timestamps;
+        let stream = tokio::select! {
             _ = cancel.changed() => return,
-            line = lines.try_next() => {
-                match line {
-                    Ok(Some(line)) => {
-                        if updates.send(Ok(line.trim_end_matches('\r').to_string())).is_err() {
-                            return;
-                        }
+            result = api.log_stream(&name, &params) => result,
+        };
+        let mut lines = match stream {
+            Ok(stream) => {
+                retry.list_succeeded();
+                stream.lines()
+            }
+            Err(error) => {
+                if !follow {
+                    let _ = updates.send(Err(format!("Could not stream logs: {error}")));
+                    return;
+                }
+                match retry.failed(&error) {
+                    RetryAction::Retry(delay) => {
+                        tracing::warn!(%error, pod = %name, delay_ms = delay.as_millis() as u64, "pods: log stream setup failed, retrying");
+                        tokio::select! {
+                            _ = cancel.changed() => return,
+                            _ = tokio::time::sleep(delay) => continue,
+                        };
                     }
-                    Ok(None) => return,
-                    Err(error) => {
-                        let _ = updates.send(Err(format!("Log stream error: {error}")));
+                    RetryAction::GiveUp => {
+                        let _ = updates.send(Err(format!("Could not stream logs: {error}")));
                         return;
                     }
                 }
             }
+        };
+
+        loop {
+            let line = tokio::select! {
+                _ = cancel.changed() => return,
+                line = lines.try_next() => line,
+            };
+            match line {
+                Ok(Some(raw)) => {
+                    retry.watch_succeeded();
+                    let raw = raw.trim_end_matches('\r');
+                    let text = if timestamps {
+                        match raw.split_once(' ') {
+                            Some((stamp, text)) => {
+                                if let Ok(timestamp) = stamp.parse::<jiff::Timestamp>() {
+                                    last_timestamp = Some(timestamp);
+                                }
+                                text
+                            }
+                            None => raw,
+                        }
+                    } else {
+                        raw
+                    };
+                    if updates.send(Ok(text.to_string())).is_err() {
+                        return;
+                    }
+                }
+                Ok(None) => {
+                    tracing::debug!(pod = %name, "pods: log stream ended");
+                    break;
+                }
+                Err(error) => {
+                    tracing::warn!(%error, pod = %name, "pods: log stream read error");
+                    break;
+                }
+            }
+        }
+
+        if !follow {
+            return;
+        }
+        // The follow stream dropped: reconnect after a soft backoff, resuming
+        // after the last received line.
+        let RetryAction::Retry(delay) = retry.failed_soft() else {
+            return;
+        };
+        tracing::warn!(pod = %name, delay_ms = delay.as_millis() as u64, "pods: log stream interrupted, reconnecting");
+        tokio::select! {
+            _ = cancel.changed() => return,
+            _ = tokio::time::sleep(delay) => {}
         }
     }
 }

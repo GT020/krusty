@@ -26,6 +26,7 @@ pub mod service_accounts;
 pub mod services;
 pub mod stateful_sets;
 pub mod storage_classes;
+pub mod watch_mode;
 
 #[allow(clippy::too_many_arguments)]
 pub fn render_detail<T: 'static>(

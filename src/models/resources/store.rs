@@ -35,6 +35,7 @@ pub struct ResourceSnapshot {
     items: Arc<[Arc<Item>]>,
     revision: u64,
     phase: SnapshotPhase,
+    mode: WatchMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -44,12 +45,43 @@ pub enum SnapshotPhase {
     Error(String),
 }
 
+/// How the snapshot is kept up to date. `Poll` carries the cadence so the UI
+/// can show and adjust it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchMode {
+    /// Live watch stream.
+    Watch,
+    /// Watch is not permitted; the store is re-listed on this cadence.
+    Poll(PollRate),
+}
+
+/// Automatic re-list cadence while polling. `Off` disables the timer; a
+/// manual refresh still re-lists once. Persisted per resource kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum PollRate {
+    /// No automatic polling.
+    Off,
+    /// Poll every this many seconds.
+    Every(u64),
+}
+
+impl PollRate {
+    pub const DEFAULT: PollRate = PollRate::Every(5);
+}
+
+impl Default for PollRate {
+    fn default() -> Self {
+        Self::DEFAULT
+    }
+}
+
 impl ResourceSnapshot {
     pub fn loading() -> Self {
         Self {
             items: Arc::from(Vec::<Arc<Item>>::new()),
             revision: 0,
             phase: SnapshotPhase::Loading,
+            mode: WatchMode::Watch,
         }
     }
 
@@ -58,7 +90,13 @@ impl ResourceSnapshot {
             items: Arc::from(Vec::<Arc<Item>>::new()),
             revision: 0,
             phase: SnapshotPhase::Error(message.into()),
+            mode: WatchMode::Watch,
         }
+    }
+
+    pub fn with_mode(mut self, mode: WatchMode) -> Self {
+        self.mode = mode;
+        self
     }
 
     pub fn items(&self) -> &[Arc<Item>] {
@@ -71,6 +109,10 @@ impl ResourceSnapshot {
 
     pub fn phase(&self) -> &SnapshotPhase {
         &self.phase
+    }
+
+    pub fn mode(&self) -> WatchMode {
+        self.mode
     }
 }
 
@@ -148,6 +190,7 @@ impl ResourceStore {
             items: self.objects.values().cloned().collect(),
             revision: self.revision,
             phase,
+            mode: WatchMode::Watch,
         }
     }
 }
@@ -228,5 +271,16 @@ mod tests {
         let snapshot = store.snapshot(SnapshotPhase::Ready);
         assert_eq!(snapshot.items().len(), 1);
         assert_eq!(snapshot.items()[0].name, "b");
+    }
+
+    #[test]
+    fn snapshots_carry_the_watch_mode() {
+        let mut store = ResourceStore::new();
+        let snapshot = store.snapshot(SnapshotPhase::Ready);
+        assert_eq!(snapshot.mode(), WatchMode::Watch);
+        let snapshot = snapshot.with_mode(WatchMode::Poll(PollRate::Every(5)));
+        assert_eq!(snapshot.mode(), WatchMode::Poll(PollRate::Every(5)));
+        assert_eq!(ResourceSnapshot::loading().mode(), WatchMode::Watch);
+        assert_eq!(ResourceSnapshot::failed("x").mode(), WatchMode::Watch);
     }
 }

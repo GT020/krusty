@@ -647,6 +647,40 @@ impl ResourceViewModel {
         }
     }
 
+    pub fn mode(&self, cx: &App) -> crate::models::WatchMode {
+        match self {
+            Self::Pods(vm) => vm.read(cx).mode(cx),
+            Self::Deployments(vm) => vm.read(cx).mode(cx),
+            Self::StatefulSets(vm) => vm.read(cx).mode(cx),
+            Self::ReplicaSets(vm) => vm.read(cx).mode(cx),
+            Self::CronJobs(vm) => vm.read(cx).mode(cx),
+            Self::ServiceAccounts(vm) => vm.read(cx).mode(cx),
+            Self::StorageClasses(vm) => vm.read(cx).mode(cx),
+            Self::Namespaces(vm) => vm.read(cx).mode(cx),
+            Self::DaemonSets(vm) => vm.read(cx).mode(cx),
+            Self::Jobs(vm) => vm.read(cx).mode(cx),
+            Self::Services(vm) => vm.read(cx).mode(cx),
+            Self::Ingresses(vm) => vm.read(cx).mode(cx),
+            Self::PersistentVolumes(vm) => vm.read(cx).mode(cx),
+            Self::PersistentVolumeClaims(vm) => vm.read(cx).mode(cx),
+            Self::ConfigMaps(vm) => vm.read(cx).mode(cx),
+            Self::Secrets(vm) => vm.read(cx).mode(cx),
+            Self::Nodes(vm) => vm.read(cx).mode(cx),
+            Self::ClusterRoles(vm) => vm.read(cx).mode(cx),
+            Self::EndpointSlices(vm) => vm.read(cx).mode(cx),
+            Self::Endpoints(vm) => vm.read(cx).mode(cx),
+            Self::Events(vm) => vm.read(cx).mode(cx),
+            Self::HorizontalPodAutoscalers(vm) => vm.read(cx).mode(cx),
+            Self::Leases(vm) => vm.read(cx).mode(cx),
+            Self::NetworkPolicies(vm) => vm.read(cx).mode(cx),
+            Self::PodDisruptionBudgets(vm) => vm.read(cx).mode(cx),
+            Self::ReplicationControllers(vm) => vm.read(cx).mode(cx),
+            Self::RoleBindings(vm) => vm.read(cx).mode(cx),
+            Self::Roles(vm) => vm.read(cx).mode(cx),
+            Self::Custom(vm) => vm.read(cx).mode(cx),
+        }
+    }
+
     pub fn item_count(&self, cx: &App) -> usize {
         match self {
             Self::Pods(vm) => vm.read(cx).item_count(cx),
