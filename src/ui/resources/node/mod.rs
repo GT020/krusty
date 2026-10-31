@@ -55,6 +55,7 @@ impl NodesView {
     fn header(&self, cx: &Context<Self>) -> impl IntoElement {
         let phase = self.vm.read(cx).phase(cx);
         let count = self.vm.read(cx).item_count(cx);
+        let mode = self.vm.read(cx).mode(cx);
 
         let status = match &phase {
             SnapshotPhase::Loading => div()
@@ -91,7 +92,12 @@ impl NodesView {
                             .font_weight(FontWeight::MEDIUM)
                             .child(SharedString::from("Nodes")),
                     )
-                    .child(status),
+                    .child(status)
+                    .child(super::watch_mode::render(
+                        mode,
+                        crate::models::ResourceKind::Nodes,
+                        cx,
+                    )),
             )
             .child(
                 Button::new("refresh-nodes")

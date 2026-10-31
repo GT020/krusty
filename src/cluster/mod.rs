@@ -1,11 +1,12 @@
 pub mod kubeconfig;
 
-use futures::TryStreamExt as _;
+use std::time::Duration;
+
 use gpui_kit::{App, BorrowAppContext as _, Global};
-use k8s_openapi::api::core::v1::Namespace;
-use kube::api::{ListParams, WatchEvent, WatchParams};
-use kube::{Api, Client, Config};
+use kube::{Client, Config};
 use tokio::sync::watch;
+
+use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
 
 /// One selectable cluster context: a kubectl context or a cluster added to krusty.
 #[derive(Clone)]
@@ -45,6 +46,9 @@ pub struct ClusterState {
     namespaces: Vec<String>,
     context_epoch: u64,
     namespace_cancel: Option<watch::Sender<bool>>,
+    /// Kept alive for the app lifetime: the selector's handle on the shared
+    /// namespaces watcher that the Namespaces page also reads.
+    namespace_subscription: Option<crate::repository::Subscription>,
 }
 
 impl Global for ClusterState {}
@@ -149,22 +153,14 @@ pub fn init(cx: &mut App) {
         .or_else(|| contexts.first().map(|context| context.id.clone()));
 
     tracing::info!(preferred = ?preferred, "cluster: selected startup context");
-    let client = preferred.as_deref().and_then(|id| {
-        let context = contexts.iter().find(|context| context.id == id)?;
-        match client_for(&tokio, kubeconfig.as_ref(), &context.source, &store) {
-            Ok(client) => Some(client),
-            Err(error) => {
-                tracing::warn!(%error, context = %context.id, "cluster: startup client failed");
-                None
-            }
-        }
-    });
+    let startup = preferred
+        .as_deref()
+        .and_then(|id| contexts.iter().find(|context| context.id == id).cloned());
 
-    let connected = client.is_some();
     cx.set_global(ClusterState {
         _runtime: runtime,
         tokio,
-        client,
+        client: None,
         kubeconfig,
         contexts,
         active: preferred,
@@ -173,142 +169,73 @@ pub fn init(cx: &mut App) {
         namespaces: Vec::new(),
         context_epoch: 0,
         namespace_cancel: None,
+        namespace_subscription: None,
     });
-    refresh_namespaces(cx);
+    // Building the client can run an auth plugin (kubelogin, gcloud, …):
+    // keep it off the UI thread so startup stays instant.
+    if let Some(context) = startup {
+        spawn_client_build(cx, context);
+    }
     tracing::info!(
         elapsed_ms = started.elapsed().as_millis() as u64,
-        connected,
         "cluster: init complete"
     );
 }
 
-async fn run_namespace_watcher(
-    client: Client,
-    tx: watch::Sender<Vec<String>>,
-    mut cancel: watch::Receiver<bool>,
-) {
-    let api: Api<Namespace> = Api::all(client);
-    let list_params = ListParams::default();
-    let watch_params = WatchParams::default().timeout(280);
-
-    loop {
-        if cancel.has_changed().is_err() || *cancel.borrow() {
-            return;
-        }
-
-        let listed = tokio::select! {
-            _ = cancel.changed() => return,
-            result = api.list(&list_params) => result,
-        };
-
-        let list = match listed {
-            Ok(list) => list,
-            Err(error) => {
-                tracing::warn!(%error, "cluster: namespace list failed, retrying");
-                tokio::select! {
-                    _ = cancel.changed() => return,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1500)) => continue,
-                };
-            }
-        };
-
-        let mut names = crate::repository::namespace_names(list.items);
-        let mut resource_version = list.metadata.resource_version.unwrap_or_default();
-        let _ = tx.send(names.clone());
-
-        let watched = tokio::select! {
-            _ = cancel.changed() => return,
-            result = api.watch(&watch_params, &resource_version) => result,
-        };
-
-        let mut stream = match watched {
-            Ok(stream) => Box::pin(stream),
-            Err(error) => {
-                tracing::warn!(%error, "cluster: namespace watch setup failed, retrying");
-                tokio::select! {
-                    _ = cancel.changed() => return,
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(1500)) => continue,
-                };
-            }
-        };
-
-        loop {
-            let event = tokio::select! {
-                _ = cancel.changed() => return,
-                item = stream.try_next() => item,
-            };
-
-            match event {
-                Ok(Some(WatchEvent::Added(ns))) => {
-                    if let Some(name) = ns.metadata.name
-                        && !names.contains(&name)
-                    {
-                        names.push(name);
-                        names.sort_unstable();
-                        let _ = tx.send(names.clone());
-                    }
-                    if let Some(version) = ns.metadata.resource_version {
-                        resource_version = version;
-                    }
-                }
-                Ok(Some(WatchEvent::Deleted(ns))) => {
-                    if let Some(name) = ns.metadata.name
-                        && let Some(idx) = names.iter().position(|n| n == &name)
-                    {
-                        names.remove(idx);
-                        let _ = tx.send(names.clone());
-                    }
-                    if let Some(version) = ns.metadata.resource_version {
-                        resource_version = version;
-                    }
-                }
-                Ok(Some(WatchEvent::Bookmark(bm))) => {
-                    resource_version = bm.metadata.resource_version;
-                }
-                Ok(Some(WatchEvent::Modified(_))) => {}
-                Ok(Some(WatchEvent::Error(err))) => {
-                    tracing::warn!(%err, "cluster: namespace watch error, relisting");
-                    break;
-                }
-                Ok(None) => {
-                    break;
-                }
-                Err(error) => {
-                    tracing::warn!(%error, "cluster: namespace watch stream error, relisting");
-                    break;
-                }
-            }
-        }
-    }
-}
-
-/// Start or restart the continuous namespace list/watch loop.
+/// Start or restart the shared namespace subscription. The selector and the
+/// Namespaces resource page read from the same repository watcher, so
+/// namespaces are fetched once per context and follow the saved poll rate.
 pub fn refresh_namespaces(cx: &mut App) {
-    let state = cx.global::<ClusterState>();
-    let Some(client) = state.client.clone() else {
+    if cx.global::<ClusterState>().client.is_none() {
         return;
-    };
-    let tokio = state.tokio.clone();
-
-    if let Some(cancel) = &state.namespace_cancel {
+    }
+    // Stop the previous pump and release the previous handle; dropping the
+    // last handle cancels the shared watcher task.
+    if let Some(cancel) = &cx.global::<ClusterState>().namespace_cancel {
         let _ = cancel.send(true);
     }
 
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    let (names_tx, mut names_rx) = watch::channel(state.namespaces.clone());
+    let subscription =
+        match crate::repository::subscribe(cx, ResourceKind::Namespaces, NamespaceScope::All) {
+            Ok(subscription) => subscription,
+            Err(error) => {
+                tracing::debug!(%error, "cluster: namespace subscription unavailable");
+                return;
+            }
+        };
 
+    let (cancel_tx, mut cancel_rx) = watch::channel(false);
     cx.update_global::<ClusterState, _>(|state, _| {
         state.namespace_cancel = Some(cancel_tx);
+        state.namespace_subscription = Some(subscription.clone());
     });
 
-    tokio.spawn(run_namespace_watcher(client, names_tx, cancel_rx));
-
+    let mut subscription = subscription;
     cx.spawn(async move |cx: &mut gpui_kit::AsyncApp| {
-        while names_rx.changed().await.is_ok() {
-            let names = names_rx.borrow_and_update().clone();
+        loop {
+            let snapshot = tokio::select! {
+                _ = cancel_rx.changed() => break,
+                snapshot = subscription.next() => snapshot,
+            };
+            let Some(snapshot) = snapshot else {
+                break;
+            };
+            let names: Vec<String> = snapshot
+                .items()
+                .iter()
+                .map(|item| item.name.clone())
+                .collect();
             cx.update_global::<ClusterState, _>(|state, _| {
-                state.namespaces = names.clone();
-                state.reachable = Some(true);
+                // An empty list means the watcher has not loaded yet (or the
+                // context is switching); keep the previous selector contents.
+                if !names.is_empty() {
+                    state.namespaces = names;
+                }
+                match snapshot.phase() {
+                    SnapshotPhase::Ready => state.reachable = Some(true),
+                    SnapshotPhase::Error(_) => state.reachable = Some(false),
+                    SnapshotPhase::Loading => {}
+                }
             });
         }
     })
@@ -350,19 +277,21 @@ fn build_contexts(
     contexts
 }
 
-fn client_for(
-    tokio: &tokio::runtime::Handle,
-    kubeconfig: Option<&kube::config::Kubeconfig>,
-    source: &ContextSource,
-    store: &kubeconfig::ConfigStore,
+/// Build a kube client without blocking the caller. Auth plugins (kubelogin,
+/// gcloud, aws, …) can take seconds, so this always runs on the cluster
+/// runtime, never the UI thread.
+async fn build_client(
+    kubeconfig: Option<kube::config::Kubeconfig>,
+    source: ContextSource,
+    store: kubeconfig::ConfigStore,
 ) -> Result<Client, &'static str> {
     let started = std::time::Instant::now();
-    let source_label = match source {
+    let source_label = match &source {
         ContextSource::Kubeconfig(name) => format!("kube:{name}"),
         ContextSource::App(id) => format!("app:{id}"),
     };
     tracing::debug!(context = %source_label, "cluster: building kube client");
-    let config = match source {
+    let mut config = match &source {
         ContextSource::Kubeconfig(name) => {
             let kubeconfig = kubeconfig.ok_or("kubeconfig unavailable")?;
             let opts = kube::config::KubeConfigOptions {
@@ -370,8 +299,8 @@ fn client_for(
                 cluster: None,
                 user: None,
             };
-            tokio
-                .block_on(Config::from_custom_kubeconfig(kubeconfig.clone(), &opts))
+            Config::from_custom_kubeconfig(kubeconfig, &opts)
+                .await
                 .map_err(|_| "invalid kubeconfig context")?
         }
         ContextSource::App(id) => {
@@ -380,12 +309,13 @@ fn client_for(
                 .iter()
                 .find(|entry| entry.id == *id)
                 .ok_or("unknown cluster")?;
-            load_inline(tokio, &entry.kubeconfig_yaml)?
+            load_inline(&entry.kubeconfig_yaml).await?
         }
     };
-    let client = tokio
-        .block_on(async { Client::try_from(config) })
-        .map_err(|_| "connection failed")?;
+    // kube defaults to 30s; fail dead endpoints faster and let the retry
+    // policy back off instead of stalling the UI.
+    config.connect_timeout = Some(Duration::from_secs(10));
+    let client = Client::try_from(config).map_err(|_| "connection failed")?;
     tracing::debug!(
         context = %source_label,
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -394,7 +324,62 @@ fn client_for(
     Ok(client)
 }
 
+/// Build the client for `context` in the background and publish it when ready.
+/// The epoch bump resubscribes every resource view; namespace polling starts
+/// here too. Stale builds (superseded by a newer switch) are discarded.
+fn spawn_client_build(cx: &mut App, context: ContextInfo) {
+    let (kubeconfig, store, tokio) = {
+        let state = cx.global::<ClusterState>();
+        (
+            state.kubeconfig.clone(),
+            state.store.clone(),
+            state.tokio.clone(),
+        )
+    };
+    let context_id = context.id.clone();
+    let started = std::time::Instant::now();
+    let building = tokio.spawn(build_client(kubeconfig, context.source, store));
+    cx.spawn(async move |cx: &mut gpui_kit::AsyncApp| {
+        let built = building.await;
+        cx.update(|cx| {
+            let state = cx.global::<ClusterState>();
+            if state.active_id() != Some(context_id.as_str()) {
+                tracing::debug!(context = %context_id, "cluster: discarding stale client build");
+                return;
+            }
+            match built {
+                Ok(Ok(client)) => {
+                    tracing::info!(
+                        context = %context_id,
+                        elapsed_ms = started.elapsed().as_millis() as u64,
+                        "cluster: client ready"
+                    );
+                    cx.update_global::<ClusterState, _>(|state, _| {
+                        state.client = Some(client);
+                        state.context_epoch = state.context_epoch.wrapping_add(1);
+                    });
+                    refresh_namespaces(cx);
+                }
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, context = %context_id, "cluster: client build failed");
+                    cx.update_global::<ClusterState, _>(|state, _| {
+                        state.reachable = Some(false);
+                    });
+                }
+                Err(error) => {
+                    tracing::error!(%error, context = %context_id, "cluster: client build task failed");
+                    cx.update_global::<ClusterState, _>(|state, _| {
+                        state.reachable = Some(false);
+                    });
+                }
+            }
+        });
+    })
+    .detach();
+}
+
 /// Switch the active cluster context. Selection is remembered across launches.
+/// The new client is built in the background; views resubscribe when it lands.
 pub fn switch_context(cx: &mut App, id: &str) -> Result<(), &'static str> {
     let started = std::time::Instant::now();
     tracing::info!(context = %id, "cluster: switching context");
@@ -405,39 +390,37 @@ pub fn switch_context(cx: &mut App, id: &str) -> Result<(), &'static str> {
             .find(|context| context.id == id)
             .cloned()
             .ok_or("unknown context")?;
-        let client = client_for(
-            &state.tokio,
-            state.kubeconfig.as_ref(),
-            &context.source,
-            &state.store,
-        )?;
-        state.client = Some(client);
-        state.active = Some(context.id);
+        state.client = None;
+        state.active = Some(context.id.clone());
         state.reachable = None;
         state.namespaces.clear();
         state.context_epoch = state.context_epoch.wrapping_add(1);
         if let Some(cancel) = state.namespace_cancel.take() {
             let _ = cancel.send(true);
         }
+        state.namespace_subscription = None;
         state.store.set_last_context(Some(id));
         let _ = state.store.save();
-        Ok(())
+        Ok(context)
     });
-    if result.is_ok() {
-        refresh_namespaces(cx);
+    match result {
+        Ok(context) => {
+            spawn_client_build(cx, context);
+            tracing::info!(
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "cluster: context switched, client building"
+            );
+            Ok(())
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "cluster: context switch failed"
+            );
+            Err(error)
+        }
     }
-    match &result {
-        Ok(()) => tracing::info!(
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "cluster: context switched"
-        ),
-        Err(error) => tracing::error!(
-            %error,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "cluster: context switch failed"
-        ),
-    }
-    result
 }
 
 fn rebuild_contexts(state: &mut ClusterState) {
@@ -451,14 +434,11 @@ fn rebuild_contexts(state: &mut ClusterState) {
     }
 }
 
-fn load_inline(tokio: &tokio::runtime::Handle, yaml: &str) -> Result<Config, &'static str> {
+async fn load_inline(yaml: &str) -> Result<Config, &'static str> {
     let kubeconfig: kube::config::Kubeconfig =
         serde_saphyr::from_str(yaml).map_err(|_| "invalid kubeconfig")?;
-    tokio
-        .block_on(Config::from_custom_kubeconfig(
-            kubeconfig,
-            &kube::config::KubeConfigOptions::default(),
-        ))
+    Config::from_custom_kubeconfig(kubeconfig, &kube::config::KubeConfigOptions::default())
+        .await
         .map_err(|_| "invalid kubeconfig")
 }
 
@@ -559,20 +539,19 @@ users:
         assert_eq!(contexts[0].label(), "kind-dev");
 
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let client = client_for(runtime.handle(), None, &contexts[0].source, &store);
+        let client = runtime.block_on(build_client(None, contexts[0].source.clone(), store));
         assert!(client.is_ok());
     }
 
     #[test]
     fn parses_inline_kubeconfig() {
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
-        let handle = runtime.handle().clone();
         let yaml = kube::config::Kubeconfig::read()
             .ok()
             .and_then(|kubeconfig| serde_saphyr::to_string(&kubeconfig).ok());
         let Some(yaml) = yaml else {
             return;
         };
-        assert!(load_inline(&handle, &yaml).is_ok());
+        assert!(runtime.block_on(load_inline(&yaml)).is_ok());
     }
 }
