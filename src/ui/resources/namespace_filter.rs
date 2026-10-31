@@ -94,7 +94,7 @@ impl NamespaceFilter {
             &select,
             |this, _, event: &SelectEvent<SearchableVec<NamespaceItem>>, cx| {
                 let SelectEvent::Confirm(value) = event;
-                this.set_scope(scope_from_value(value.as_deref()), cx);
+                this.apply_scope(scope_from_value(value.as_deref()), cx);
             },
         );
         let cluster_sub = cx.observe_global_in::<ClusterState>(window, |this, window, cx| {
@@ -109,7 +109,25 @@ impl NamespaceFilter {
         }
     }
 
-    fn set_scope(&mut self, scope: NamespaceScope, cx: &mut Context<Self>) {
+    /// Switch the filter from outside the selector, e.g. when a kubectl
+    /// command targets a namespace.
+    pub fn set_scope(
+        &mut self,
+        scope: NamespaceScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.scope == scope {
+            return;
+        }
+        let value = scope.namespace().unwrap_or_default().to_string();
+        self.apply_scope(scope, cx);
+        self.select.update(cx, |select, cx| {
+            select.set_selected_value(&value, window, cx);
+        });
+    }
+
+    fn apply_scope(&mut self, scope: NamespaceScope, cx: &mut Context<Self>) {
         if self.scope == scope {
             return;
         }
@@ -129,7 +147,7 @@ impl NamespaceFilter {
             NamespaceScope::One(namespace)
                 if !namespaces.is_empty() && !namespaces.contains(namespace) =>
             {
-                self.set_scope(NamespaceScope::All, cx);
+                self.apply_scope(NamespaceScope::All, cx);
                 true
             }
             _ => false,

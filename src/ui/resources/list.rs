@@ -98,12 +98,30 @@ impl ResourceListView {
         &self.namespace_filter
     }
 
+    /// Switch this tab's namespace, used by the kubectl command bar.
+    pub fn set_scope(
+        &mut self,
+        scope: NamespaceScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.namespace_filter
+            .update(cx, |filter, cx| filter.set_scope(scope, window, cx));
+    }
+
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.vm.set_active(active, cx);
     }
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.detail.update(cx, |detail, cx| detail.close(cx));
+    }
+
+    /// Open the detail pane for a named resource, used by `kubectl describe`.
+    pub fn open_detail(&mut self, namespace: String, name: String, cx: &mut Context<Self>) {
+        self.detail.update(cx, |detail, cx| {
+            detail.open(self.kind, namespace, name, cx);
+        });
     }
 
     fn list(&self, cx: &Context<Self>) -> AnyElement {

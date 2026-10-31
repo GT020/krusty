@@ -114,6 +114,8 @@ fn actions(detail: &PodDetail, view: Entity<PodsView>) -> AnyElement {
                     logs_namespace.clone(),
                     logs_name.clone(),
                     logs_containers.clone(),
+                    None,
+                    true,
                     cx,
                 );
             });

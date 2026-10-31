@@ -19,7 +19,9 @@ use gpui_kit::{
     Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 
+use crate::models::resources::pod::detail::PodDetailUpdate;
 use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
+use crate::repository;
 use crate::ui::resources::namespace_filter::{
     NamespaceFilter, NamespaceFilterEvent, render as render_namespace_filter,
 };
@@ -92,8 +94,89 @@ impl PodsView {
         self.vm.update(cx, |vm, cx| vm.set_active(active, cx));
     }
 
+    /// Switch this tab's namespace, used by the kubectl command bar.
+    pub fn set_scope(
+        &mut self,
+        scope: NamespaceScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.namespace_filter
+            .update(cx, |filter, cx| filter.set_scope(scope, window, cx));
+    }
+
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.vm.update(cx, |vm, cx| vm.close_detail(cx));
+    }
+
+    /// Open a pod's detail pane by name, used by `kubectl describe`.
+    pub fn open_detail(&mut self, namespace: String, name: String, cx: &mut Context<Self>) {
+        self.vm
+            .update(cx, |vm, cx| vm.open_detail(namespace, name, cx));
+    }
+
+    /// Resolve a pod's containers and then open its log panel.
+    pub fn open_logs_for_pod(
+        &mut self,
+        namespace: String,
+        name: String,
+        container: Option<String>,
+        follow: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let key = SessionKey::logs(namespace.clone(), name.clone());
+        if self.sessions.focus(&key) {
+            cx.notify();
+            return;
+        }
+
+        let mut subscription =
+            match repository::resources::pods::subscribe_detail(cx, &namespace, &name) {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    self.open_logs_error(namespace, name, error, cx);
+                    return;
+                }
+            };
+        let target_namespace = namespace.clone();
+        let target_name = name.clone();
+        cx.spawn(async move |this, cx| {
+            let mut containers =
+                Err("Pod details ended before the container list was loaded.".to_string());
+            while let Some(update) = subscription.next().await {
+                match update {
+                    PodDetailUpdate::Detail {
+                        result: Ok(detail), ..
+                    } => {
+                        containers = Ok(detail
+                            .containers
+                            .iter()
+                            .map(|container| container.name.clone())
+                            .collect::<Vec<_>>());
+                        break;
+                    }
+                    PodDetailUpdate::Detail {
+                        result: Err(error), ..
+                    } => {
+                        containers = Err(error);
+                        break;
+                    }
+                    PodDetailUpdate::Usage { .. } => {}
+                }
+            }
+            let _ = this.update(cx, |this, cx| match containers {
+                Ok(containers) => this.open_logs(
+                    target_namespace,
+                    target_name,
+                    containers,
+                    container,
+                    follow,
+                    cx,
+                ),
+                Err(error) => this.open_logs_error(target_namespace, target_name, error, cx),
+            });
+        })
+        .detach();
     }
 
     /// Open logs in this tab's bottom panel, or focus them when already open.
@@ -102,6 +185,8 @@ impl PodsView {
         namespace: String,
         name: String,
         containers: Vec<String>,
+        container: Option<String>,
+        follow: bool,
         cx: &mut Context<Self>,
     ) {
         let key = SessionKey::logs(namespace.clone(), name.clone());
@@ -109,7 +194,26 @@ impl PodsView {
             cx.notify();
             return;
         }
-        let vm = cx.new(|cx| PodLogsViewModel::new(namespace, name, containers, cx));
+        let vm =
+            cx.new(|cx| PodLogsViewModel::new(namespace, name, containers, container, follow, cx));
+        let view = cx.new(|cx| PodLogsView::new(vm.clone(), cx));
+        self.sessions.push(PodSession::logs(key, view, vm));
+        cx.notify();
+    }
+
+    fn open_logs_error(
+        &mut self,
+        namespace: String,
+        name: String,
+        error: String,
+        cx: &mut Context<Self>,
+    ) {
+        let key = SessionKey::logs(namespace.clone(), name.clone());
+        if self.sessions.focus(&key) {
+            cx.notify();
+            return;
+        }
+        let vm = cx.new(|_| PodLogsViewModel::failed(namespace, name, error));
         let view = cx.new(|cx| PodLogsView::new(vm.clone(), cx));
         self.sessions.push(PodSession::logs(key, view, vm));
         cx.notify();

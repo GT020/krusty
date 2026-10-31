@@ -52,6 +52,11 @@ impl NodesView {
         self.vm.update(cx, |vm, cx| vm.close_detail(cx));
     }
 
+    /// Open a node's detail pane by name, used by `kubectl describe`.
+    pub fn open_detail(&mut self, name: String, cx: &mut Context<Self>) {
+        self.vm.update(cx, |vm, cx| vm.open_detail(name, cx));
+    }
+
     fn header(&self, cx: &Context<Self>) -> impl IntoElement {
         let phase = self.vm.read(cx).phase(cx);
         let count = self.vm.read(cx).item_count(cx);
