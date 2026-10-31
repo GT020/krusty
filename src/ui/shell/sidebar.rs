@@ -73,7 +73,7 @@ pub fn render_sidebar(
                 div()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child("krusty v0.1"),
+                    .child(concat!("krusty v", env!("CARGO_PKG_VERSION"))),
             ),
         )
         .children(groups)
