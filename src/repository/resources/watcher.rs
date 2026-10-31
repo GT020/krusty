@@ -4,8 +4,9 @@
 //! [`ResourceStore`] and only publishes immutable snapshots to the UI, throttled
 //! to `FLUSH_INTERVAL` or every `FLUSH_AT` events, whichever comes first.
 
+use std::collections::HashSet;
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use futures::TryStreamExt as _;
@@ -29,29 +30,72 @@ use serde::de::DeserializeOwned;
 use tokio::sync::watch;
 
 use crate::models::{
-    Item, NamespaceScope, ObjectKey, ResourceKind, ResourceSnapshot, ResourceStore, SnapshotPhase,
+    Item, NamespaceScope, ObjectKey, PollRate, ResourceKind, ResourceSnapshot, ResourceStore,
+    SnapshotPhase, WatchMode,
 };
+use crate::repository::retry::{self, RequestFailure, Retry, RetryAction};
+use crate::repository::watch_prefs::{WatchPreference, WatchPrefs};
 
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const FLUSH_AT: usize = 256;
-const RETRY_DELAY: Duration = Duration::from_millis(750);
+
+/// List chunk size. Big kinds (thousands of pods/events) render their first
+/// chunk immediately instead of waiting for one huge response.
+const LIST_CHUNK_SIZE: u32 = 500;
+
+/// Kinds whose watch the API server denied (RBAC) for the current context
+/// epoch. New subscriptions for these kinds skip the doomed watch attempt and
+/// start polling right away, so changing the namespace filter does not reset
+/// polling back to a live-watch attempt.
+static WATCH_DENIED: OnceLock<Mutex<HashSet<(u64, ResourceKind)>>> = OnceLock::new();
+
+fn denied_registry() -> &'static Mutex<HashSet<(u64, ResourceKind)>> {
+    WATCH_DENIED.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+pub fn watch_denied(epoch: u64, kind: ResourceKind) -> bool {
+    denied_registry()
+        .lock()
+        .is_ok_and(|set| set.contains(&(epoch, kind)))
+}
+
+/// Forget a denial: the user explicitly asked for live watch again.
+pub fn clear_watch_denied(epoch: u64, kind: ResourceKind) {
+    if let Ok(mut set) = denied_registry().lock() {
+        set.remove(&(epoch, kind));
+    }
+}
+
+fn mark_watch_denied(epoch: u64, kind: ResourceKind) {
+    if let Ok(mut set) = denied_registry().lock() {
+        set.retain(|(stale_epoch, _)| *stale_epoch == epoch);
+        set.insert((epoch, kind));
+    }
+}
 
 /// Spawned once per subscription. Keep it generic over the store; the typed
 /// kind dispatch lives in `run`.
+#[allow(clippy::too_many_arguments)]
 pub async fn run(
     client: Client,
     kind: ResourceKind,
     scope: NamespaceScope,
+    epoch: u64,
     tx: watch::Sender<Arc<ResourceSnapshot>>,
     cancel: watch::Receiver<bool>,
     refresh: watch::Receiver<u64>,
+    prefs: watch::Receiver<WatchPrefs>,
 ) {
     let mut task = WatchTask {
         client,
+        kind,
+        epoch,
         tx,
         cancel,
         refresh,
+        prefs,
         store: ResourceStore::new(),
+        mode: WatchMode::Watch,
     };
     match kind {
         ResourceKind::Pods => task.run_namespaced::<Pod, _>(scope, pod_item).await,
@@ -142,21 +186,34 @@ pub async fn run(
     }
 }
 
-pub fn namespace_names(namespaces: Vec<Namespace>) -> Vec<String> {
-    let mut names: Vec<_> = namespaces
-        .into_iter()
-        .filter_map(|namespace| namespace.metadata.name)
-        .collect();
-    names.sort_unstable();
-    names
-}
-
 struct WatchTask {
     client: Client,
+    kind: ResourceKind,
+    epoch: u64,
     tx: watch::Sender<Arc<ResourceSnapshot>>,
     cancel: watch::Receiver<bool>,
     refresh: watch::Receiver<u64>,
+    prefs: watch::Receiver<WatchPrefs>,
     store: ResourceStore,
+    mode: WatchMode,
+}
+
+/// Why the poll loop exited.
+enum PollOutcome {
+    /// Subscription cancelled or listing denied: stop the task.
+    Stop,
+    /// The user switched this kind back to watch mode.
+    ResumeWatch,
+}
+
+/// Outcome of a chunked list.
+enum ListOutcome {
+    /// Full list published; watch from this resource version.
+    Listed(String),
+    /// Subscription cancelled mid-list.
+    Cancelled,
+    /// A chunk request failed or timed out; the caller decides whether to retry.
+    Failed(RequestFailure),
 }
 
 impl WatchTask {
@@ -201,10 +258,10 @@ impl WatchTask {
         K: Resource + Clone + Debug + DeserializeOwned + Send + 'static,
         F: Fn(&K) -> Item + Copy,
     {
-        let list_params = ListParams::default();
         let watch_params = WatchParams::default().timeout(280);
         let mut resource_version = String::new();
         let mut need_list = true;
+        let mut retry = Retry::new();
         let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         ticker.tick().await;
@@ -213,43 +270,74 @@ impl WatchTask {
             if self.cancel.has_changed().is_err() {
                 return;
             }
-            if need_list {
-                let listed = tokio::select! {
-                    _ = self.cancel.changed() => return,
-                    result = api.list(&list_params) => result,
-                };
-                match listed {
-                    Ok(list) => {
-                        resource_version = list.metadata.resource_version.unwrap_or_default();
-                        self.store.reset(list.items.iter().map(map));
-                        self.publish(SnapshotPhase::Ready);
-                        need_list = false;
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, ?api, "repository: list failed");
-                        self.publish(SnapshotPhase::Error(format!("list failed: {error}")));
-                        if !self.sleep(RETRY_DELAY).await {
-                            return;
-                        }
+            // The user prefers polling for this kind: skip the watch entirely.
+            if self.prefs.borrow().mode == WatchPreference::Poll {
+                match self.poll_loop(&api, map).await {
+                    PollOutcome::Stop => return,
+                    PollOutcome::ResumeWatch => {
+                        need_list = true;
+                        retry = Retry::new();
                         continue;
                     }
+                }
+            }
+            if need_list {
+                match self.list_progressively(&api, map).await {
+                    ListOutcome::Listed(version) => {
+                        retry.list_succeeded();
+                        resource_version = version;
+                        need_list = false;
+                    }
+                    ListOutcome::Cancelled => return,
+                    ListOutcome::Failed(failure) => match failure.action(&mut retry) {
+                        RetryAction::Retry(delay) => {
+                            tracing::warn!(%failure, ?api, delay_ms = delay.as_millis() as u64, "repository: list failed, retrying");
+                            self.publish(SnapshotPhase::Error(format!("list failed: {failure}")));
+                            if !self.sleep(delay).await {
+                                return;
+                            }
+                            continue;
+                        }
+                        RetryAction::GiveUp => {
+                            tracing::error!(%failure, ?api, "repository: list rejected, stopping watch");
+                            self.publish(SnapshotPhase::Error(format!("list rejected: {failure}")));
+                            return;
+                        }
+                    },
                 }
             }
 
             let watched = tokio::select! {
                 _ = self.cancel.changed() => return,
-                result = api.watch(&watch_params, &resource_version) => result,
+                result = retry::bounded(api.watch(&watch_params, &resource_version)) => result,
             };
             let mut stream = match watched {
-                Ok(stream) => Box::pin(stream),
-                Err(error) => {
-                    tracing::warn!(%error, "repository: watch setup failed");
-                    if !self.sleep(RETRY_DELAY).await {
-                        return;
-                    }
-                    need_list = true;
-                    continue;
+                Ok(stream) => {
+                    clear_watch_denied(self.epoch, self.kind);
+                    Box::pin(stream)
                 }
+                Err(failure) => match failure.action(&mut retry) {
+                    RetryAction::Retry(delay) => {
+                        tracing::warn!(%failure, delay_ms = delay.as_millis() as u64, "repository: watch setup failed, retrying");
+                        if !self.sleep(delay).await {
+                            return;
+                        }
+                        need_list = true;
+                        continue;
+                    }
+                    RetryAction::GiveUp => {
+                        tracing::warn!(%failure, ?api, "repository: watch denied, polling instead");
+                        mark_watch_denied(self.epoch, self.kind);
+                        match self.poll_loop(&api, map).await {
+                            PollOutcome::Stop => return,
+                            PollOutcome::ResumeWatch => {
+                                need_list = true;
+                                retry = Retry::new();
+                                continue;
+                            }
+                        }
+                    }
+                },
             };
 
             let mut relist = false;
@@ -261,6 +349,21 @@ impl WatchTask {
                         relist = true;
                         break;
                     }
+                    _ = self.prefs.changed() => {
+                        let prefs = *self.prefs.borrow_and_update();
+                        if prefs.mode == WatchPreference::Poll {
+                            tracing::info!(?api, "repository: watch disabled by preference, polling instead");
+                            drop(stream);
+                            match self.poll_loop(&api, map).await {
+                                PollOutcome::Stop => return,
+                                PollOutcome::ResumeWatch => {
+                                    relist = true;
+                                    retry = Retry::new();
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     _ = ticker.tick() => {
                         if self.store.pending() > 0 {
                             self.publish(SnapshotPhase::Ready);
@@ -269,6 +372,7 @@ impl WatchTask {
                     event = stream.try_next() => {
                         match event {
                             Ok(Some(WatchEvent::Added(object) | WatchEvent::Modified(object))) => {
+                                retry.watch_succeeded();
                                 let item = map(&object);
                                 if !item.resource_version.is_empty() {
                                     resource_version.clone_from(&item.resource_version);
@@ -276,6 +380,7 @@ impl WatchTask {
                                 self.store.upsert(item);
                             }
                             Ok(Some(WatchEvent::Deleted(object))) => {
+                                retry.watch_succeeded();
                                 if let Some(version) = object.resource_version() {
                                     resource_version = version;
                                 }
@@ -285,30 +390,71 @@ impl WatchTask {
                                 ));
                             }
                             Ok(Some(WatchEvent::Bookmark(bookmark))) => {
+                                retry.watch_succeeded();
                                 resource_version = bookmark.metadata.resource_version;
                             }
                             Ok(Some(WatchEvent::Error(status))) => {
-                                tracing::warn!(
-                                    code = status.code,
-                                    message = %status.message,
-                                    "repository: watch error event"
-                                );
                                 relist = status.code == 410
                                     || status.reason == "Expired"
                                     || status.reason == "Gone";
-                                break;
+                                match retry.failed_status(status.code) {
+                                    RetryAction::Retry(delay) => {
+                                        tracing::warn!(
+                                            code = status.code,
+                                            message = %status.message,
+                                            delay_ms = delay.as_millis() as u64,
+                                            "repository: watch error event, retrying"
+                                        );
+                                        if !self.sleep(delay).await {
+                                            return;
+                                        }
+                                        break;
+                                    }
+                                    RetryAction::GiveUp => {
+                                        tracing::warn!(
+                                            code = status.code,
+                                            message = %status.message,
+                                            "repository: watch denied, polling instead"
+                                        );
+                                        mark_watch_denied(self.epoch, self.kind);
+                                        drop(stream);
+                                        match self.poll_loop(&api, map).await {
+                                            PollOutcome::Stop => return,
+                                            PollOutcome::ResumeWatch => {
+                                                relist = true;
+                                                retry = Retry::new();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Ok(None) => {
                                 tracing::debug!("repository: watch stream ended, resuming");
                                 break;
                             }
-                            Err(error) => {
-                                tracing::warn!(%error, "repository: watch stream failed");
-                                if !self.sleep(RETRY_DELAY).await {
-                                    return;
+                            Err(error) => match retry.failed(&error) {
+                                RetryAction::Retry(delay) => {
+                                    tracing::warn!(%error, delay_ms = delay.as_millis() as u64, "repository: watch stream failed, retrying");
+                                    if !self.sleep(delay).await {
+                                        return;
+                                    }
+                                    break;
                                 }
-                                break;
-                            }
+                                RetryAction::GiveUp => {
+                                    tracing::warn!(%error, ?api, "repository: watch denied, polling instead");
+                                    mark_watch_denied(self.epoch, self.kind);
+                                    drop(stream);
+                                    match self.poll_loop(&api, map).await {
+                                        PollOutcome::Stop => return,
+                                        PollOutcome::ResumeWatch => {
+                                            relist = true;
+                                            retry = Retry::new();
+                                            break;
+                                        }
+                                    }
+                                }
+                            },
                         }
                         if self.store.pending() >= FLUSH_AT {
                             self.publish(SnapshotPhase::Ready);
@@ -329,7 +475,7 @@ impl WatchTask {
     }
 
     fn publish(&mut self, phase: SnapshotPhase) {
-        let snapshot = Arc::new(self.store.snapshot(phase));
+        let snapshot = Arc::new(self.store.snapshot(phase).with_mode(self.mode));
         tracing::trace!(
             objects = self.store.len(),
             revision = snapshot.revision(),
@@ -343,6 +489,125 @@ impl WatchTask {
         tokio::select! {
             _ = self.cancel.changed() => false,
             _ = tokio::time::sleep(duration) => true,
+        }
+    }
+
+    /// List every object in chunks, publishing each chunk so large kinds
+    /// render progressively instead of waiting for one huge response.
+    /// Returns the resource version to watch from.
+    async fn list_progressively<K, F>(&mut self, api: &Api<K>, map: F) -> ListOutcome
+    where
+        K: Resource + Clone + Debug + DeserializeOwned + Send + 'static,
+        F: Fn(&K) -> Item + Copy,
+    {
+        let mut params = ListParams::default().limit(LIST_CHUNK_SIZE);
+        let mut resource_version = String::new();
+        let mut first_chunk = true;
+        loop {
+            let listed = tokio::select! {
+                _ = self.cancel.changed() => return ListOutcome::Cancelled,
+                result = retry::bounded(api.list(&params)) => result,
+            };
+            let chunk = match listed {
+                Ok(chunk) => chunk,
+                Err(failure) => return ListOutcome::Failed(failure),
+            };
+            // Every chunk carries the version of the same list snapshot.
+            if let Some(version) = chunk.metadata.resource_version {
+                resource_version = version;
+            }
+            if first_chunk {
+                self.store.reset(chunk.items.iter().map(map));
+                first_chunk = false;
+            } else {
+                for object in &chunk.items {
+                    self.store.upsert(map(object));
+                }
+            }
+            self.publish(SnapshotPhase::Ready);
+            match chunk.metadata.continue_ {
+                Some(token) if !token.is_empty() => {
+                    params = params.continue_token(&token);
+                }
+                _ => break,
+            }
+        }
+        ListOutcome::Listed(resource_version)
+    }
+
+    /// Poll instead of watching — because watch was denied (RBAC) or the user
+    /// prefers polling for this kind. Runs until the subscription is
+    /// cancelled, listing is denied, or the user switches back to watch mode.
+    /// `PollRate::Off` disables the timer; manual refresh still re-lists.
+    async fn poll_loop<K, F>(&mut self, api: &Api<K>, map: F) -> PollOutcome
+    where
+        K: Resource + Clone + Debug + DeserializeOwned + Send + 'static,
+        F: Fn(&K) -> Item + Copy,
+    {
+        self.mode = WatchMode::Poll(self.prefs.borrow().rate);
+        // Reflect the mode switch in the UI immediately, not after the first
+        // poll roundtrip.
+        if self.store.len() > 0 {
+            self.publish(SnapshotPhase::Ready);
+        }
+        let mut retry = Retry::new();
+
+        loop {
+            if self.cancel.has_changed().is_err() {
+                return PollOutcome::Stop;
+            }
+
+            match self.list_progressively(api, map).await {
+                ListOutcome::Listed(_) => {
+                    retry.list_succeeded();
+                }
+                ListOutcome::Cancelled => return PollOutcome::Stop,
+                ListOutcome::Failed(failure) => match failure.action(&mut retry) {
+                    RetryAction::Retry(delay) => {
+                        tracing::warn!(%failure, ?api, delay_ms = delay.as_millis() as u64, "repository: poll list failed, retrying");
+                        self.publish(SnapshotPhase::Error(format!("list failed: {failure}")));
+                        if !self.sleep(delay).await {
+                            return PollOutcome::Stop;
+                        }
+                        continue;
+                    }
+                    RetryAction::GiveUp => {
+                        tracing::error!(%failure, ?api, "repository: poll list rejected, stopping watch");
+                        self.publish(SnapshotPhase::Error(format!("list rejected: {failure}")));
+                        return PollOutcome::Stop;
+                    }
+                },
+            }
+
+            // Wait for the next tick. Refresh or a preference change re-list
+            // immediately; `Off` waits without a timer.
+            let rate = self.prefs.borrow().rate;
+            tokio::select! {
+                _ = self.cancel.changed() => return PollOutcome::Stop,
+                _ = self.refresh.changed() => {
+                    self.refresh.borrow_and_update();
+                }
+                _ = self.prefs.changed() => {
+                    let prefs = *self.prefs.borrow_and_update();
+                    self.mode = WatchMode::Poll(prefs.rate);
+                    if prefs.mode == WatchPreference::Watch {
+                        self.mode = WatchMode::Watch;
+                        self.publish(SnapshotPhase::Ready);
+                        return PollOutcome::ResumeWatch;
+                    }
+                    // Show the new rate/off state instantly; the re-list
+                    // happens on the next loop turn.
+                    self.publish(SnapshotPhase::Ready);
+                }
+                _ = async {
+                        match rate {
+                            PollRate::Every(secs) => {
+                                tokio::time::sleep(Duration::from_secs(secs)).await
+                            }
+                            PollRate::Off => std::future::pending().await,
+                        }
+                    } => {}
+            }
         }
     }
 }
@@ -902,4 +1167,21 @@ fn node_item(node: &Node) -> Item {
         .map(|info| info.kubelet_version.clone())
         .unwrap_or_default();
     item
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn watch_denied_registry_roundtrip() {
+        // Unique epoch so the process-global registry is not disturbed.
+        let epoch = u64::MAX;
+        assert!(!watch_denied(epoch, ResourceKind::Pods));
+        mark_watch_denied(epoch, ResourceKind::Pods);
+        assert!(watch_denied(epoch, ResourceKind::Pods));
+        assert!(!watch_denied(epoch, ResourceKind::Nodes));
+        clear_watch_denied(epoch, ResourceKind::Pods);
+        assert!(!watch_denied(epoch, ResourceKind::Pods));
+    }
 }

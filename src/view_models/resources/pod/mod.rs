@@ -17,7 +17,7 @@ use tokio::sync::watch;
 use crate::cluster::ClusterState;
 use crate::models::resources::pod::PodsModel;
 use crate::models::resources::pod::detail::{PodDetailState, PodDetailUpdate, UsageHistory};
-use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase};
+use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository;
 
 pub struct PodsViewModel {
@@ -101,6 +101,10 @@ impl PodsViewModel {
 
     pub fn phase(&self, cx: &App) -> SnapshotPhase {
         self.model.read(cx).phase().clone()
+    }
+
+    pub fn mode(&self, cx: &App) -> WatchMode {
+        self.model.read(cx).snapshot().mode()
     }
 
     pub fn item_count(&self, cx: &App) -> usize {

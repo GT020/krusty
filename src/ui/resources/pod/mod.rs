@@ -19,7 +19,7 @@ use gpui_kit::{
     Render, SharedString, Styled as _, Subscription, Window, div, px,
 };
 
-use crate::models::{NamespaceScope, SnapshotPhase};
+use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
 use crate::ui::resources::namespace_filter::{
     NamespaceFilter, NamespaceFilterEvent, render as render_namespace_filter,
 };
@@ -156,6 +156,7 @@ impl PodsView {
     fn header(&self, cx: &Context<Self>) -> impl IntoElement {
         let phase = self.vm.read(cx).phase(cx);
         let count = self.vm.read(cx).item_count(cx);
+        let mode = self.vm.read(cx).mode(cx);
 
         let status = match &phase {
             SnapshotPhase::Loading => div()
@@ -193,7 +194,8 @@ impl PodsView {
                             .child(SharedString::from("Pods")),
                     )
                     .child(render_namespace_filter(&self.namespace_filter, cx))
-                    .child(status),
+                    .child(status)
+                    .child(super::watch_mode::render(mode, ResourceKind::Pods, cx)),
             )
             .child(
                 Button::new("refresh-pods")
