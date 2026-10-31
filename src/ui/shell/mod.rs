@@ -11,6 +11,7 @@ use crate::models::{NamespaceScope, ResourceKind};
 use crate::ui::resources::list::ResourceListView;
 use crate::ui::resources::namespace_filter::NamespaceFilterEvent;
 use crate::ui::resources::node::NodesView;
+use crate::ui::resources::overview::OverviewView;
 use crate::ui::resources::pod::PodsView;
 use crate::ui::settings::custom_resources::CustomResourcesView;
 use crate::ui::settings::render_settings;
@@ -38,6 +39,7 @@ use std::collections::BTreeMap;
 /// One tab's retained view. The entity is created with the tab and dropped
 /// when the tab closes, so two tabs of the same kind have separate state.
 enum WorkspacePane {
+    Overview(Entity<OverviewView>),
     Pods(Entity<PodsView>),
     Nodes(Entity<NodesView>),
     List(Entity<ResourceListView>),
@@ -46,6 +48,7 @@ enum WorkspacePane {
 impl WorkspacePane {
     fn set_active(&self, active: bool, cx: &mut Context<Workspace>) {
         match self {
+            Self::Overview(view) => view.update(cx, |view, cx| view.set_active(active, cx)),
             Self::Pods(view) => view.update(cx, |view, cx| view.set_active(active, cx)),
             Self::Nodes(view) => view.update(cx, |view, cx| view.set_active(active, cx)),
             Self::List(view) => view.update(cx, |view, cx| view.set_active(active, cx)),
@@ -54,8 +57,8 @@ impl WorkspacePane {
 
     fn scope_label(&self, cx: &App) -> Option<String> {
         match self {
+            Self::Overview(_) | Self::Nodes(_) => None,
             Self::Pods(view) => Some(view.read(cx).scope_label(cx)),
-            Self::Nodes(_) => None,
             Self::List(view) => Some(view.read(cx).scope_label(cx)),
         }
     }
@@ -65,18 +68,18 @@ impl WorkspacePane {
         cx: &App,
     ) -> Option<Entity<crate::ui::resources::namespace_filter::NamespaceFilter>> {
         match self {
+            Self::Overview(_) | Self::Nodes(_) => None,
             Self::Pods(view) => Some(view.read(cx).namespace_filter().clone()),
-            Self::Nodes(_) => None,
             Self::List(view) => Some(view.read(cx).namespace_filter().clone()),
         }
     }
 
     fn set_scope(&self, scope: NamespaceScope, window: &mut Window, cx: &mut Context<Workspace>) {
         match self {
+            Self::Overview(_) | Self::Nodes(_) => {}
             Self::Pods(view) => view.update(cx, |view, cx| {
                 view.set_scope(scope, window, cx);
             }),
-            Self::Nodes(_) => {}
             Self::List(view) => view.update(cx, |view, cx| {
                 view.set_scope(scope, window, cx);
             }),
@@ -85,6 +88,7 @@ impl WorkspacePane {
 
     fn open_detail(&self, namespace: &str, name: &str, cx: &mut Context<Workspace>) {
         match self {
+            Self::Overview(_) => {}
             Self::Pods(view) => view.update(cx, |view, cx| {
                 view.open_detail(namespace.to_string(), name.to_string(), cx);
             }),
@@ -114,6 +118,7 @@ impl WorkspacePane {
 
     fn element(&self) -> AnyElement {
         match self {
+            Self::Overview(view) => view.clone().into_any_element(),
             Self::Pods(view) => view.clone().into_any_element(),
             Self::Nodes(view) => view.clone().into_any_element(),
             Self::List(view) => view.clone().into_any_element(),
@@ -263,7 +268,7 @@ impl Workspace {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let new_tab = new_tab && target != NavTarget::Settings;
+        let new_tab = new_tab && !target.is_singleton();
         let previous = self.shell.read(cx).active();
         let id = self.shell.update(cx, |shell, cx| {
             if new_tab {
@@ -452,6 +457,9 @@ impl Workspace {
             .or_insert(NamespaceScope::All)
             .clone();
         let pane = match tab.target() {
+            NavTarget::Overview => {
+                WorkspacePane::Overview(cx.new(|cx| OverviewView::new(window, cx)))
+            }
             NavTarget::Resource(ResourceKind::Pods) => {
                 WorkspacePane::Pods(cx.new(|cx| PodsView::new(scope, window, cx)))
             }
@@ -622,7 +630,7 @@ impl Workspace {
                 let new_tab_workspace = workspace.clone();
                 let color_workspace = workspace.clone();
                 let new_tab_label = format!("Open another {} tab", target.label());
-                let new_tab_button = (target != NavTarget::Settings).then(|| {
+                let new_tab_button = (!target.is_singleton()).then(|| {
                     Button::new("new-tab")
                         .ghost()
                         .small()
@@ -689,7 +697,7 @@ impl Workspace {
             NavTarget::Settings => {
                 render_settings(cx, self.custom_resources.clone()).into_any_element()
             }
-            NavTarget::Resource(_) => self
+            NavTarget::Overview | NavTarget::Resource(_) => self
                 .panes
                 .get(&id)
                 .map(WorkspacePane::element)

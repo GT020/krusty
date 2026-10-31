@@ -11,6 +11,8 @@ pub struct Item {
     pub capacity: String,
     pub status: String,
     pub version: String,
+    /// Node a pod is scheduled on. Empty for other resource kinds.
+    pub node: String,
     pub created_at: Option<i64>,
 }
 
@@ -26,6 +28,7 @@ impl Item {
             capacity: String::new(),
             status: String::new(),
             version: String::new(),
+            node: String::new(),
             created_at: None,
         }
     }

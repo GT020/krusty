@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::time::Duration;
 
 use k8s_openapi::api::core::v1::Node;
-use kube::api::{Api, DynamicObject};
+use kube::api::{Api, DynamicObject, ListParams};
 use kube::core::{ApiResource, GroupVersionKind};
 use kube::{Client, ResourceExt};
 use tokio::sync::{mpsc, watch};
@@ -48,6 +48,93 @@ impl Drop for NodeDetailSubscription {
     fn drop(&mut self) {
         let _ = self.cancel.send(true);
     }
+}
+
+/// Live cluster-wide NodeMetrics samples, refreshed on the metrics cadence.
+pub struct NodeMetricsSubscription {
+    updates: mpsc::UnboundedReceiver<Result<BTreeMap<String, NodeUsage>, String>>,
+    cancel: watch::Sender<bool>,
+}
+
+impl NodeMetricsSubscription {
+    pub async fn next(&mut self) -> Option<Result<BTreeMap<String, NodeUsage>, String>> {
+        self.updates.recv().await
+    }
+
+    pub fn cancel_handle(&self) -> watch::Sender<bool> {
+        self.cancel.clone()
+    }
+}
+
+impl Drop for NodeMetricsSubscription {
+    fn drop(&mut self) {
+        let _ = self.cancel.send(true);
+    }
+}
+
+/// Poll all node usage from metrics-server. A missing metrics API is reported
+/// through the stream so the overview can explain why usage is unavailable.
+pub fn subscribe_metrics(cx: &mut App) -> Result<NodeMetricsSubscription, String> {
+    let state = cx.global::<ClusterState>();
+    let client = state.client().ok_or_else(|| "not connected".to_string())?;
+    let tokio = state.tokio();
+    let (updates_tx, updates) = mpsc::unbounded_channel();
+    let (cancel, cancel_rx) = watch::channel(false);
+    tokio.spawn(watch_node_metrics(client, updates_tx, cancel_rx));
+    Ok(NodeMetricsSubscription { updates, cancel })
+}
+
+async fn watch_node_metrics(
+    client: Client,
+    updates: mpsc::UnboundedSender<Result<BTreeMap<String, NodeUsage>, String>>,
+    mut cancel: watch::Receiver<bool>,
+) {
+    loop {
+        let result = fetch_all_usage(&client).await;
+        if updates.send(result).is_err() {
+            return;
+        }
+        tokio::select! {
+            _ = cancel.changed() => return,
+            _ = tokio::time::sleep(METRICS_POLL_INTERVAL) => {}
+        }
+    }
+}
+
+async fn fetch_all_usage(client: &Client) -> Result<BTreeMap<String, NodeUsage>, String> {
+    let gvk = GroupVersionKind::gvk("metrics.k8s.io", "v1beta1", "NodeMetrics");
+    let resource = ApiResource::from_gvk(&gvk);
+    let api: Api<DynamicObject> = Api::all_with(client.clone(), &resource);
+    let list = api.list(&ListParams::default()).await.map_err(|error| {
+        format!("Node metrics are unavailable. Install metrics-server to see usage. ({error})")
+    })?;
+    let observed_at = jiff::Timestamp::now().as_second();
+    let mut usages = BTreeMap::new();
+    for metrics in list.items {
+        let name = metrics.name_any();
+        let usage = metrics.data.get("usage");
+        let cpu = usage
+            .and_then(|usage| usage.get("cpu"))
+            .and_then(|value| value.as_str())
+            .and_then(parse_quantity)
+            .map(|cores| (cores * 1000.0).round().max(0.0) as u64);
+        let memory = usage
+            .and_then(|usage| usage.get("memory"))
+            .and_then(|value| value.as_str())
+            .and_then(parse_quantity)
+            .map(|bytes| bytes.max(0.0).round() as u64);
+        usages.insert(
+            name,
+            NodeUsage {
+                observed_at,
+                cpu_used_millicores: cpu,
+                cpu_capacity_millicores: None,
+                memory_used_bytes: memory,
+                memory_capacity_bytes: None,
+            },
+        );
+    }
+    Ok(usages)
 }
 
 /// Start loading a node's full description and live usage samples.

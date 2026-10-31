@@ -30,7 +30,7 @@ fn nav_item(
                     workspace.select(target, false, window, cx);
                 });
             }));
-            if target == NavTarget::Settings {
+            if target.is_singleton() {
                 return menu;
             }
             menu.item(
@@ -50,12 +50,16 @@ pub fn render_sidebar(
 ) -> Sidebar<SidebarGroup<SidebarMenuItem>> {
     let groups = ResourceKind::nav_groups()
         .into_iter()
-        .map(|(label, kinds)| {
-            SidebarGroup::new(label).children(
-                kinds
-                    .into_iter()
-                    .map(|kind| nav_item(NavTarget::Resource(kind), selected, &entity)),
-            )
+        .enumerate()
+        .map(|(index, (label, kinds))| {
+            let mut items = kinds
+                .into_iter()
+                .map(|kind| nav_item(NavTarget::Resource(kind), selected, &entity))
+                .collect::<Vec<_>>();
+            if index == 0 {
+                items.insert(0, nav_item(NavTarget::Overview, selected, &entity));
+            }
+            SidebarGroup::new(label).children(items)
         })
         .chain(std::iter::once(
             SidebarGroup::new("Application").child(nav_item(

@@ -631,6 +631,11 @@ fn version_label(labels: Option<&std::collections::BTreeMap<String, String>>) ->
 
 fn pod_item(pod: &Pod) -> Item {
     let mut item = base_item(pod);
+    item.node = pod
+        .spec
+        .as_ref()
+        .and_then(|spec| spec.node_name.clone())
+        .unwrap_or_default();
     let statuses = pod
         .status
         .as_ref()

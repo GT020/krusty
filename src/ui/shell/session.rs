@@ -49,6 +49,7 @@ struct StoredTab {
 
 #[derive(Serialize, Deserialize)]
 enum StoredTarget {
+    Overview,
     Resource(String),
     Custom(CustomResourceDef),
     Settings,
@@ -57,6 +58,7 @@ enum StoredTarget {
 impl StoredTarget {
     fn from_nav(target: NavTarget) -> Option<Self> {
         match target {
+            NavTarget::Overview => Some(Self::Overview),
             NavTarget::Settings => Some(Self::Settings),
             NavTarget::Resource(ResourceKind::Custom(index)) => {
                 catalog::custom_def(index).map(|def| Self::Custom(def.clone()))
@@ -67,6 +69,7 @@ impl StoredTarget {
 
     fn to_nav(&self) -> Option<NavTarget> {
         match self {
+            Self::Overview => Some(NavTarget::Overview),
             Self::Settings => Some(NavTarget::Settings),
             Self::Resource(id) => ResourceKind::from_stable_id(id).map(NavTarget::Resource),
             Self::Custom(def) => catalog::custom_resource_entries()
@@ -216,6 +219,10 @@ mod tests {
     fn tabs_and_namespaces_round_trip() {
         let session = WorkspaceSession {
             tabs: vec![
+                SessionTab {
+                    target: NavTarget::Overview,
+                    scope: NamespaceScope::All,
+                },
                 SessionTab {
                     target: resource(ResourceKind::Pods),
                     scope: NamespaceScope::One("kube-system".to_string()),

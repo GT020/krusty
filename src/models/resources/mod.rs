@@ -19,6 +19,7 @@ pub mod leases;
 pub mod namespaces;
 pub mod network_policies;
 pub mod node;
+pub mod overview;
 pub mod persistent_volume_claims;
 pub mod persistent_volumes;
 pub mod pod;

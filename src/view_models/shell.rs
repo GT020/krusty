@@ -9,6 +9,7 @@ use gpui_kit::{App, Context, Hsla};
 /// Navigation targets shared by the shell and sidebar.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum NavTarget {
+    Overview,
     Resource(ResourceKind),
     Settings,
 }
@@ -16,6 +17,7 @@ pub enum NavTarget {
 impl NavTarget {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Overview => "Overview",
             Self::Resource(kind) => kind.label(),
             Self::Settings => "Settings",
         }
@@ -23,9 +25,15 @@ impl NavTarget {
 
     pub fn icon(self) -> IconName {
         match self {
+            Self::Overview => IconName::LayoutDashboard,
             Self::Resource(kind) => kind.icon(),
             Self::Settings => IconName::Settings,
         }
+    }
+
+    /// Whether this target is a singleton tab like Settings.
+    pub fn is_singleton(self) -> bool {
+        matches!(self, Self::Overview | Self::Settings)
     }
 }
 
