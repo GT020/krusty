@@ -4,10 +4,10 @@ pub mod resources;
 pub mod shell;
 
 pub use resources::{
-    ClusterRolesViewModel, ConfigMapsViewModel, CronJobsViewModel, CustomResourceViewModel,
-    DaemonSetsViewModel, DeploymentsViewModel, EndpointSlicesViewModel, EndpointsViewModel,
-    EventsViewModel, HorizontalPodAutoscalersViewModel, IngressesViewModel, JobsViewModel,
-    LeasesViewModel, NamespacesViewModel, NetworkPoliciesViewModel, NodesViewModel,
+    ClusterOverviewViewModel, ClusterRolesViewModel, ConfigMapsViewModel, CronJobsViewModel,
+    CustomResourceViewModel, DaemonSetsViewModel, DeploymentsViewModel, EndpointSlicesViewModel,
+    EndpointsViewModel, EventsViewModel, HorizontalPodAutoscalersViewModel, IngressesViewModel,
+    JobsViewModel, LeasesViewModel, NamespacesViewModel, NetworkPoliciesViewModel, NodesViewModel,
     PersistentVolumeClaimsViewModel, PersistentVolumesViewModel, PodDisruptionBudgetsViewModel,
     PodsViewModel, ReplicaSetsViewModel, ReplicationControllersViewModel, RoleBindingsViewModel,
     RolesViewModel, SecretsViewModel, ServiceAccountsViewModel, ServicesViewModel,

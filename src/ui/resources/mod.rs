@@ -17,6 +17,7 @@ pub mod list;
 pub mod namespace_filter;
 pub mod namespaces;
 pub mod node;
+pub mod overview;
 pub mod persistent_volume_claims;
 pub mod persistent_volumes;
 pub mod pod;
