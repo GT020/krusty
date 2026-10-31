@@ -25,15 +25,25 @@ impl PodLogsViewModel {
         namespace: String,
         name: String,
         containers: Vec<String>,
+        selected_container: Option<String>,
+        follow: bool,
         cx: &mut Context<Self>,
     ) -> Self {
-        let container = containers.first().cloned().unwrap_or_default();
+        let container = selected_container
+            .and_then(|selected| {
+                containers
+                    .iter()
+                    .find(|container| **container == selected)
+                    .cloned()
+            })
+            .or_else(|| containers.first().cloned())
+            .unwrap_or_default();
         let mut this = Self {
             namespace,
             name,
             containers,
             container,
-            follow: true,
+            follow,
             lines: Vec::new(),
             status: "Connecting…".to_string(),
             error: None,
@@ -42,6 +52,23 @@ impl PodLogsViewModel {
         };
         this.subscribe(cx);
         this
+    }
+
+    /// A log panel that could not start, used when the pod itself cannot be
+    /// read to discover its containers.
+    pub fn failed(namespace: String, name: String, error: String) -> Self {
+        Self {
+            namespace,
+            name,
+            containers: Vec::new(),
+            container: String::new(),
+            follow: false,
+            lines: Vec::new(),
+            status: "Unable to load pod containers".to_string(),
+            error: Some(error),
+            generation: 0,
+            cancel: None,
+        }
     }
 
     pub fn containers(&self) -> &[String] {

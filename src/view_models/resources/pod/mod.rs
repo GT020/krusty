@@ -168,6 +168,14 @@ impl PodsViewModel {
         });
     }
 
+    /// Open the detail pane for a pod by name, used by kubectl commands.
+    pub fn open_detail(&mut self, namespace: String, name: String, cx: &mut Context<Self>) {
+        if self.current_detail_identity(cx) == Some((namespace.clone(), name.clone())) {
+            return;
+        }
+        self.start_detail(namespace, name, cx);
+    }
+
     fn current_detail_identity(&self, cx: &App) -> Option<(String, String)> {
         self.model
             .read(cx)

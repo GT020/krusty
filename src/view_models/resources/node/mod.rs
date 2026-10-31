@@ -165,6 +165,14 @@ impl NodesViewModel {
         });
     }
 
+    /// Open the detail pane for a node by name, used by kubectl commands.
+    pub fn open_detail(&mut self, node: String, cx: &mut Context<Self>) {
+        if self.current_detail_node(cx).as_deref() == Some(node.as_str()) {
+            return;
+        }
+        self.start_detail(node, cx);
+    }
+
     fn current_detail_node(&self, cx: &App) -> Option<String> {
         self.model.read(cx).detail().node().map(str::to_string)
     }

@@ -45,25 +45,28 @@ impl PodLogsView {
     ) -> AnyElement {
         let menu_vm = vm.clone();
         let menu_container = container.clone();
-        let container_button = Button::new("pod-logs-container")
-            .ghost()
-            .small()
-            .label(container)
-            .icon(IconName::ChevronsUpDown)
-            .dropdown_menu(move |mut menu, _, _| {
-                for name in &containers {
-                    let selected = name == &menu_container;
-                    let value = name.clone();
-                    let vm = menu_vm.clone();
-                    menu = menu.item(PopupMenuItem::new(name.clone()).checked(selected).on_click(
-                        move |_, _, cx| {
-                            let value = value.clone();
-                            vm.update(cx, |vm, cx| vm.set_container(value, cx));
-                        },
-                    ));
-                }
-                menu
-            });
+        let container_button = (!containers.is_empty()).then(|| {
+            Button::new("pod-logs-container")
+                .ghost()
+                .small()
+                .label(container)
+                .icon(IconName::ChevronsUpDown)
+                .dropdown_menu(move |mut menu, _, _| {
+                    for name in &containers {
+                        let selected = name == &menu_container;
+                        let value = name.clone();
+                        let vm = menu_vm.clone();
+                        menu =
+                            menu.item(PopupMenuItem::new(name.clone()).checked(selected).on_click(
+                                move |_, _, cx| {
+                                    let value = value.clone();
+                                    vm.update(cx, |vm, cx| vm.set_container(value, cx));
+                                },
+                            ));
+                    }
+                    menu
+                })
+        });
 
         let follow_vm = vm.clone();
         let follow_button = Button::new("pod-logs-follow")
@@ -108,6 +111,18 @@ impl PodLogsView {
             ));
         }
 
+        let mut container_row = h_flex().gap_2().items_center();
+        if let Some(container_button) = container_button {
+            container_row = container_row
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("Container"),
+                )
+                .child(container_button);
+        }
+
         v_flex()
             .gap_2()
             .child(
@@ -115,18 +130,7 @@ impl PodLogsView {
                     .justify_between()
                     .gap_2()
                     .items_center()
-                    .child(
-                        h_flex()
-                            .gap_2()
-                            .items_center()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child("Container"),
-                            )
-                            .child(container_button),
-                    )
+                    .child(container_row)
                     .child(actions),
             )
             .child(status_row)

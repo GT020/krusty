@@ -67,6 +67,11 @@ const BUILTIN_KINDS: [ResourceKind; 28] = [
     ResourceKind::RoleBindings,
 ];
 
+/// All built-in resource kinds known to the application.
+pub fn builtin_kinds() -> &'static [ResourceKind] {
+    &BUILTIN_KINDS
+}
+
 impl ResourceKind {
     pub fn label(self) -> &'static str {
         match self {

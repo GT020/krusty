@@ -6,6 +6,7 @@ pub mod sidebar;
 pub mod status_bar;
 
 use crate::cluster::ClusterState;
+use crate::models::kubectl::{self, KubectlAction, KubectlCommand};
 use crate::models::{NamespaceScope, ResourceKind};
 use crate::ui::resources::list::ResourceListView;
 use crate::ui::resources::namespace_filter::NamespaceFilterEvent;
@@ -20,6 +21,7 @@ use crate::ui::shell::status_bar::render_status_bar;
 use crate::view_models::shell::{ShellViewModel, TabColor, TabId, TabInfo};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{
@@ -69,6 +71,47 @@ impl WorkspacePane {
         }
     }
 
+    fn set_scope(&self, scope: NamespaceScope, window: &mut Window, cx: &mut Context<Workspace>) {
+        match self {
+            Self::Pods(view) => view.update(cx, |view, cx| {
+                view.set_scope(scope, window, cx);
+            }),
+            Self::Nodes(_) => {}
+            Self::List(view) => view.update(cx, |view, cx| {
+                view.set_scope(scope, window, cx);
+            }),
+        }
+    }
+
+    fn open_detail(&self, namespace: &str, name: &str, cx: &mut Context<Workspace>) {
+        match self {
+            Self::Pods(view) => view.update(cx, |view, cx| {
+                view.open_detail(namespace.to_string(), name.to_string(), cx);
+            }),
+            Self::Nodes(view) => view.update(cx, |view, cx| {
+                view.open_detail(name.to_string(), cx);
+            }),
+            Self::List(view) => view.update(cx, |view, cx| {
+                view.open_detail(namespace.to_string(), name.to_string(), cx);
+            }),
+        }
+    }
+
+    fn open_logs(
+        &self,
+        namespace: String,
+        name: String,
+        container: Option<String>,
+        follow: bool,
+        cx: &mut Context<Workspace>,
+    ) {
+        if let Self::Pods(view) = self {
+            view.update(cx, |view, cx| {
+                view.open_logs_for_pod(namespace, name, container, follow, cx);
+            });
+        }
+    }
+
     fn element(&self) -> AnyElement {
         match self {
             Self::Pods(view) => view.clone().into_any_element(),
@@ -83,8 +126,11 @@ pub struct Workspace {
     panes: BTreeMap<TabId, WorkspacePane>,
     pane_subs: BTreeMap<TabId, Subscription>,
     tab_scopes: BTreeMap<TabId, NamespaceScope>,
+    command_input: Entity<InputState>,
+    command_error: Option<String>,
     custom_resources: Entity<CustomResourcesView>,
     _shell_subscription: Subscription,
+    _command_subscription: Subscription,
     _cluster_subscription: Subscription,
     _appearance_subscription: Subscription,
     _activation_subscription: Subscription,
@@ -134,6 +180,23 @@ impl Workspace {
             }
         });
         let preference_subscription = cx.observe_global::<AppearanceState>(|_, cx| cx.notify());
+        let command_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Paste a kubectl command, e.g. kubectl get pods -n default")
+        });
+        let command_subscription = cx.subscribe_in(
+            &command_input,
+            window,
+            |this, _, event: &InputEvent, window, cx| match event {
+                InputEvent::PressEnter { .. } => this.run_command(window, cx),
+                InputEvent::Change => {
+                    if this.command_error.take().is_some() {
+                        cx.notify();
+                    }
+                }
+                InputEvent::Focus | InputEvent::Blur => {}
+            },
+        );
         let custom_resources = cx.new(|_| CustomResourcesView::new());
         let custom_resources_subscription =
             cx.observe_global::<crate::ui::settings::custom_resources::CustomResourcesState>(
@@ -169,8 +232,11 @@ impl Workspace {
             panes: BTreeMap::new(),
             pane_subs: BTreeMap::new(),
             tab_scopes,
+            command_input,
+            command_error: None,
             custom_resources,
             _shell_subscription: shell_subscription,
+            _command_subscription: command_subscription,
             _cluster_subscription: cluster_subscription,
             _appearance_subscription: appearance_subscription,
             _activation_subscription: activation_subscription,
@@ -265,6 +331,111 @@ impl Workspace {
         {
             tracing::info!(id = id.get(), locked, "ui: tab lock changed");
         }
+    }
+
+    /// Parse and run the command currently in the top-bar input.
+    fn run_command(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = self.command_input.read(cx).value().to_string();
+        if input.trim().is_empty() {
+            return;
+        }
+        match kubectl::parse(&input) {
+            Ok(command) => {
+                self.command_error = None;
+                self.command_input
+                    .update(cx, |input, cx| input.set_value("", window, cx));
+                self.execute_command(command, window, cx);
+            }
+            Err(error) => {
+                self.command_error = Some(error);
+                cx.notify();
+            }
+        }
+    }
+
+    /// Turn a parsed command into a tab, detail pane, or log panel.
+    fn execute_command(
+        &mut self,
+        command: KubectlCommand,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let KubectlCommand { action, namespace } = command;
+        let (kind, scope) = match &action {
+            KubectlAction::Get { kind, .. } | KubectlAction::Describe { kind, .. } => {
+                (*kind, namespace.clone())
+            }
+            KubectlAction::Logs { .. } => (ResourceKind::Pods, namespace.clone()),
+        };
+        let scope = if kind.is_namespaced() {
+            scope
+        } else {
+            NamespaceScope::All
+        };
+        tracing::info!(?action, ?scope, "ui: kubectl command");
+        let Some(id) = self.open_resource_target(NavTarget::Resource(kind), scope, window, cx)
+        else {
+            return;
+        };
+        let detail_namespace = if kind.is_namespaced() {
+            namespace.namespace().unwrap_or("default").to_string()
+        } else {
+            String::new()
+        };
+        match action {
+            KubectlAction::Get { .. } => {}
+            KubectlAction::Describe { name, .. } => {
+                if let Some(pane) = self.panes.get(&id) {
+                    pane.open_detail(&detail_namespace, &name, cx);
+                }
+            }
+            KubectlAction::Logs {
+                pod,
+                container,
+                follow,
+            } => {
+                if let Some(pane) = self.panes.get(&id) {
+                    pane.open_logs(detail_namespace, pod, container, follow, cx);
+                }
+            }
+        }
+    }
+
+    /// Focus or open the tab for a resource and switch it to `scope`.
+    fn open_resource_target(
+        &mut self,
+        target: NavTarget,
+        scope: NamespaceScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<TabId> {
+        let NavTarget::Resource(kind) = target else {
+            return None;
+        };
+        let scope = if kind.is_namespaced() {
+            scope
+        } else {
+            NamespaceScope::All
+        };
+        let previous = self.shell.read(cx).active();
+        let id = self
+            .shell
+            .update(cx, |shell, cx| shell.focus_or_open(target, cx));
+        self.tab_scopes.insert(id, scope.clone());
+        if let Some(pane) = self.panes.get(&id) {
+            pane.set_scope(scope, window, cx);
+        } else {
+            self.ensure_pane(id, window, cx);
+        }
+        if previous != Some(id) {
+            if let Some(previous) = previous {
+                self.deactivate(previous, cx);
+            }
+            self.activate(id, cx);
+        }
+        self.save_session(cx);
+        cx.notify();
+        Some(id)
     }
 
     /// Create the view for an open tab when it does not exist yet.
@@ -652,6 +823,7 @@ impl Render for Workspace {
             .child(
                 TitleBar::new().child(
                     h_flex()
+                        .w_full()
                         .gap_2()
                         .items_center()
                         .child(
@@ -660,7 +832,33 @@ impl Render for Workspace {
                                 .text_color(cx.theme().muted_foreground)
                                 .child("krusty"),
                         )
-                        .child(render_context_selector(cx, &self.shell)),
+                        .child(render_context_selector(cx, &self.shell))
+                        .child(
+                            h_flex().flex_1().min_w_0().justify_center().px_6().child(
+                                div().w_full().max_w(px(520.)).child(
+                                    Input::new(&self.command_input)
+                                        .small()
+                                        .cleanable(true)
+                                        .prefix(
+                                            Icon::new(IconName::Terminal)
+                                                .small()
+                                                .text_color(cx.theme().muted_foreground),
+                                        )
+                                        .aria_label("kubectl command"),
+                                ),
+                            ),
+                        )
+                        .when_some(self.command_error.clone(), |this, error| {
+                            this.child(
+                                div()
+                                    .max_w(px(260.))
+                                    .overflow_hidden()
+                                    .whitespace_nowrap()
+                                    .text_xs()
+                                    .text_color(cx.theme().danger)
+                                    .child(error),
+                            )
+                        }),
                 ),
             )
             .child(
