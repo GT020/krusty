@@ -17,6 +17,8 @@ krusty is a fast, native desktop UI for everyday Kubernetes work:
   [metrics-server](https://github.com/kubernetes-sigs/metrics-server) is
   available.
 - Cluster context switching from the title bar with per-tab namespace filtering.
+- Split the editor into two side-by-side groups, each with its own tabs and
+  namespace filter, for live comparisons.
 - Multiple kubeconfigs managed inside the app, including pasted credentials.
 - Light, dark, and system themes.
 - Responsive layouts that keep the list and detail panes side by side on wide

@@ -1,5 +1,7 @@
-//! Tabbed workspace shell: every tab owns its view model and namespace filter.
+//! Tabbed workspace shell: up to two side-by-side editor groups, each with its
+//! own tabs, active tab, namespace scope, and live view.
 
+pub mod commands;
 pub mod nav;
 pub mod session;
 pub mod sidebar;
@@ -16,25 +18,37 @@ use crate::ui::resources::pod::PodsView;
 use crate::ui::settings::custom_resources::CustomResourcesView;
 use crate::ui::settings::render_settings;
 use crate::ui::settings::theme::{self, AppearanceState};
+use crate::ui::shell::commands::{FocusNextGroup, MoveTabToOtherGroup, SplitRight, Unsplit};
 use crate::ui::shell::nav::NavTarget;
 use crate::ui::shell::sidebar::render_sidebar;
 use crate::ui::shell::status_bar::render_status_bar;
-use crate::view_models::shell::{ShellViewModel, TabColor, TabId, TabInfo};
+use crate::view_models::shell::{
+    CloseOutcome, PaneId, PaneInfo, ShellViewModel, TabColor, TabId, TabInfo,
+};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
+use gpui_kit::component::resizable::{
+    ResizablePanelEvent, ResizableState, h_resizable, resizable_panel,
+};
 use gpui_kit::component::tab::{Tab, TabBar};
 use gpui_kit::component::{
-    ActiveTheme, Icon, Sizable as _, TitleBar,
+    ActiveTheme, Disableable as _, Icon, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, Entity, FontWeight, IntoElement, ParentElement as _,
-    Render, SharedString, Styled as _, Subscription, Window, div, px,
+    AnyElement, AnyWindowHandle, App, AppContext as _, Context, Entity, FontWeight,
+    InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render,
+    SharedString, Styled as _, Subscription, Window, div, px,
 };
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+const MIN_SPLIT_VIEWPORT_WIDTH: f32 = 1080.;
+const PANE_MIN_WIDTH: Pixels = px(360.);
+const SPLIT_MIN_FRACTION: f32 = 0.2;
+const SPLIT_MAX_FRACTION: f32 = 0.8;
 
 /// One tab's retained view. The entity is created with the tab and dropped
 /// when the tab closes, so two tabs of the same kind have separate state.
@@ -52,6 +66,15 @@ impl WorkspacePane {
             Self::Pods(view) => view.update(cx, |view, cx| view.set_active(active, cx)),
             Self::Nodes(view) => view.update(cx, |view, cx| view.set_active(active, cx)),
             Self::List(view) => view.update(cx, |view, cx| view.set_active(active, cx)),
+        }
+    }
+
+    fn set_width_share(&self, share: f32, cx: &mut Context<Workspace>) {
+        match self {
+            Self::Pods(view) => view.update(cx, |view, cx| view.set_width_share(share, cx)),
+            Self::Nodes(view) => view.update(cx, |view, cx| view.set_width_share(share, cx)),
+            Self::List(view) => view.update(cx, |view, cx| view.set_width_share(share, cx)),
+            Self::Overview(_) => {}
         }
     }
 
@@ -131,6 +154,10 @@ pub struct Workspace {
     panes: BTreeMap<TabId, WorkspacePane>,
     pane_subs: BTreeMap<TabId, Subscription>,
     tab_scopes: BTreeMap<TabId, NamespaceScope>,
+    split_state: Entity<ResizableState>,
+    split_fraction: f32,
+    pending_split_restore: bool,
+    window_handle: AnyWindowHandle,
     command_input: Entity<InputState>,
     command_error: Option<String>,
     custom_resources: Entity<CustomResourcesView>,
@@ -141,39 +168,47 @@ pub struct Workspace {
     _activation_subscription: Subscription,
     _preference_subscription: Subscription,
     _custom_resources_subscription: Subscription,
+    _split_subscription: Subscription,
 }
 
 impl Workspace {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let started = std::time::Instant::now();
         tracing::info!("ui: workspace construction start");
-        let restored = session::load();
-        let (shell, scopes) = if restored.tabs.is_empty() {
-            (cx.new(ShellViewModel::new), vec![NamespaceScope::All])
+        let session::WorkspaceSession {
+            panes: restored_panes,
+            focused: restored_focused,
+            split: restored_split,
+        } = session::load();
+        let split_fraction = restored_split
+            .map(|value| value.clamp(SPLIT_MIN_FRACTION, SPLIT_MAX_FRACTION))
+            .unwrap_or(0.5);
+
+        let shell = if restored_panes.is_empty() {
+            cx.new(ShellViewModel::new)
         } else {
-            let targets = restored
-                .tabs
+            let targets = restored_panes
                 .iter()
-                .map(|tab| tab.target)
+                .map(|pane| {
+                    (
+                        pane.tabs.iter().map(|tab| tab.target).collect::<Vec<_>>(),
+                        pane.active,
+                    )
+                })
                 .collect::<Vec<_>>();
-            let scopes = restored
-                .tabs
-                .iter()
-                .map(|tab| tab.scope.clone())
-                .collect::<Vec<_>>();
-            let active = restored.active.unwrap_or(0).min(targets.len() - 1);
-            (
-                cx.new(|cx| ShellViewModel::with_tabs(targets, active, cx)),
-                scopes,
-            )
+            let focused = restored_focused.unwrap_or(0);
+            cx.new(|cx| ShellViewModel::from_session(targets, focused, cx))
         };
-        let tab_scopes = shell
-            .read(cx)
-            .tabs()
-            .iter()
-            .map(|tab| tab.id())
-            .zip(scopes)
-            .collect::<BTreeMap<_, _>>();
+
+        // Restore each tab's namespace scope alongside the shell's tab ids.
+        let mut tab_scopes = BTreeMap::new();
+        let shell_panes = shell.read(cx).panes();
+        for (session_pane, pane) in restored_panes.iter().zip(shell_panes.iter()) {
+            for (session_tab, tab) in session_pane.tabs.iter().zip(pane.tabs().iter()) {
+                tab_scopes.insert(tab.id(), session_tab.scope.clone());
+            }
+        }
+
         let shell_subscription = cx.observe(&shell, |_, _, cx| cx.notify());
         let cluster_subscription = cx.observe_global::<ClusterState>(|_, cx| cx.notify());
         let appearance_subscription = cx.observe_window_appearance(window, |_, window, cx| {
@@ -209,34 +244,58 @@ impl Workspace {
                     let removed = this
                         .shell
                         .read(cx)
-                        .tabs()
-                        .iter()
-                        .filter(|tab| {
+                        .all_tabs()
+                        .into_iter()
+                        .filter(|(_, tab)| {
                             matches!(
                                 tab.target(),
                                 NavTarget::Resource(ResourceKind::Custom(index))
                                     if crate::models::resources::catalog::custom_def(index).is_none()
                             )
                         })
-                        .map(|tab| tab.id())
+                        .map(|(_, tab)| tab.id())
                         .collect::<Vec<_>>();
+                    let window_handle = this.window_handle;
+                    let workspace = cx.weak_entity();
                     for id in removed {
                         // A deleted definition cannot stay usable, so its tab
                         // closes even when the user protected it from closing.
                         this.shell.update(cx, |shell, cx| {
                             _ = shell.set_locked(id, false, cx);
                         });
-                        this.close_tab(id, cx);
+                        let workspace = workspace.clone();
+                        _ = window_handle.update(cx, move |_, window, cx| {
+                            window.defer(cx, move |window, cx| {
+                                if let Some(workspace) = workspace.upgrade() {
+                                    workspace.update(cx, |this, cx| {
+                                        this.close_tab(id, window, cx);
+                                    });
+                                }
+                            });
+                        });
                     }
                     cx.notify();
                 },
             );
 
+        let split_state = cx.new(|_| ResizableState::default());
+        let split_subscription =
+            cx.subscribe(&split_state, |this, _, event: &ResizablePanelEvent, cx| {
+                if matches!(event, ResizablePanelEvent::Resized) {
+                    this.split_resized(cx);
+                }
+            });
+
+        let pending_split_restore = shell.read(cx).is_split();
         let mut this = Self {
             shell,
             panes: BTreeMap::new(),
             pane_subs: BTreeMap::new(),
             tab_scopes,
+            split_state,
+            split_fraction,
+            pending_split_restore,
+            window_handle: window.window_handle(),
             command_input,
             command_error: None,
             custom_resources,
@@ -247,10 +306,11 @@ impl Workspace {
             _activation_subscription: activation_subscription,
             _preference_subscription: preference_subscription,
             _custom_resources_subscription: custom_resources_subscription,
+            _split_subscription: split_subscription,
         };
-        if let Some(id) = this.shell.read(cx).active() {
-            this.ensure_pane(id, window, cx);
-        }
+        this.ensure_active_panes(window, cx);
+        this.sync_visibility(cx);
+        this.sync_width_shares(cx);
 
         tracing::info!(
             elapsed_ms = started.elapsed().as_millis() as u64,
@@ -259,8 +319,9 @@ impl Workspace {
         this
     }
 
-    /// Focus the target's existing tab, or open a new one. `new_tab` always
-    /// opens another tab, even when the same resource is already visible.
+    /// Focus the target's existing tab in the focused group, or open a new one.
+    /// `new_tab` always opens another tab, even when the same resource is
+    /// already visible.
     pub fn select(
         &mut self,
         target: NavTarget,
@@ -269,7 +330,6 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) {
         let new_tab = new_tab && !target.is_singleton();
-        let previous = self.shell.read(cx).active();
         let id = self.shell.update(cx, |shell, cx| {
             if new_tab {
                 shell.open_new(target, cx)
@@ -277,45 +337,111 @@ impl Workspace {
                 shell.focus_or_open(target, cx)
             }
         });
-        if previous == Some(id) {
-            return;
+        tracing::info!(to = ?id, kind = ?target, new_tab, "ui: open tab");
+        self.finish_open(id, window, cx);
+    }
+
+    /// Open a target in the other editor group, creating it when needed.
+    pub fn open_to_side(&mut self, target: NavTarget, window: &mut Window, cx: &mut Context<Self>) {
+        let was_split = self.shell.read(cx).is_split();
+        let id = self
+            .shell
+            .update(cx, |shell, cx| shell.open_to_side(target, cx));
+        if !was_split && self.shell.read(cx).is_split() {
+            self.pending_split_restore = true;
         }
-        tracing::info!(from = ?previous, to = ?id, kind = ?target, new_tab, "ui: open tab");
-        if let Some(previous) = previous {
-            self.deactivate(previous, cx);
-        }
+        tracing::info!(to = ?id, kind = ?target, "ui: open tab to the side");
+        self.finish_open(id, window, cx);
+    }
+
+    fn finish_open(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         self.ensure_pane(id, window, cx);
-        self.activate(id, cx);
+        self.sync_visibility(cx);
+        self.sync_width_shares(cx);
         self.save_session(cx);
         cx.notify();
     }
 
     fn focus_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
-        let previous = self.shell.read(cx).active();
         if !self.shell.update(cx, |shell, cx| shell.activate(id, cx)) {
             return;
         }
-        if let Some(previous) = previous {
-            self.deactivate(previous, cx);
-        }
         self.ensure_pane(id, window, cx);
-        self.activate(id, cx);
+        self.sync_visibility(cx);
+        self.apply_width_share(id, cx);
         self.save_session(cx);
         cx.notify();
     }
 
-    fn close_tab(&mut self, id: TabId, cx: &mut Context<Self>) {
-        let was_active = self.shell.update(cx, |shell, cx| shell.close(id, cx));
-        if self.shell.read(cx).tab(id).is_some() {
+    fn focus_pane(&mut self, id: PaneId, cx: &mut Context<Self>) {
+        if self.shell.update(cx, |shell, cx| shell.focus_pane(id, cx)) {
+            self.save_session(cx);
+        }
+    }
+
+    fn close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        let outcome = self.shell.update(cx, |shell, cx| shell.close(id, cx));
+        if !matches!(outcome, CloseOutcome::Closed | CloseOutcome::PaneCollapsed) {
             return;
         }
-        tracing::info!(id = id.get(), active = was_active, "ui: close tab");
+        tracing::info!(id = id.get(), ?outcome, "ui: close tab");
         self.panes.remove(&id);
         self.pane_subs.remove(&id);
         self.tab_scopes.remove(&id);
-        if was_active && let Some(active) = self.shell.read(cx).active() {
-            self.activate(active, cx);
+        self.ensure_active_panes(window, cx);
+        self.sync_visibility(cx);
+        self.sync_width_shares(cx);
+        self.save_session(cx);
+        cx.notify();
+    }
+
+    fn split_active(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let source_scope = self
+            .shell
+            .read(cx)
+            .active()
+            .and_then(|id| self.tab_scopes.get(&id).cloned());
+        let Some(id) = self
+            .shell
+            .update(cx, |shell, cx| shell.split_with_active(cx))
+        else {
+            return;
+        };
+        self.tab_scopes
+            .insert(id, source_scope.unwrap_or(NamespaceScope::All));
+        tracing::info!(id = id.get(), "ui: split editor");
+        self.ensure_pane(id, window, cx);
+        self.sync_visibility(cx);
+        self.sync_width_shares(cx);
+        self.pending_split_restore = true;
+        self.save_session(cx);
+        cx.notify();
+    }
+
+    fn unsplit(&mut self, cx: &mut Context<Self>) {
+        if !self.shell.update(cx, |shell, cx| shell.unsplit(cx)) {
+            return;
         }
+        tracing::info!("ui: unsplit editor");
+        self.pending_split_restore = false;
+        self.sync_visibility(cx);
+        self.sync_width_shares(cx);
+        self.save_session(cx);
+        cx.notify();
+    }
+
+    fn move_tab_to_other(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        if self
+            .shell
+            .update(cx, |shell, cx| shell.move_tab_to_other_pane(id, cx))
+            .is_none()
+        {
+            return;
+        }
+        tracing::info!(id = id.get(), "ui: move tab to the other group");
+        self.ensure_active_panes(window, cx);
+        self.sync_visibility(cx);
+        self.sync_width_shares(cx);
         self.save_session(cx);
         cx.notify();
     }
@@ -422,7 +548,6 @@ impl Workspace {
         } else {
             NamespaceScope::All
         };
-        let previous = self.shell.read(cx).active();
         let id = self
             .shell
             .update(cx, |shell, cx| shell.focus_or_open(target, cx));
@@ -432,12 +557,8 @@ impl Workspace {
         } else {
             self.ensure_pane(id, window, cx);
         }
-        if previous != Some(id) {
-            if let Some(previous) = previous {
-                self.deactivate(previous, cx);
-            }
-            self.activate(id, cx);
-        }
+        self.sync_visibility(cx);
+        self.sync_width_shares(cx);
         self.save_session(cx);
         cx.notify();
         Some(id)
@@ -485,66 +606,145 @@ impl Workspace {
         self.panes.insert(id, pane);
     }
 
-    /// Persist the open tabs, the active tab, and each tab's namespace scope.
+    fn ensure_active_panes(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let ids = self
+            .shell
+            .read(cx)
+            .panes()
+            .iter()
+            .filter_map(PaneInfo::active)
+            .collect::<Vec<_>>();
+        for id in ids {
+            self.ensure_pane(id, window, cx);
+        }
+    }
+
+    /// Only the active tab of each visible group is live. Hidden tabs keep
+    /// their retained views but stop receiving watch updates until shown again.
+    fn sync_visibility(&mut self, cx: &mut Context<Self>) {
+        let visible = self
+            .shell
+            .read(cx)
+            .panes()
+            .iter()
+            .filter_map(PaneInfo::active)
+            .collect::<BTreeSet<_>>();
+        for (id, pane) in &self.panes {
+            pane.set_active(visible.contains(id), cx);
+        }
+    }
+
+    fn share_for_pane(&self, pane: PaneId, cx: &App) -> f32 {
+        let shell = self.shell.read(cx);
+        if !shell.is_split() {
+            return 1.0;
+        }
+        match shell.panes().iter().position(|info| info.id() == pane) {
+            Some(0) => self.split_fraction,
+            Some(_) => (1.0 - self.split_fraction).max(SPLIT_MIN_FRACTION),
+            None => 1.0,
+        }
+    }
+
+    fn apply_width_share(&mut self, id: TabId, cx: &mut Context<Self>) {
+        let Some(pane) = self.shell.read(cx).pane_of(id) else {
+            return;
+        };
+        let share = self.share_for_pane(pane, cx);
+        if let Some(view) = self.panes.get(&id) {
+            view.set_width_share(share, cx);
+        }
+    }
+
+    fn sync_width_shares(&mut self, cx: &mut Context<Self>) {
+        let active = self
+            .shell
+            .read(cx)
+            .panes()
+            .iter()
+            .filter_map(|pane| pane.active().map(|id| (id, pane.id())))
+            .collect::<Vec<_>>();
+        for (id, pane) in active {
+            let share = self.share_for_pane(pane, cx);
+            if let Some(view) = self.panes.get(&id) {
+                view.set_width_share(share, cx);
+            }
+        }
+    }
+
+    fn split_resized(&mut self, cx: &mut Context<Self>) {
+        let sizes = self.split_state.read(cx).sizes().clone();
+        if sizes.len() != 2 {
+            return;
+        }
+        let total = sizes[0] + sizes[1];
+        if total <= px(0.) {
+            return;
+        }
+        let fraction = (sizes[0] / total).clamp(SPLIT_MIN_FRACTION, SPLIT_MAX_FRACTION);
+        if (fraction - self.split_fraction).abs() > 0.001 {
+            self.split_fraction = fraction;
+            self.sync_width_shares(cx);
+            self.save_session(cx);
+            cx.notify();
+        }
+    }
+
+    /// Persist the open groups, their active tabs, focus, scopes, and ratio.
     fn save_session(&self, cx: &App) {
         let shell = self.shell.read(cx);
-        let active = shell
-            .active()
-            .and_then(|id| shell.tabs().iter().position(|tab| tab.id() == id));
-        let tabs = shell
-            .tabs()
+        let panes = shell
+            .panes()
             .iter()
-            .map(|tab| session::SessionTab {
-                target: tab.target(),
-                scope: self
-                    .tab_scopes
-                    .get(&tab.id())
-                    .cloned()
-                    .unwrap_or(NamespaceScope::All),
+            .map(|pane| session::SessionPane {
+                tabs: pane
+                    .tabs()
+                    .iter()
+                    .map(|tab| session::SessionTab {
+                        target: tab.target(),
+                        scope: self
+                            .tab_scopes
+                            .get(&tab.id())
+                            .cloned()
+                            .unwrap_or(NamespaceScope::All),
+                    })
+                    .collect(),
+                active: pane
+                    .active()
+                    .and_then(|id| pane.tabs().iter().position(|tab| tab.id() == id)),
             })
             .collect::<Vec<_>>();
-        session::save(&session::WorkspaceSession { tabs, active });
+        let focused = shell
+            .focused_pane()
+            .and_then(|id| shell.panes().iter().position(|pane| pane.id() == id));
+        let split = shell.is_split().then_some(self.split_fraction);
+        session::save(&session::WorkspaceSession {
+            panes,
+            focused,
+            split,
+        });
     }
 
-    fn activate(&mut self, id: TabId, cx: &mut Context<Self>) {
-        if let Some(pane) = self.panes.get(&id) {
-            pane.set_active(true, cx);
-        }
-    }
-
-    /// Stop notifying an inactive view. Its state is kept so switching back to
-    /// the tab restores the list, scroll position, and open detail.
-    fn deactivate(&mut self, id: TabId, cx: &mut Context<Self>) {
-        if let Some(pane) = self.panes.get(&id) {
-            pane.set_active(false, cx);
-        }
-    }
-
-    fn tab_bar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        let (tabs, active) = {
-            let shell = self.shell.read(cx);
-            (shell.tabs().to_vec(), shell.active())
-        };
-        let active_color = active
-            .and_then(|id| tabs.iter().find(|tab| tab.id() == id))
-            .and_then(|tab| tab.color());
+    fn tab_bar(&self, pane: PaneInfo, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let pane_id = pane.id();
+        let tabs = pane.tabs().to_vec();
+        let active = pane.active();
+        let focused_pane = self.shell.read(cx).focused_pane() == Some(pane_id);
         let selected_index = active
             .and_then(|id| tabs.iter().position(|tab| tab.id() == id))
             .unwrap_or(0);
         let workspace = cx.entity();
+        let is_split = self.shell.read(cx).is_split();
 
-        let mut bar = TabBar::new("workspace-tabs")
+        let mut bar = TabBar::new(("workspace-tabs", pane_id.get()))
             .small()
             .menu(true)
             .max_width(px(240.))
             .selected_index(selected_index)
-            .on_click(cx.listener(|this, index, window, cx| {
-                let id = this
-                    .shell
-                    .read(cx)
-                    .tabs()
-                    .get(*index)
-                    .map(|tab: &TabInfo| tab.id());
+            .on_click(cx.listener(move |this, index, window, cx| {
+                let pane = this.shell.read(cx).pane(pane_id);
+                let id =
+                    pane.and_then(|pane| pane.tabs().get(*index).map(|tab: &TabInfo| tab.id()));
                 if let Some(id) = id {
                     this.focus_tab(id, window, cx);
                 }
@@ -594,9 +794,9 @@ impl Workspace {
                     .icon(IconName::Close)
                     .tooltip("Close tab")
                     .accessibility_label(format!("Close {} tab", tab_label))
-                    .on_click(move |_, _, cx| {
+                    .on_click(move |_, window, cx| {
                         cx.stop_propagation();
-                        close_workspace.update(cx, |this, cx| this.close_tab(id, cx));
+                        close_workspace.update(cx, |this, cx| this.close_tab(id, window, cx));
                     })
             });
             bar = bar.child(
@@ -620,49 +820,109 @@ impl Workspace {
             );
         }
 
-        let tab_actions =
-            active.map(|id| {
-                let target = tabs
-                    .iter()
-                    .find(|tab| tab.id() == id)
-                    .map(|tab| tab.target())
-                    .unwrap_or(NavTarget::Settings);
-                let new_tab_workspace = workspace.clone();
-                let color_workspace = workspace.clone();
-                let new_tab_label = format!("Open another {} tab", target.label());
-                let new_tab_button = (!target.is_singleton()).then(|| {
-                    Button::new("new-tab")
+        let tab_actions = active.map(|id| {
+            let target = tabs
+                .iter()
+                .find(|tab| tab.id() == id)
+                .map(|tab| tab.target())
+                .unwrap_or(NavTarget::Settings);
+            let new_tab_workspace = workspace.clone();
+            let color_workspace = workspace.clone();
+            let move_workspace = workspace.clone();
+            let split_workspace = workspace.clone();
+            let new_tab_label = format!("Open another {} tab", target.label());
+            let new_tab_button = (!target.is_singleton()).then(|| {
+                Button::new(SharedString::from(format!("new-tab-{}", pane_id.get())))
+                    .ghost()
+                    .small()
+                    .icon(IconName::Plus)
+                    .tooltip(new_tab_label.clone())
+                    .accessibility_label(new_tab_label)
+                    .on_click(move |_, window, cx| {
+                        new_tab_workspace.update(cx, |this, cx| {
+                            let id = this
+                                .shell
+                                .update(cx, |shell, cx| shell.open_in(pane_id, target, true, cx));
+                            if let Some(id) = id {
+                                this.finish_open(id, window, cx);
+                            }
+                        });
+                    })
+            });
+            let move_button = (is_split && !target.is_singleton()).then(|| {
+                Button::new(SharedString::from(format!("move-tab-{}", pane_id.get())))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ArrowRightLeft)
+                    .tooltip("Move tab to the other group")
+                    .accessibility_label("Move tab to the other group")
+                    .on_click(move |_, window, cx| {
+                        move_workspace.update(cx, |this, cx| {
+                            this.move_tab_to_other(id, window, cx);
+                        });
+                    })
+            });
+            let split_button = if is_split {
+                Button::new(SharedString::from(format!("unsplit-{}", pane_id.get())))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::PanelRightClose)
+                    .tooltip("Unsplit editor groups")
+                    .accessibility_label("Unsplit editor groups")
+                    .on_click(move |_, _window, cx| {
+                        split_workspace.update(cx, |this, cx| {
+                            this.unsplit(cx);
+                        });
+                    })
+            } else {
+                let can_split = !target.is_singleton()
+                    && window.viewport_size().width.as_f32() >= MIN_SPLIT_VIEWPORT_WIDTH;
+                Button::new(SharedString::from(format!("split-{}", pane_id.get())))
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::PanelRight)
+                    .tooltip("Split editor right")
+                    .accessibility_label("Split editor right")
+                    .disabled(!can_split)
+                    .on_click(move |_, window, cx| {
+                        split_workspace.update(cx, |this, cx| {
+                            this.split_active(window, cx);
+                        });
+                    })
+            };
+
+            h_flex()
+                .gap_1()
+                .when_some(new_tab_button, |this, button| this.child(button))
+                .when_some(move_button, |this, button| this.child(button))
+                .child(
+                    Button::new(SharedString::from(format!("tab-color-{}", pane_id.get())))
                         .ghost()
                         .small()
-                        .icon(IconName::Plus)
-                        .tooltip(new_tab_label.clone())
-                        .accessibility_label(new_tab_label)
-                        .on_click(move |_, window, cx| {
-                            new_tab_workspace.update(cx, |this, cx| {
-                                this.select(target, true, window, cx);
-                            });
-                        })
-                });
-                h_flex()
-                    .gap_1()
-                    .when_some(new_tab_button, |this, button| this.child(button))
-                    .child(
-                        Button::new("tab-color")
-                            .ghost()
-                            .small()
-                            .icon(Icon::new(IconName::Palette).when_some(
-                                active_color.map(|color| color.color(cx)),
+                        .icon(
+                            Icon::new(IconName::Palette).when_some(
+                                active
+                                    .and_then(|id| tabs.iter().find(|tab| tab.id() == id))
+                                    .and_then(|tab| tab.color())
+                                    .map(|color| color.color(cx)),
                                 |this, color| this.text_color(color),
-                            ))
-                            .tooltip("Tab color")
-                            .accessibility_label("Tab color")
-                            .dropdown_menu(move |menu, _, cx| {
-                                tab_color_menu(menu, id, active_color, color_workspace.clone(), cx)
-                            }),
-                    )
-            });
+                            ),
+                        )
+                        .tooltip("Tab color")
+                        .accessibility_label("Tab color")
+                        .dropdown_menu(move |menu, _, cx| {
+                            let current = active
+                                .and_then(|id| tabs.iter().find(|tab| tab.id() == id))
+                                .and_then(|tab| tab.color());
+                            tab_color_menu(menu, id, current, color_workspace.clone(), cx)
+                        }),
+                )
+                .child(split_button)
+        });
 
         bar.when_some(tab_actions, |bar, actions| bar.suffix(actions))
+            .when(!focused_pane, |bar| bar.bg(cx.theme().muted))
+            .into_any_element()
     }
 
     /// Show the tab's namespace in its label for namespaced resources.
@@ -686,8 +946,8 @@ impl Workspace {
         target.label().to_string()
     }
 
-    fn content(&self, active: Option<TabId>, cx: &Context<Self>) -> AnyElement {
-        let Some(id) = active else {
+    fn pane_content(&self, pane: &PaneInfo, cx: &Context<Self>) -> AnyElement {
+        let Some(id) = pane.active() else {
             return render_empty_workspace(cx);
         };
         let Some(tab) = self.shell.read(cx).tab(id) else {
@@ -703,6 +963,67 @@ impl Workspace {
                 .map(WorkspacePane::element)
                 .unwrap_or_else(|| render_empty_workspace(cx)),
         }
+    }
+
+    fn render_pane(
+        &self,
+        pane: PaneInfo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let pane_id = pane.id();
+        let tab_bar = self.tab_bar(pane.clone(), window, cx);
+        let content = self.pane_content(&pane, cx);
+        let focus_workspace = cx.entity();
+        v_flex()
+            .id(("editor-pane", pane_id.get()))
+            .flex_1()
+            .min_w_0()
+            .min_h_0()
+            .h_full()
+            .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                focus_workspace.update(cx, |this, cx| this.focus_pane(pane_id, cx));
+            })
+            .child(tab_bar)
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .child(content),
+            )
+            .into_any_element()
+    }
+
+    fn editor_area(&self, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let (panes, is_split) = {
+            let shell = self.shell.read(cx);
+            (shell.panes(), shell.is_split())
+        };
+
+        if panes.is_empty() {
+            return render_empty_workspace(cx);
+        }
+        if !is_split {
+            return self.render_pane(panes[0].clone(), window, cx);
+        }
+
+        let left = self.render_pane(panes[0].clone(), window, cx);
+        let right = self.render_pane(panes[1].clone(), window, cx);
+        h_resizable("workspace-split")
+            .with_state(&self.split_state)
+            .child(
+                resizable_panel()
+                    .size_range(PANE_MIN_WIDTH..Pixels::MAX)
+                    .child(left),
+            )
+            .child(
+                resizable_panel()
+                    .size_range(PANE_MIN_WIDTH..Pixels::MAX)
+                    .child(right),
+            )
+            .into_any_element()
     }
 }
 
@@ -807,25 +1128,48 @@ fn render_context_selector(
 }
 
 impl Render for Workspace {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let started = std::time::Instant::now();
-        let active = self.shell.read(cx).active();
+        if self.pending_split_restore {
+            self.pending_split_restore = false;
+            if self.shell.read(cx).is_split() {
+                let fraction = self.split_fraction;
+                let state = self.split_state.clone();
+                window.defer(cx, move |window, cx| {
+                    let width = state.read(cx).container_size();
+                    if width > px(0.) {
+                        state.update(cx, |state, cx| {
+                            state.resize_panel(0, px(width.as_f32() * fraction), window, cx);
+                        });
+                    }
+                });
+            }
+        }
         let active_target = self.shell.read(cx).active_tab().map(TabInfo::target);
-        let has_tabs = !self.shell.read(cx).tabs().is_empty();
-        tracing::trace!(
-            active = ?active,
-            panes = self.panes.len(),
-            "ui: workspace render start"
-        );
+        tracing::trace!(panes = self.panes.len(), "ui: workspace render start");
         let sidebar = render_sidebar(active_target, cx.entity(), cx);
-        let tab_bar = if has_tabs {
-            Some(self.tab_bar(cx))
-        } else {
-            None
-        };
+        let editor = self.editor_area(window, cx);
 
         let root = v_flex()
             .size_full()
+            .key_context("Workspace")
+            .on_action(cx.listener(|this, _: &SplitRight, window, cx| {
+                this.split_active(window, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Unsplit, _window, cx| {
+                this.unsplit(cx);
+            }))
+            .on_action(cx.listener(|this, _: &FocusNextGroup, _window, cx| {
+                if this.shell.update(cx, |shell, cx| shell.focus_next_pane(cx)) {
+                    this.save_session(cx);
+                    cx.notify();
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MoveTabToOtherGroup, window, cx| {
+                if let Some(id) = this.shell.read(cx).active() {
+                    this.move_tab_to_other(id, window, cx);
+                }
+            }))
             .bg(cx.theme().background)
             .text_color(cx.theme().foreground)
             .child(
@@ -876,24 +1220,18 @@ impl Render for Workspace {
                     .overflow_hidden()
                     .child(sidebar)
                     .child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .when_some(tab_bar, |this, tab_bar| this.child(tab_bar))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .min_h_0()
-                                    .overflow_hidden()
-                                    .child(self.content(active, cx)),
-                            ),
+                        v_flex().flex_1().min_w_0().h_full().child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .min_h_0()
+                                .overflow_hidden()
+                                .child(editor),
+                        ),
                     ),
             )
             .child(render_status_bar(cx));
         tracing::trace!(
-            active = ?active,
             elapsed_ms = started.elapsed().as_millis() as u64,
             "ui: workspace render end"
         );

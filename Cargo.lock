@@ -3539,7 +3539,7 @@ dependencies = [
 
 [[package]]
 name = "krusty"
-version = "0.0.3"
+version = "0.0.4"
 dependencies = [
  "dirs 7.0.0",
  "futures",

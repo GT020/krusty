@@ -55,6 +55,7 @@ pub struct PodsView {
     vm: gpui_kit::Entity<PodsViewModel>,
     namespace_filter: gpui_kit::Entity<NamespaceFilter>,
     sessions: PodSessions,
+    width_share: f32,
     _vm_sub: Subscription,
     _namespace_sub: Subscription,
 }
@@ -78,6 +79,7 @@ impl PodsView {
             vm,
             namespace_filter,
             sessions: PodSessions::default(),
+            width_share: 1.0,
             _vm_sub: vm_sub,
             _namespace_sub: namespace_sub,
         }
@@ -88,6 +90,18 @@ impl PodsView {
 
     pub fn namespace_filter(&self) -> &gpui_kit::Entity<NamespaceFilter> {
         &self.namespace_filter
+    }
+
+    /// Fraction of the window width this editor group occupies. The internal
+    /// list/detail split uses it so two side-by-side groups do not each assume
+    /// they own the whole window.
+    pub fn set_width_share(&mut self, share: f32, cx: &mut Context<Self>) {
+        let share = share.clamp(0.1, 1.0);
+        if (self.width_share - share).abs() < f32::EPSILON {
+            return;
+        }
+        self.width_share = share;
+        cx.notify();
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
@@ -346,7 +360,7 @@ impl PodsView {
                 .into_any_element();
         }
 
-        let viewport_width = window.viewport_size().width.as_f32();
+        let viewport_width = window.viewport_size().width.as_f32() * self.width_share;
         let split = viewport_width >= SPLIT_MIN_VIEWPORT_WIDTH;
         let usage = self.vm.read(cx).usage(cx);
         let usage_error = self.vm.read(cx).usage_error(cx);

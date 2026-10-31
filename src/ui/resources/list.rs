@@ -40,6 +40,7 @@ pub struct ResourceListView {
     namespace_filter: gpui_kit::Entity<NamespaceFilter>,
     detail: gpui_kit::Entity<ResourceDetailViewModel>,
     deployment_actions: gpui_kit::Entity<DeploymentsDetailViewModel>,
+    width_share: f32,
     _vm_sub: Subscription,
     _namespace_sub: Subscription,
     _detail_sub: Subscription,
@@ -83,6 +84,7 @@ impl ResourceListView {
             namespace_filter,
             detail,
             deployment_actions,
+            width_share: 1.0,
             _vm_sub: vm_sub,
             _namespace_sub: namespace_sub,
             _detail_sub: detail_sub,
@@ -96,6 +98,16 @@ impl ResourceListView {
 
     pub fn namespace_filter(&self) -> &gpui_kit::Entity<NamespaceFilter> {
         &self.namespace_filter
+    }
+
+    /// Fraction of the window width this editor group occupies.
+    pub fn set_width_share(&mut self, share: f32, cx: &mut Context<Self>) {
+        let share = share.clamp(0.1, 1.0);
+        if (self.width_share - share).abs() < f32::EPSILON {
+            return;
+        }
+        self.width_share = share;
+        cx.notify();
     }
 
     /// Switch this tab's namespace, used by the kubectl command bar.
@@ -205,7 +217,7 @@ impl Render for ResourceListView {
                 .into_any_element();
         }
 
-        let viewport_width = window.viewport_size().width.as_f32();
+        let viewport_width = window.viewport_size().width.as_f32() * self.width_share;
         let split = viewport_width >= SPLIT_MIN_VIEWPORT_WIDTH;
         let detail = if self.kind == ResourceKind::Deployments {
             crate::ui::resources::deployments::detail::render(
