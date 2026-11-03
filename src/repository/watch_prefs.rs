@@ -42,12 +42,13 @@ pub struct WatchPrefsStore {
     kinds: HashMap<String, WatchPrefs>,
 }
 
-/// The factory preference for a kind. Namespaces default to polling: many
-/// clusters deny `watch` on them and they change rarely. Picking "Live watch"
-/// in the UI saves and sticks across launches.
+/// The factory preference for a kind. Namespaces, Events, and Leases default
+/// to polling: many clusters deny `watch` on them and they are high-churn or
+/// rarely change. Picking "Live watch" in the UI saves and sticks across
+/// launches.
 fn default_prefs_for(kind: ResourceKind) -> WatchPrefs {
     match kind {
-        ResourceKind::Namespaces => WatchPrefs {
+        ResourceKind::Namespaces | ResourceKind::Events | ResourceKind::Leases => WatchPrefs {
             mode: WatchPreference::Poll,
             rate: PollRate::DEFAULT,
         },
@@ -153,15 +154,21 @@ mod tests {
     }
 
     #[test]
-    fn namespaces_default_to_polling_until_watch_is_chosen() {
+    fn high_churn_kinds_default_to_polling_until_watch_is_chosen() {
         let mut store = WatchPrefsStore::default();
-        assert_eq!(
-            store.prefs_for(ResourceKind::Namespaces),
-            WatchPrefs {
-                mode: WatchPreference::Poll,
-                rate: PollRate::Every(5),
-            }
-        );
+        for kind in [
+            ResourceKind::Namespaces,
+            ResourceKind::Events,
+            ResourceKind::Leases,
+        ] {
+            assert_eq!(
+                store.prefs_for(kind),
+                WatchPrefs {
+                    mode: WatchPreference::Poll,
+                    rate: PollRate::Every(5),
+                }
+            );
+        }
 
         // Choosing live watch is saved and sticks.
         store.update(ResourceKind::Namespaces, |prefs| {

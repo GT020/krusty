@@ -3,8 +3,9 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use futures::TryStreamExt as _;
 use k8s_openapi::api::core::v1::Node;
-use kube::api::{Api, DynamicObject, ListParams};
+use kube::api::{Api, DynamicObject, ListParams, WatchEvent, WatchParams};
 use kube::core::{ApiResource, GroupVersionKind};
 use kube::{Client, ResourceExt};
 use tokio::sync::{mpsc, watch};
@@ -15,11 +16,14 @@ use crate::models::resources::node::detail::{
     NodeUsage,
 };
 use crate::models::{NamespaceScope, ResourceKind};
+use crate::repository::retry::{self, Retry, RetryAction};
 use gpui_kit::App;
 
 use crate::repository::{Subscription, subscribe_kind};
 
 const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const DETAIL_WATCH_TIMEOUT_SECS: u32 = 280;
+const DETAIL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 
 /// Subscribe to the live Nodes stream.
 /// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
@@ -160,59 +164,241 @@ async fn watch_node_detail(
     mut cancel: watch::Receiver<bool>,
 ) {
     let api: Api<Node> = Api::all(client.clone());
-    let fetched = tokio::select! {
-        _ = cancel.changed() => return,
-        result = api.get(&node) => result,
-    };
-    let fetched = match fetched {
-        Ok(node) => node,
-        Err(error) => {
-            let _ = updates.send(NodeDetailUpdate::Detail {
-                node,
-                result: Err(format!("Could not load node details: {error}")),
-            });
+    let mut retry = Retry::new();
+    let mut resource_version = String::new();
+    let mut need_get = true;
+    let mut cpu_capacity = None;
+    let mut memory_capacity = None;
+    let mut ticker = tokio::time::interval(METRICS_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        if need_get {
+            let fetched = tokio::select! {
+                _ = cancel.changed() => return,
+                result = api.get(&node) => result,
+            };
+            let object = match fetched {
+                Ok(object) => object,
+                Err(error) => {
+                    let _ = updates.send(NodeDetailUpdate::Detail {
+                        node,
+                        result: Err(format!("Could not load node details: {error}")),
+                    });
+                    return;
+                }
+            };
+            retry.list_succeeded();
+            if let Some(version) = object.resource_version() {
+                resource_version = version;
+            }
+            let detail = detail_from_node(&object);
+            (cpu_capacity, memory_capacity) = capacity_from_detail(&detail);
+            if !send_node_detail(&updates, &node, detail) {
+                return;
+            }
+            need_get = false;
+        }
+
+        let params = WatchParams::default()
+            .timeout(DETAIL_WATCH_TIMEOUT_SECS)
+            .fields(&format!("metadata.name={node}"));
+        let watched = tokio::select! {
+            _ = cancel.changed() => return,
+            result = retry::bounded(api.watch(&params, &resource_version)) => result,
+        };
+        let mut stream = match watched {
+            Ok(stream) => {
+                retry.watch_succeeded();
+                Box::pin(stream)
+            }
+            Err(failure) => match failure.action(&mut retry) {
+                RetryAction::Retry(delay) => {
+                    if !sleep_or_cancel(&mut cancel, delay).await {
+                        return;
+                    }
+                    continue;
+                }
+                RetryAction::GiveUp => {
+                    poll_node_detail(&client, &node, &updates, &mut cancel).await;
+                    return;
+                }
+            },
+        };
+
+        let mut relist = false;
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => return,
+                _ = ticker.tick() => {
+                    let usage = fetch_usage(&client, &node, cpu_capacity, memory_capacity).await;
+                    if updates
+                        .send(NodeDetailUpdate::Usage {
+                            node: node.clone(),
+                            result: usage,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                event = stream.try_next() => match event {
+                    Ok(Some(WatchEvent::Added(object) | WatchEvent::Modified(object))) => {
+                        retry.watch_succeeded();
+                        if let Some(version) = object.resource_version() {
+                            resource_version = version;
+                        }
+                        let detail = detail_from_node(&object);
+                        (cpu_capacity, memory_capacity) = capacity_from_detail(&detail);
+                        if !send_node_detail(&updates, &node, detail) {
+                            return;
+                        }
+                    }
+                    Ok(Some(WatchEvent::Deleted(_))) => {
+                        let _ = updates.send(NodeDetailUpdate::Detail {
+                            node,
+                            result: Err("This node was deleted".to_string()),
+                        });
+                        return;
+                    }
+                    Ok(Some(WatchEvent::Bookmark(bookmark))) => {
+                        retry.watch_succeeded();
+                        resource_version = bookmark.metadata.resource_version;
+                    }
+                    Ok(Some(WatchEvent::Error(status))) => {
+                        relist = status.code == 410
+                            || status.reason == "Expired"
+                            || status.reason == "Gone";
+                        match retry.failed_status(status.code) {
+                            RetryAction::Retry(delay) => {
+                                if !sleep_or_cancel(&mut cancel, delay).await {
+                                    return;
+                                }
+                                break;
+                            }
+                            RetryAction::GiveUp => {
+                                poll_node_detail(&client, &node, &updates, &mut cancel).await;
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => match retry.failed(&error) {
+                        RetryAction::Retry(delay) => {
+                            if !sleep_or_cancel(&mut cancel, delay).await {
+                                return;
+                            }
+                            break;
+                        }
+                        RetryAction::GiveUp => {
+                            poll_node_detail(&client, &node, &updates, &mut cancel).await;
+                            return;
+                        }
+                    },
+                }
+            }
+        }
+
+        if relist {
+            need_get = true;
+        }
+        if !sleep_or_cancel(&mut cancel, DETAIL_RECONNECT_DELAY).await {
             return;
         }
-    };
-    let detail = detail_from_node(&fetched);
-    let cpu_capacity = detail
+    }
+}
+
+/// Watch is not permitted: keep both the object and its usage fresh with GETs.
+async fn poll_node_detail(
+    client: &Client,
+    node: &str,
+    updates: &mpsc::UnboundedSender<NodeDetailUpdate>,
+    cancel: &mut watch::Receiver<bool>,
+) {
+    let api: Api<Node> = Api::all(client.clone());
+    let mut retry = Retry::new();
+    loop {
+        let fetched = tokio::select! {
+            _ = cancel.changed() => return,
+            result = api.get(node) => result,
+        };
+        match fetched {
+            Ok(object) => {
+                retry.list_succeeded();
+                let detail = detail_from_node(&object);
+                let (cpu_capacity, memory_capacity) = capacity_from_detail(&detail);
+                if !send_node_detail(updates, node, detail) {
+                    return;
+                }
+                let usage = fetch_usage(client, node, cpu_capacity, memory_capacity).await;
+                if updates
+                    .send(NodeDetailUpdate::Usage {
+                        node: node.to_string(),
+                        result: usage,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                if updates
+                    .send(NodeDetailUpdate::Detail {
+                        node: node.to_string(),
+                        result: Err(format!("Could not load node details: {error}")),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                match retry.failed(&error) {
+                    RetryAction::Retry(delay) => {
+                        if !sleep_or_cancel(cancel, delay).await {
+                            return;
+                        }
+                        continue;
+                    }
+                    RetryAction::GiveUp => return,
+                }
+            }
+        }
+        if !sleep_or_cancel(cancel, METRICS_POLL_INTERVAL).await {
+            return;
+        }
+    }
+}
+
+fn capacity_from_detail(detail: &NodeDetail) -> (Option<u64>, Option<u64>) {
+    let cpu = detail
         .allocatable
         .get("cpu")
         .and_then(|quantity| parse_quantity(quantity))
         .map(|cores| (cores * 1000.0).round() as u64);
-    let memory_capacity = detail
+    let memory = detail
         .allocatable
         .get("memory")
         .and_then(|quantity| parse_quantity(quantity))
         .map(|bytes| bytes.max(0.0).round() as u64);
-    if updates
+    (cpu, memory)
+}
+
+fn send_node_detail(
+    updates: &mpsc::UnboundedSender<NodeDetailUpdate>,
+    node: &str,
+    detail: NodeDetail,
+) -> bool {
+    updates
         .send(NodeDetailUpdate::Detail {
-            node: node.clone(),
+            node: node.to_string(),
             result: Ok(Box::new(detail)),
         })
-        .is_err()
-    {
-        return;
-    }
+        .is_ok()
+}
 
-    loop {
-        let fetched = tokio::select! {
-            _ = cancel.changed() => return,
-            result = fetch_usage(&client, &node, cpu_capacity, memory_capacity) => result,
-        };
-        if updates
-            .send(NodeDetailUpdate::Usage {
-                node: node.clone(),
-                result: fetched,
-            })
-            .is_err()
-        {
-            return;
-        }
-        tokio::select! {
-            _ = cancel.changed() => return,
-            _ = tokio::time::sleep(METRICS_POLL_INTERVAL) => {}
-        }
+async fn sleep_or_cancel(cancel: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+    tokio::select! {
+        _ = cancel.changed() => false,
+        _ = tokio::time::sleep(duration) => true,
     }
 }
 

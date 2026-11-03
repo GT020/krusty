@@ -11,6 +11,7 @@ use gpui_kit::Context;
 pub struct ResourceDetailViewModel {
     state: ResourceDetailState,
     epoch: u64,
+    active: bool,
     cancel: Option<watch::Sender<bool>>,
     #[allow(dead_code)] // held for its Drop side-effect: cancels the GPUI observer
     cluster_sub: gpui_kit::Subscription,
@@ -32,6 +33,7 @@ impl ResourceDetailViewModel {
         Self {
             state: ResourceDetailState::Closed,
             epoch,
+            active: true,
             cancel: None,
             cluster_sub,
         }
@@ -39,6 +41,25 @@ impl ResourceDetailViewModel {
 
     pub fn state(&self) -> &ResourceDetailState {
         &self.state
+    }
+
+    /// Cancel the live detail stream while the owning tab is hidden, and
+    /// resume it without resetting the visible detail when the tab returns.
+    pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if self.active == active {
+            return;
+        }
+        self.active = active;
+        if !active {
+            self.cancel_detail();
+            return;
+        }
+        if let Some((kind, namespace, name)) = self.state.identity() {
+            let (kind, namespace, name) = (kind, namespace.to_string(), name.to_string());
+            if self.cancel.is_none() {
+                self.subscribe(kind, namespace, name, cx);
+            }
+        }
     }
 
     pub fn open(
@@ -60,6 +81,18 @@ impl ResourceDetailViewModel {
             name: name.clone(),
         };
         cx.notify();
+        if self.active {
+            self.subscribe(kind, namespace, name, cx);
+        }
+    }
+
+    fn subscribe(
+        &mut self,
+        kind: ResourceKind,
+        namespace: String,
+        name: String,
+        cx: &mut Context<Self>,
+    ) {
         let mut subscription =
             match repository::resources::detail::subscribe_detail(cx, kind, &namespace, &name) {
                 Ok(subscription) => subscription,
