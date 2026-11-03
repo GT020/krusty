@@ -54,6 +54,11 @@ impl NodesViewModel {
                 return;
             }
             this.epoch = epoch;
+            if !this.is_active() {
+                this.cancel_pump();
+                this.cancel_detail();
+                return;
+            }
             this.subscribe(cx);
             cx.notify();
         });
@@ -134,8 +139,30 @@ impl NodesViewModel {
         if was_active == active {
             return;
         }
+        if let Some(subscription) = &self.subscription {
+            subscription.set_paused(!active);
+        }
         if active {
+            if self.subscription.is_none() {
+                self.subscribe(cx);
+                return;
+            }
+            let snapshot = self
+                .subscription
+                .as_ref()
+                .map(|subscription| subscription.snapshot());
+            if let Some(snapshot) = snapshot {
+                self.model.update(cx, |model, cx| {
+                    model.apply_snapshot(snapshot);
+                    cx.notify();
+                });
+            }
+            if let Some(node) = self.current_detail_node(cx) {
+                self.attach_detail(node, cx);
+            }
             cx.notify();
+        } else {
+            self.cancel_detail();
         }
     }
 
@@ -205,6 +232,13 @@ impl NodesViewModel {
             model.begin_detail(node.clone());
             cx.notify();
         });
+        self.attach_detail(node, cx);
+    }
+
+    /// Restart the detail stream without resetting the selected detail state,
+    /// used when a hidden tab becomes visible again.
+    fn attach_detail(&mut self, node: String, cx: &mut Context<Self>) {
+        self.cancel_detail();
         let mut detail_sub = match repository::resources::nodes::subscribe_detail(cx, &node) {
             Ok(subscription) => subscription,
             Err(error) => {
@@ -257,6 +291,7 @@ impl NodesViewModel {
                 return;
             }
         };
+        subscription.set_paused(!self.is_active());
         let initial = subscription.snapshot();
         let notify_now = self.is_active();
         self.model.update(cx, |model, cx| {
@@ -268,7 +303,6 @@ impl NodesViewModel {
         let (cancel, mut cancel_rx) = watch::channel(());
         self.pump_cancel = Some(cancel);
         let model = self.model.downgrade();
-        let active = Arc::clone(&self.active);
         let mut pump = subscription.clone();
         cx.spawn(async move |_, cx: &mut gpui_kit::AsyncApp| {
             loop {
@@ -279,12 +313,9 @@ impl NodesViewModel {
                 let Some(snapshot) = snapshot else {
                     break;
                 };
-                let should_notify = active.load(Ordering::Relaxed);
                 let applied = model.update(cx, |model, cx| {
                     model.apply_snapshot(snapshot);
-                    if should_notify {
-                        cx.notify();
-                    }
+                    cx.notify();
                 });
                 if applied.is_err() {
                     break;

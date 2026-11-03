@@ -43,6 +43,11 @@ impl ClusterOverviewViewModel {
                 return;
             }
             this.epoch = epoch;
+            if !this.is_active() {
+                this.cancel_pump();
+                this.cancel_metrics();
+                return;
+            }
             this.subscribe(cx);
             this.subscribe_metrics(cx);
         });
@@ -86,14 +91,39 @@ impl ClusterOverviewViewModel {
         self.metrics_error.as_deref()
     }
 
+    pub fn is_active(&self) -> bool {
+        self.active.load(Ordering::Relaxed)
+    }
+
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         let was_active = self.active.swap(active, Ordering::Relaxed);
         if was_active == active {
             return;
         }
+        if let Some(nodes) = &self.nodes {
+            nodes.set_paused(!active);
+        }
+        if let Some(pods) = &self.pods {
+            pods.set_paused(!active);
+        }
         if active {
+            if self.nodes.is_none() || self.pods.is_none() {
+                self.subscribe(cx);
+                self.subscribe_metrics(cx);
+                cx.notify();
+                return;
+            }
+            if let Some(nodes) = &self.nodes {
+                self.node_snapshot = nodes.snapshot();
+            }
+            if let Some(pods) = &self.pods {
+                self.pod_snapshot = pods.snapshot();
+            }
+            self.subscribe_metrics(cx);
             self.recompute();
             cx.notify();
+        } else {
+            self.cancel_metrics();
         }
     }
 
@@ -130,9 +160,11 @@ impl ClusterOverviewViewModel {
             }
         };
         if let Some(nodes) = &self.nodes {
+            nodes.set_paused(!self.is_active());
             self.node_snapshot = nodes.snapshot();
         }
         if let Some(pods) = &self.pods {
+            pods.set_paused(!self.is_active());
             self.pod_snapshot = pods.snapshot();
         }
         self.recompute();
@@ -141,7 +173,6 @@ impl ClusterOverviewViewModel {
         self.pump_cancel = Some(cancel);
         let mut nodes = self.nodes.clone();
         let mut pods = self.pods.clone();
-        let active = Arc::clone(&self.active);
         cx.spawn(async move |this, cx| {
             loop {
                 tokio::select! {
@@ -151,13 +182,10 @@ impl ClusterOverviewViewModel {
                             nodes = None;
                             continue;
                         };
-                        let should_notify = active.load(Ordering::Relaxed);
                         let applied = this.update(cx, |this, cx| {
                             this.node_snapshot = snapshot;
                             this.recompute();
-                            if should_notify {
-                                cx.notify();
-                            }
+                            cx.notify();
                         });
                         if applied.is_err() {
                             break;
@@ -168,13 +196,10 @@ impl ClusterOverviewViewModel {
                             pods = None;
                             continue;
                         };
-                        let should_notify = active.load(Ordering::Relaxed);
                         let applied = this.update(cx, |this, cx| {
                             this.pod_snapshot = snapshot;
                             this.recompute();
-                            if should_notify {
-                                cx.notify();
-                            }
+                            cx.notify();
                         });
                         if applied.is_err() {
                             break;
@@ -200,7 +225,20 @@ impl ClusterOverviewViewModel {
         self.pods = None;
     }
 
+    fn cancel_metrics(&mut self) {
+        if let Some(cancel) = self.metrics_cancel.take() {
+            let _ = cancel.send(true);
+        }
+        self.metrics.clear();
+        self.metrics_error = None;
+        self.metrics_generation = self.metrics_generation.wrapping_add(1);
+    }
+
     fn subscribe_metrics(&mut self, cx: &mut Context<Self>) {
+        if !self.is_active() {
+            self.cancel_metrics();
+            return;
+        }
         if let Some(cancel) = self.metrics_cancel.take() {
             let _ = cancel.send(true);
         }

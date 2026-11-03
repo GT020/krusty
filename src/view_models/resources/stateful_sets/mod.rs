@@ -48,6 +48,10 @@ impl StatefulSetsViewModel {
                 return;
             }
             this.epoch = epoch;
+            if !this.is_active() {
+                this.cancel_pump();
+                return;
+            }
             this.subscribe(cx);
             cx.notify();
         });
@@ -114,8 +118,26 @@ impl StatefulSetsViewModel {
         if was_active == active {
             return;
         }
+        if let Some(subscription) = &self.subscription {
+            subscription.set_paused(!active);
+        }
         if active {
-            cx.notify();
+            if self.subscription.is_none() {
+                self.subscribe(cx);
+                return;
+            }
+            let snapshot = self
+                .subscription
+                .as_ref()
+                .map(|subscription| subscription.snapshot());
+            if let Some(snapshot) = snapshot {
+                self.model.update(cx, |model, cx| {
+                    model.apply_snapshot(snapshot);
+                    cx.notify();
+                });
+            } else {
+                cx.notify();
+            }
         }
     }
 
@@ -153,6 +175,7 @@ impl StatefulSetsViewModel {
                     return;
                 }
             };
+        subscription.set_paused(!self.is_active());
         let initial = subscription.snapshot();
         let notify_now = self.is_active();
         self.model.update(cx, |model, cx| {
@@ -164,7 +187,6 @@ impl StatefulSetsViewModel {
         let (cancel, mut cancel_rx) = watch::channel(());
         self.pump_cancel = Some(cancel);
         let model = self.model.downgrade();
-        let active = Arc::clone(&self.active);
         let mut pump = subscription.clone();
         cx.spawn(async move |_, cx: &mut gpui_kit::AsyncApp| {
             loop {
@@ -175,12 +197,9 @@ impl StatefulSetsViewModel {
                 let Some(snapshot) = snapshot else {
                     break;
                 };
-                let should_notify = active.load(Ordering::Relaxed);
                 let applied = model.update(cx, |model, cx| {
                     model.apply_snapshot(snapshot);
-                    if should_notify {
-                        cx.notify();
-                    }
+                    cx.notify();
                 });
                 if applied.is_err() {
                     break;

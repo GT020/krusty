@@ -50,6 +50,8 @@ pub fn init(cx: &mut App) {
 #[derive(Clone)]
 pub struct Subscription {
     rx: watch::Receiver<Arc<ResourceSnapshot>>,
+    paused: watch::Sender<bool>,
+    paused_rx: watch::Receiver<bool>,
     _entry: Arc<Entry>,
 }
 
@@ -58,10 +60,50 @@ impl Subscription {
         self.rx.borrow().clone()
     }
 
-    /// Wait for the next snapshot. `None` means the subscription ended.
+    /// Stop delivering snapshots to this subscriber. The shared watch task
+    /// keeps running; [`next`](Self::next) returns the latest snapshot as soon
+    /// as the subscription is resumed.
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.send_replace(paused);
+    }
+
+    /// Wait for the next snapshot relevant to this subscriber. `None` means the
+    /// subscription ended. While paused, snapshots are coalesced and only the
+    /// latest one is returned on resume.
     pub async fn next(&mut self) -> Option<Arc<ResourceSnapshot>> {
-        self.rx.changed().await.ok()?;
-        Some(self.rx.borrow_and_update().clone())
+        let mut paused = *self.paused_rx.borrow_and_update();
+        loop {
+            if paused {
+                tokio::select! {
+                    result = self.paused_rx.changed() => {
+                        result.ok()?;
+                        if !*self.paused_rx.borrow_and_update() {
+                            return Some(self.rx.borrow_and_update().clone());
+                        }
+                    }
+                    result = self.rx.changed() => {
+                        result.ok()?;
+                        self.rx.borrow_and_update();
+                    }
+                }
+            } else {
+                tokio::select! {
+                    result = self.paused_rx.changed() => {
+                        result.ok()?;
+                        paused = *self.paused_rx.borrow_and_update();
+                    }
+                    result = self.rx.changed() => {
+                        result.ok()?;
+                        if *self.paused_rx.borrow() {
+                            self.rx.borrow_and_update();
+                            paused = true;
+                        } else {
+                            return Some(self.rx.borrow_and_update().clone());
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Ask the shared watch task to perform a fresh list.
@@ -107,8 +149,17 @@ pub(crate) fn subscribe_kind(
             .retain(|_, entry| entry.strong_count() > 0);
 
         if let Some(entry) = repository.entries.get(&key).and_then(Weak::upgrade) {
+            tracing::trace!(
+                ?kind,
+                ?scope,
+                active = repository.entries.len(),
+                "repository: subscription reused"
+            );
+            let (paused, paused_rx) = watch::channel(false);
             return Subscription {
                 rx: entry.snapshots.subscribe(),
+                paused,
+                paused_rx,
                 _entry: entry,
             };
         }
@@ -139,12 +190,25 @@ pub(crate) fn subscribe_kind(
             refresh,
             prefs,
         });
+        let scope_log = scope.clone();
         let watch_task = resources::watcher::run(
             client, kind, scope, key.epoch, snapshots, cancel_rx, refresh_rx, prefs_rx,
         );
         tokio.spawn(watch_task);
         repository.entries.insert(key, Arc::downgrade(&entry));
-        Subscription { rx, _entry: entry }
+        tracing::debug!(
+            ?kind,
+            scope = ?scope_log,
+            active = repository.entries.len(),
+            "repository: subscription created"
+        );
+        let (paused, paused_rx) = watch::channel(false);
+        Subscription {
+            rx,
+            paused,
+            paused_rx,
+            _entry: entry,
+        }
     }))
 }
 
@@ -185,4 +249,51 @@ fn update_watch_prefs(cx: &mut App, kind: ResourceKind, change: impl FnOnce(&mut
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::models::SnapshotPhase;
+
+    #[tokio::test]
+    async fn a_paused_subscription_coalesces_until_resumed() {
+        let (snapshots, rx) = watch::channel(Arc::new(ResourceSnapshot::loading()));
+        let (cancel, _) = watch::channel(false);
+        let (refresh, _) = watch::channel(0u64);
+        let (prefs, _) = watch::channel(WatchPrefs::default());
+        let entry = Arc::new(Entry {
+            snapshots: snapshots.clone(),
+            _cancel: cancel,
+            refresh,
+            prefs,
+        });
+        let (paused, paused_rx) = watch::channel(false);
+        let mut subscription = Subscription {
+            rx,
+            paused,
+            paused_rx,
+            _entry: entry,
+        };
+
+        subscription.set_paused(true);
+        snapshots.send_replace(Arc::new(ResourceSnapshot::failed("offline")));
+        let resume = subscription.clone();
+        let mut next = Box::pin(subscription.next());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut next)
+                .await
+                .is_err(),
+            "a paused subscription must not deliver snapshots"
+        );
+
+        resume.set_paused(false);
+        let snapshot = tokio::time::timeout(Duration::from_millis(250), next)
+            .await
+            .expect("resume must wake the pump")
+            .expect("resume snapshot");
+        assert!(matches!(snapshot.phase(), SnapshotPhase::Error(_)));
+    }
 }

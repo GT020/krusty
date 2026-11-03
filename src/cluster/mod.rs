@@ -363,13 +363,22 @@ fn spawn_client_build(cx: &mut App, context: ContextInfo) {
                 Ok(Err(error)) => {
                     tracing::warn!(%error, context = %context_id, "cluster: client build failed");
                     cx.update_global::<ClusterState, _>(|state, _| {
+                        // The active label now points at a context with no
+                        // working client. Drop the old one and let every view
+                        // resubscribe into the visible error state.
+                        state.client = None;
                         state.reachable = Some(false);
+                        state.namespaces.clear();
+                        state.context_epoch = state.context_epoch.wrapping_add(1);
                     });
                 }
                 Err(error) => {
                     tracing::error!(%error, context = %context_id, "cluster: client build task failed");
                     cx.update_global::<ClusterState, _>(|state, _| {
+                        state.client = None;
                         state.reachable = Some(false);
+                        state.namespaces.clear();
+                        state.context_epoch = state.context_epoch.wrapping_add(1);
                     });
                 }
             }
@@ -390,11 +399,11 @@ pub fn switch_context(cx: &mut App, id: &str) -> Result<(), &'static str> {
             .find(|context| context.id == id)
             .cloned()
             .ok_or("unknown context")?;
-        state.client = None;
+        // Keep the old client and snapshots until the new client is ready.
+        // Bumping the epoch here would make every view resubscribe with no
+        // client, publish an error, and resubscribe again on success.
         state.active = Some(context.id.clone());
         state.reachable = None;
-        state.namespaces.clear();
-        state.context_epoch = state.context_epoch.wrapping_add(1);
         if let Some(cancel) = state.namespace_cancel.take() {
             let _ = cancel.send(true);
         }
