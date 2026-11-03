@@ -49,13 +49,6 @@ const WATCH_REPROBE_INTERVAL: Duration = Duration::from_secs(600);
 const STREAM_INITIAL_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_INITIAL_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 
-/// Streaming initial events are a bulk load. Publishing every 256 events makes
-/// a 13k-object namespace rebuild and repaint the list ~50 times before the
-/// user sees the final count. Larger batches keep the bulk phase cheap while
-/// the bookmark still forces one final snapshot.
-const STREAM_INITIAL_FLUSH_AT: usize = 4_096;
-const STREAM_INITIAL_FLUSH_INTERVAL: Duration = Duration::from_millis(200);
-
 /// Kubernetes version at which `sendInitialEvents` was introduced. 1.27 and
 /// 1.28 may still have the WatchList feature gate disabled, so the stream is
 /// still attempted and falls back to list if no initial-end bookmark arrives.
@@ -658,7 +651,7 @@ impl WatchTask {
         let mut changed = false;
         let total_deadline = tokio::time::Instant::now() + STREAM_INITIAL_TOTAL_TIMEOUT;
         let mut idle_deadline = tokio::time::Instant::now() + STREAM_INITIAL_IDLE_TIMEOUT;
-        let mut ticker = tokio::time::interval(STREAM_INITIAL_FLUSH_INTERVAL);
+        let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
@@ -687,7 +680,7 @@ impl WatchTask {
                         }
                         changed |= self.store.upsert(item);
                         changed |= self.trim_high_churn();
-                        if self.store.pending() >= STREAM_INITIAL_FLUSH_AT {
+                        if self.store.pending() >= FLUSH_AT {
                             self.publish(SnapshotPhase::Ready);
                         }
                     }

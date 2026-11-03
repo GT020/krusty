@@ -174,10 +174,8 @@ the last `Subscription` cancels the background task. A context switch bumps
 `run_stream()` first tries a Kubernetes 1.27+ streaming list
 (`WatchParams::initial_events()`), which sends synthetic `ADDED` events followed
 by a `BOOKMARK` carrying `k8s.io/initial-events-end: "true"`. It applies those
-events progressively, publishes on a bulk-load cadence (4,096 events or
-200 ms, whichever comes first), and continues the regular watch from the
-bookmark's resource version. The regular watch keeps the fresher 50 ms /
-256-event cadence.
+events progressively, publishes on the normal 50 ms/256-event cadence, and
+continues the regular watch from the bookmark's resource version.
 
 Compatibility fallbacks:
 
