@@ -7,7 +7,9 @@ use futures::{AsyncBufReadExt, SinkExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
     Container, ContainerState, ContainerStatus, EnvVar, Pod, PodStatus, Toleration, Volume,
 };
-use kube::api::{Api, AttachParams, DynamicObject, LogParams, TerminalSize};
+use kube::api::{
+    Api, AttachParams, DynamicObject, LogParams, TerminalSize, WatchEvent, WatchParams,
+};
 use kube::core::{ApiResource, GroupVersionKind};
 use kube::{Client, ResourceExt};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
@@ -21,10 +23,12 @@ use crate::models::resources::pod::detail::{
 use crate::models::{NamespaceScope, ResourceKind};
 use gpui_kit::App;
 
-use crate::repository::retry::{Retry, RetryAction};
+use crate::repository::retry::{self, Retry, RetryAction};
 use crate::repository::{Subscription, subscribe_kind};
 
 const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
+const DETAIL_WATCH_TIMEOUT_SECS: u32 = 280;
+const DETAIL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 
 /// Subscribe to the live Pods stream.
 /// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
@@ -462,53 +466,234 @@ async fn watch_pod_detail(
     mut cancel: watch::Receiver<bool>,
 ) {
     let api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
-    let fetched = tokio::select! {
-        _ = cancel.changed() => return,
-        result = api.get(&name) => result,
-    };
-    let fetched = match fetched {
-        Ok(pod) => pod,
-        Err(error) => {
-            let _ = updates.send(PodDetailUpdate::Detail {
-                namespace,
-                name,
-                result: Err(format!("Could not load pod details: {error}")),
-            });
+    let mut retry = Retry::new();
+    let mut resource_version = String::new();
+    let mut need_get = true;
+    let mut cpu_capacity = None;
+    let mut memory_capacity = None;
+    let mut ticker = tokio::time::interval(METRICS_POLL_INTERVAL);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    loop {
+        if need_get {
+            let fetched = tokio::select! {
+                _ = cancel.changed() => return,
+                result = api.get(&name) => result,
+            };
+            let pod = match fetched {
+                Ok(pod) => pod,
+                Err(error) => {
+                    let _ = updates.send(PodDetailUpdate::Detail {
+                        namespace,
+                        name,
+                        result: Err(format!("Could not load pod details: {error}")),
+                    });
+                    return;
+                }
+            };
+            retry.list_succeeded();
+            if let Some(version) = pod.resource_version() {
+                resource_version = version;
+            }
+            (cpu_capacity, memory_capacity) = capacity_from_pod(&pod);
+            if !send_pod_detail(&updates, &namespace, &name, &pod) {
+                return;
+            }
+            need_get = false;
+        }
+
+        let params = WatchParams::default()
+            .timeout(DETAIL_WATCH_TIMEOUT_SECS)
+            .fields(&format!("metadata.name={name}"));
+        let watched = tokio::select! {
+            _ = cancel.changed() => return,
+            result = retry::bounded(api.watch(&params, &resource_version)) => result,
+        };
+        let mut stream = match watched {
+            Ok(stream) => {
+                retry.watch_succeeded();
+                Box::pin(stream)
+            }
+            Err(failure) => match failure.action(&mut retry) {
+                RetryAction::Retry(delay) => {
+                    if !sleep_or_cancel(&mut cancel, delay).await {
+                        return;
+                    }
+                    continue;
+                }
+                RetryAction::GiveUp => {
+                    poll_pod_detail(&client, &namespace, &name, &updates, &mut cancel).await;
+                    return;
+                }
+            },
+        };
+
+        let mut relist = false;
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => return,
+                _ = ticker.tick() => {
+                    let usage = fetch_usage(&client, &namespace, &name, cpu_capacity, memory_capacity).await;
+                    if updates
+                        .send(PodDetailUpdate::Usage {
+                            namespace: namespace.clone(),
+                            name: name.clone(),
+                            result: usage,
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                event = stream.try_next() => match event {
+                    Ok(Some(WatchEvent::Added(pod) | WatchEvent::Modified(pod))) => {
+                        retry.watch_succeeded();
+                        if let Some(version) = pod.resource_version() {
+                            resource_version = version;
+                        }
+                        (cpu_capacity, memory_capacity) = capacity_from_pod(&pod);
+                        if !send_pod_detail(&updates, &namespace, &name, &pod) {
+                            return;
+                        }
+                    }
+                    Ok(Some(WatchEvent::Deleted(_))) => {
+                        let _ = updates.send(PodDetailUpdate::Detail {
+                            namespace,
+                            name,
+                            result: Err("This pod was deleted".to_string()),
+                        });
+                        return;
+                    }
+                    Ok(Some(WatchEvent::Bookmark(bookmark))) => {
+                        retry.watch_succeeded();
+                        resource_version = bookmark.metadata.resource_version;
+                    }
+                    Ok(Some(WatchEvent::Error(status))) => {
+                        relist = status.code == 410
+                            || status.reason == "Expired"
+                            || status.reason == "Gone";
+                        match retry.failed_status(status.code) {
+                            RetryAction::Retry(delay) => {
+                                if !sleep_or_cancel(&mut cancel, delay).await {
+                                    return;
+                                }
+                                break;
+                            }
+                            RetryAction::GiveUp => {
+                                poll_pod_detail(&client, &namespace, &name, &updates, &mut cancel)
+                                    .await;
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => match retry.failed(&error) {
+                        RetryAction::Retry(delay) => {
+                            if !sleep_or_cancel(&mut cancel, delay).await {
+                                return;
+                            }
+                            break;
+                        }
+                        RetryAction::GiveUp => {
+                            poll_pod_detail(&client, &namespace, &name, &updates, &mut cancel).await;
+                            return;
+                        }
+                    },
+                }
+            }
+        }
+
+        if relist {
+            need_get = true;
+        }
+        if !sleep_or_cancel(&mut cancel, DETAIL_RECONNECT_DELAY).await {
             return;
         }
-    };
-    let detail = detail_from_pod(&fetched);
-    let (cpu_capacity, memory_capacity) = capacity_from_pod(&fetched);
-    if updates
-        .send(PodDetailUpdate::Detail {
-            namespace: namespace.clone(),
-            name: name.clone(),
-            result: Ok(Box::new(detail)),
-        })
-        .is_err()
-    {
-        return;
     }
+}
 
+/// Watch is not permitted: keep both the object and its usage fresh with GETs.
+async fn poll_pod_detail(
+    client: &Client,
+    namespace: &str,
+    name: &str,
+    updates: &mpsc::UnboundedSender<PodDetailUpdate>,
+    cancel: &mut watch::Receiver<bool>,
+) {
+    let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let mut retry = Retry::new();
     loop {
         let fetched = tokio::select! {
             _ = cancel.changed() => return,
-            result = fetch_usage(&client, &namespace, &name, cpu_capacity, memory_capacity) => result,
+            result = api.get(name) => result,
         };
-        if updates
-            .send(PodDetailUpdate::Usage {
-                namespace: namespace.clone(),
-                name: name.clone(),
-                result: fetched,
-            })
-            .is_err()
-        {
+        match fetched {
+            Ok(pod) => {
+                retry.list_succeeded();
+                let (cpu_capacity, memory_capacity) = capacity_from_pod(&pod);
+                if !send_pod_detail(updates, namespace, name, &pod) {
+                    return;
+                }
+                let usage =
+                    fetch_usage(client, namespace, name, cpu_capacity, memory_capacity).await;
+                if updates
+                    .send(PodDetailUpdate::Usage {
+                        namespace: namespace.to_string(),
+                        name: name.to_string(),
+                        result: usage,
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+            }
+            Err(error) => {
+                if updates
+                    .send(PodDetailUpdate::Detail {
+                        namespace: namespace.to_string(),
+                        name: name.to_string(),
+                        result: Err(format!("Could not load pod details: {error}")),
+                    })
+                    .is_err()
+                {
+                    return;
+                }
+                match retry.failed(&error) {
+                    RetryAction::Retry(delay) => {
+                        if !sleep_or_cancel(cancel, delay).await {
+                            return;
+                        }
+                        continue;
+                    }
+                    RetryAction::GiveUp => return,
+                }
+            }
+        }
+        if !sleep_or_cancel(cancel, METRICS_POLL_INTERVAL).await {
             return;
         }
-        tokio::select! {
-            _ = cancel.changed() => return,
-            _ = tokio::time::sleep(METRICS_POLL_INTERVAL) => {}
-        }
+    }
+}
+
+fn send_pod_detail(
+    updates: &mpsc::UnboundedSender<PodDetailUpdate>,
+    namespace: &str,
+    name: &str,
+    pod: &Pod,
+) -> bool {
+    updates
+        .send(PodDetailUpdate::Detail {
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            result: Ok(Box::new(detail_from_pod(pod))),
+        })
+        .is_ok()
+}
+
+async fn sleep_or_cancel(cancel: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+    tokio::select! {
+        _ = cancel.changed() => false,
+        _ = tokio::time::sleep(duration) => true,
     }
 }
 

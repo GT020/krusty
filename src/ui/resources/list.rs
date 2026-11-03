@@ -123,6 +123,8 @@ impl ResourceListView {
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
         self.vm.set_active(active, cx);
+        self.detail
+            .update(cx, |detail, cx| detail.set_active(active, cx));
     }
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {

@@ -4,7 +4,7 @@
 //! [`ResourceStore`] and only publishes immutable snapshots to the UI, throttled
 //! to `FLUSH_INTERVAL` or every `FLUSH_AT` events, whichever comes first.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -39,9 +39,67 @@ use crate::repository::watch_prefs::{WatchPreference, WatchPrefs};
 const FLUSH_INTERVAL: Duration = Duration::from_millis(50);
 const FLUSH_AT: usize = 256;
 
+/// How often an automatically denied watch is retried. RBAC can change without
+/// an app restart, but re-probing too often would spam the API server.
+const WATCH_REPROBE_INTERVAL: Duration = Duration::from_secs(600);
+
+/// Streaming lists (`sendInitialEvents`) bounds. A server that ignores the
+/// option never sends the initial-end bookmark, so an idle stream falls back to
+/// the list path quickly. A busy initial stream gets longer, but is capped.
+const STREAM_INITIAL_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+const STREAM_INITIAL_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Kubernetes version at which `sendInitialEvents` was introduced. 1.27 and
+/// 1.28 may still have the WatchList feature gate disabled, so the stream is
+/// still attempted and falls back to list if no initial-end bookmark arrives.
+const STREAM_INITIAL_MIN_MINOR: u32 = 27;
+
+static STREAMING_SUPPORT: OnceLock<Mutex<HashMap<u64, bool>>> = OnceLock::new();
+
+fn streaming_support() -> &'static Mutex<HashMap<u64, bool>> {
+    STREAMING_SUPPORT.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn supports_streaming_initial(client: &Client, epoch: u64) -> bool {
+    if let Ok(cache) = streaming_support().lock()
+        && let Some(supported) = cache.get(&epoch)
+    {
+        return *supported;
+    }
+
+    let supported = match retry::bounded(client.apiserver_version()).await {
+        Ok(info) => version_supports_streaming(&info.major, &info.minor),
+        Err(failure) => {
+            tracing::debug!(%failure, "repository: could not determine API server version");
+            false
+        }
+    };
+    if let Ok(mut cache) = streaming_support().lock() {
+        cache.insert(epoch, supported);
+    }
+    supported
+}
+
+fn version_supports_streaming(major: &str, minor: &str) -> bool {
+    let major = major.parse::<u32>().unwrap_or(0);
+    let minor = minor
+        .trim_end_matches(|character: char| !character.is_ascii_digit())
+        .parse::<u32>()
+        .unwrap_or(0);
+    major > 1 || (major == 1 && minor >= STREAM_INITIAL_MIN_MINOR)
+}
+
+fn bookmark_ends_initial_events(annotations: &std::collections::BTreeMap<String, String>) -> bool {
+    annotations
+        .get("k8s.io/initial-events-end")
+        .is_some_and(|value| value == "true")
+}
+
 /// List chunk size. Big kinds (thousands of pods/events) render their first
 /// chunk immediately instead of waiting for one huge response.
 const LIST_CHUNK_SIZE: u32 = 500;
+
+const EVENTS_LIMIT: usize = 1_000;
 
 /// Kinds whose watch the API server denied (RBAC) for the current context
 /// epoch. New subscriptions for these kinds skip the doomed watch attempt and
@@ -96,6 +154,8 @@ pub async fn run(
         prefs,
         store: ResourceStore::new(),
         mode: WatchMode::Watch,
+        ready: false,
+        stream_initial_disabled: false,
     };
     match kind {
         ResourceKind::Pods => task.run_namespaced::<Pod, _>(scope, pod_item).await,
@@ -196,6 +256,11 @@ struct WatchTask {
     prefs: watch::Receiver<WatchPrefs>,
     store: ResourceStore,
     mode: WatchMode,
+    /// Whether a `Ready` snapshot has been published for this task. Used to
+    /// publish an empty first list without republishing unchanged poll results.
+    ready: bool,
+    /// Once streaming lists fall back, keep using the list path for this task.
+    stream_initial_disabled: bool,
 }
 
 /// Why the poll loop exited.
@@ -209,11 +274,28 @@ enum PollOutcome {
 /// Outcome of a chunked list.
 enum ListOutcome {
     /// Full list published; watch from this resource version.
-    Listed(String),
+    Listed {
+        resource_version: String,
+        changed: bool,
+    },
     /// Subscription cancelled mid-list.
     Cancelled,
     /// A chunk request failed or timed out; the caller decides whether to retry.
     Failed(RequestFailure),
+}
+
+/// Outcome of attempting a Kubernetes streaming list.
+enum InitialStream {
+    /// Initial events and the end-of-initial-events bookmark were received.
+    Listed {
+        resource_version: String,
+        changed: bool,
+    },
+    /// Subscription cancelled.
+    Cancelled,
+    /// The server ignored/rejected streaming lists, the stream ended, or the
+    /// initial bookmark did not arrive in time.
+    Unsupported,
 }
 
 impl WatchTask {
@@ -282,28 +364,68 @@ impl WatchTask {
                 }
             }
             if need_list {
-                match self.list_progressively(&api, map).await {
-                    ListOutcome::Listed(version) => {
-                        retry.list_succeeded();
-                        resource_version = version;
-                        need_list = false;
+                let mut streamed = false;
+                if !self.stream_initial_disabled
+                    && !self.ready
+                    && self.store.len() == 0
+                    && !watch_denied(self.epoch, self.kind)
+                    && supports_streaming_initial(&self.client, self.epoch).await
+                {
+                    match self.stream_initial(&api, map).await {
+                        InitialStream::Listed {
+                            resource_version: version,
+                            changed,
+                        } => {
+                            tracing::debug!(
+                                changed,
+                                "repository: initial state came from a streaming list"
+                            );
+                            retry.list_succeeded();
+                            resource_version = version;
+                            need_list = false;
+                            streamed = true;
+                        }
+                        InitialStream::Cancelled => return,
+                        InitialStream::Unsupported => {
+                            tracing::debug!(
+                                "repository: streaming list unsupported or timed out, falling back to list"
+                            );
+                            self.stream_initial_disabled = true;
+                        }
                     }
-                    ListOutcome::Cancelled => return,
-                    ListOutcome::Failed(failure) => match failure.action(&mut retry) {
-                        RetryAction::Retry(delay) => {
-                            tracing::warn!(%failure, ?api, delay_ms = delay.as_millis() as u64, "repository: list failed, retrying");
-                            self.publish(SnapshotPhase::Error(format!("list failed: {failure}")));
-                            if !self.sleep(delay).await {
+                }
+
+                if !streamed {
+                    match self.list_progressively(&api, map).await {
+                        ListOutcome::Listed {
+                            resource_version: version,
+                            ..
+                        } => {
+                            retry.list_succeeded();
+                            resource_version = version;
+                            need_list = false;
+                        }
+                        ListOutcome::Cancelled => return,
+                        ListOutcome::Failed(failure) => match failure.action(&mut retry) {
+                            RetryAction::Retry(delay) => {
+                                tracing::warn!(%failure, ?api, delay_ms = delay.as_millis() as u64, "repository: list failed, retrying");
+                                self.publish(SnapshotPhase::Error(format!(
+                                    "list failed: {failure}"
+                                )));
+                                if !self.sleep(delay).await {
+                                    return;
+                                }
+                                continue;
+                            }
+                            RetryAction::GiveUp => {
+                                tracing::error!(%failure, ?api, "repository: list rejected, stopping watch");
+                                self.publish(SnapshotPhase::Error(format!(
+                                    "list rejected: {failure}"
+                                )));
                                 return;
                             }
-                            continue;
-                        }
-                        RetryAction::GiveUp => {
-                            tracing::error!(%failure, ?api, "repository: list rejected, stopping watch");
-                            self.publish(SnapshotPhase::Error(format!("list rejected: {failure}")));
-                            return;
-                        }
-                    },
+                        },
+                    }
                 }
             }
 
@@ -456,6 +578,7 @@ impl WatchTask {
                                 }
                             },
                         }
+                        self.trim_high_churn();
                         if self.store.pending() >= FLUSH_AT {
                             self.publish(SnapshotPhase::Ready);
                         }
@@ -474,11 +597,18 @@ impl WatchTask {
         }
     }
 
+    fn trim_high_churn(&mut self) -> bool {
+        if self.kind == ResourceKind::Events {
+            return self.store.trim_oldest(EVENTS_LIMIT);
+        }
+        false
+    }
+
     fn publish(&mut self, phase: SnapshotPhase) {
+        self.ready = matches!(&phase, SnapshotPhase::Ready);
         let snapshot = Arc::new(self.store.snapshot(phase).with_mode(self.mode));
         tracing::trace!(
             objects = self.store.len(),
-            revision = snapshot.revision(),
             "repository: publishing snapshot"
         );
         self.tx.send_replace(snapshot);
@@ -492,8 +622,131 @@ impl WatchTask {
         }
     }
 
-    /// List every object in chunks, publishing each chunk so large kinds
-    /// render progressively instead of waiting for one huge response.
+    /// Try Kubernetes 1.27+ streaming lists (`sendInitialEvents`) before the
+    /// chunked list path. Returns `Unsupported` for old API servers, disabled
+    /// feature gates, RBAC errors, or a stream that never emits the
+    /// `k8s.io/initial-events-end` bookmark. The caller then falls back to the
+    /// existing list+watch code.
+    async fn stream_initial<K, F>(&mut self, api: &Api<K>, map: F) -> InitialStream
+    where
+        K: Resource + Clone + Debug + DeserializeOwned + Send + 'static,
+        F: Fn(&K) -> Item + Copy,
+    {
+        let params = WatchParams::streaming_lists().timeout(280);
+        let watched = tokio::select! {
+            _ = self.cancel.changed() => return InitialStream::Cancelled,
+            result = retry::bounded(api.watch(&params, "")) => result,
+        };
+        let mut stream = match watched {
+            Ok(stream) => Box::pin(stream),
+            Err(failure) => {
+                tracing::debug!(%failure, ?api, "repository: streaming list setup failed");
+                return InitialStream::Unsupported;
+            }
+        };
+
+        let mut resource_version = String::new();
+        let mut changed = false;
+        let total_deadline = tokio::time::Instant::now() + STREAM_INITIAL_TOTAL_TIMEOUT;
+        let mut idle_deadline = tokio::time::Instant::now() + STREAM_INITIAL_IDLE_TIMEOUT;
+        let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        loop {
+            let deadline = total_deadline.min(idle_deadline);
+            tokio::select! {
+                _ = self.cancel.changed() => return InitialStream::Cancelled,
+                _ = ticker.tick() => {
+                    if self.store.pending() > 0 {
+                        self.publish(SnapshotPhase::Ready);
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    tracing::debug!(
+                        ?api,
+                        "repository: streaming list did not finish, falling back to list"
+                    );
+                    return InitialStream::Unsupported;
+                }
+                event = stream.try_next() => match event {
+                    Ok(Some(WatchEvent::Added(object) | WatchEvent::Modified(object))) => {
+                        idle_deadline =
+                            tokio::time::Instant::now() + STREAM_INITIAL_IDLE_TIMEOUT;
+                        let item = map(&object);
+                        if !item.resource_version.is_empty() {
+                            resource_version.clone_from(&item.resource_version);
+                        }
+                        changed |= self.store.upsert(item);
+                        changed |= self.trim_high_churn();
+                        if self.store.pending() >= FLUSH_AT {
+                            self.publish(SnapshotPhase::Ready);
+                        }
+                    }
+                    Ok(Some(WatchEvent::Deleted(object))) => {
+                        idle_deadline =
+                            tokio::time::Instant::now() + STREAM_INITIAL_IDLE_TIMEOUT;
+                        if let Some(version) = object.resource_version() {
+                            resource_version = version;
+                        }
+                        changed |= self.store.remove(&ObjectKey::new(
+                            object.namespace().unwrap_or_default(),
+                            object.name_any(),
+                        ));
+                        changed |= self.trim_high_churn();
+                    }
+                    Ok(Some(WatchEvent::Bookmark(bookmark))) => {
+                        let initial_end =
+                            bookmark_ends_initial_events(&bookmark.metadata.annotations);
+                        if !bookmark.metadata.resource_version.is_empty() {
+                            resource_version = bookmark.metadata.resource_version;
+                        }
+                        if !initial_end {
+                            tracing::debug!(
+                                ?api,
+                                "repository: streaming list bookmark was not the initial-events-end"
+                            );
+                            return InitialStream::Unsupported;
+                        }
+                        if self.store.pending() > 0 || !self.ready {
+                            self.publish(SnapshotPhase::Ready);
+                        }
+                        return InitialStream::Listed {
+                            resource_version,
+                            changed,
+                        };
+                    }
+                    Ok(Some(WatchEvent::Error(status))) => {
+                        tracing::debug!(
+                            code = status.code,
+                            message = %status.message,
+                            ?api,
+                            "repository: streaming list error, falling back to list"
+                        );
+                        return InitialStream::Unsupported;
+                    }
+                    Ok(None) => {
+                        tracing::debug!(
+                            ?api,
+                            "repository: streaming list ended early, falling back to list"
+                        );
+                        return InitialStream::Unsupported;
+                    }
+                    Err(error) => {
+                        tracing::debug!(
+                            %error,
+                            ?api,
+                            "repository: streaming list failed, falling back to list"
+                        );
+                        return InitialStream::Unsupported;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Merge every object in the list into the store, publishing each chunk so
+    /// large kinds render progressively. Objects missing from the completed
+    /// list are removed at the end; unchanged objects are left untouched.
     /// Returns the resource version to watch from.
     async fn list_progressively<K, F>(&mut self, api: &Api<K>, map: F) -> ListOutcome
     where
@@ -502,29 +755,34 @@ impl WatchTask {
     {
         let mut params = ListParams::default().limit(LIST_CHUNK_SIZE);
         let mut resource_version = String::new();
-        let mut first_chunk = true;
+        let mut changed = false;
+        self.store.begin_sync();
         loop {
             let listed = tokio::select! {
-                _ = self.cancel.changed() => return ListOutcome::Cancelled,
+                _ = self.cancel.changed() => {
+                    self.store.abort_sync();
+                    return ListOutcome::Cancelled;
+                }
                 result = retry::bounded(api.list(&params)) => result,
             };
             let chunk = match listed {
                 Ok(chunk) => chunk,
-                Err(failure) => return ListOutcome::Failed(failure),
+                Err(failure) => {
+                    self.store.abort_sync();
+                    return ListOutcome::Failed(failure);
+                }
             };
             // Every chunk carries the version of the same list snapshot.
             if let Some(version) = chunk.metadata.resource_version {
                 resource_version = version;
             }
-            if first_chunk {
-                self.store.reset(chunk.items.iter().map(map));
-                first_chunk = false;
-            } else {
-                for object in &chunk.items {
-                    self.store.upsert(map(object));
-                }
+            for object in &chunk.items {
+                changed |= self.store.upsert(map(object));
             }
-            self.publish(SnapshotPhase::Ready);
+            changed |= self.trim_high_churn();
+            if self.store.pending() > 0 {
+                self.publish(SnapshotPhase::Ready);
+            }
             match chunk.metadata.continue_ {
                 Some(token) if !token.is_empty() => {
                     params = params.continue_token(&token);
@@ -532,7 +790,14 @@ impl WatchTask {
                 _ => break,
             }
         }
-        ListOutcome::Listed(resource_version)
+        changed |= self.store.finish_sync();
+        if self.store.pending() > 0 || !self.ready {
+            self.publish(SnapshotPhase::Ready);
+        }
+        ListOutcome::Listed {
+            resource_version,
+            changed,
+        }
     }
 
     /// Poll instead of watching — because watch was denied (RBAC) or the user
@@ -551,6 +816,10 @@ impl WatchTask {
             self.publish(SnapshotPhase::Ready);
         }
         let mut retry = Retry::new();
+        let mut unchanged_polls: u32 = 0;
+        let mut reprobe = tokio::time::interval(WATCH_REPROBE_INTERVAL);
+        reprobe.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        reprobe.tick().await;
 
         loop {
             if self.cancel.has_changed().is_err() {
@@ -558,8 +827,13 @@ impl WatchTask {
             }
 
             match self.list_progressively(api, map).await {
-                ListOutcome::Listed(_) => {
+                ListOutcome::Listed { changed, .. } => {
                     retry.list_succeeded();
+                    if changed {
+                        unchanged_polls = 0;
+                    } else {
+                        unchanged_polls = unchanged_polls.saturating_add(1);
+                    }
                 }
                 ListOutcome::Cancelled => return PollOutcome::Stop,
                 ListOutcome::Failed(failure) => match failure.action(&mut retry) {
@@ -580,16 +854,20 @@ impl WatchTask {
             }
 
             // Wait for the next tick. Refresh or a preference change re-list
-            // immediately; `Off` waits without a timer.
+            // immediately; `Off` waits without a timer. Repeated unchanged
+            // polls back off up to one minute.
             let rate = self.prefs.borrow().rate;
+            let delay = poll_delay(rate, unchanged_polls);
             tokio::select! {
                 _ = self.cancel.changed() => return PollOutcome::Stop,
                 _ = self.refresh.changed() => {
                     self.refresh.borrow_and_update();
+                    unchanged_polls = 0;
                 }
                 _ = self.prefs.changed() => {
                     let prefs = *self.prefs.borrow_and_update();
                     self.mode = WatchMode::Poll(prefs.rate);
+                    unchanged_polls = 0;
                     if prefs.mode == WatchPreference::Watch {
                         self.mode = WatchMode::Watch;
                         self.publish(SnapshotPhase::Ready);
@@ -599,15 +877,38 @@ impl WatchTask {
                     // happens on the next loop turn.
                     self.publish(SnapshotPhase::Ready);
                 }
+                _ = reprobe.tick() => {
+                    // Only an automatic denial is re-probed; an explicit
+                    // polling preference is left alone.
+                    if self.prefs.borrow().mode == WatchPreference::Watch
+                        && watch_denied(self.epoch, self.kind)
+                    {
+                        tracing::info!(?api, "repository: re-probing previously denied watch");
+                        clear_watch_denied(self.epoch, self.kind);
+                        self.mode = WatchMode::Watch;
+                        self.publish(SnapshotPhase::Ready);
+                        return PollOutcome::ResumeWatch;
+                    }
+                }
                 _ = async {
-                        match rate {
-                            PollRate::Every(secs) => {
-                                tokio::time::sleep(Duration::from_secs(secs)).await
-                            }
-                            PollRate::Off => std::future::pending().await,
+                        match delay {
+                            Some(delay) => tokio::time::sleep(delay).await,
+                            None => std::future::pending().await,
                         }
                     } => {}
             }
+        }
+    }
+}
+
+fn poll_delay(rate: PollRate, unchanged_polls: u32) -> Option<Duration> {
+    match rate {
+        PollRate::Off => None,
+        PollRate::Every(secs) => {
+            let factor = 1u64 << unchanged_polls.min(3);
+            Some(Duration::from_secs(
+                secs.saturating_mul(factor).clamp(1, 60),
+            ))
         }
     }
 }
@@ -1188,5 +1489,50 @@ mod tests {
         assert!(!watch_denied(epoch, ResourceKind::Nodes));
         clear_watch_denied(epoch, ResourceKind::Pods);
         assert!(!watch_denied(epoch, ResourceKind::Pods));
+    }
+
+    #[test]
+    fn poll_backoff_doubles_until_the_cap() {
+        assert_eq!(
+            poll_delay(PollRate::Every(5), 0),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            poll_delay(PollRate::Every(5), 1),
+            Some(Duration::from_secs(10))
+        );
+        assert_eq!(
+            poll_delay(PollRate::Every(5), 2),
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(
+            poll_delay(PollRate::Every(5), 3),
+            Some(Duration::from_secs(40))
+        );
+        assert_eq!(
+            poll_delay(PollRate::Every(10), 4),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(poll_delay(PollRate::Off, 3), None);
+    }
+
+    #[test]
+    fn streaming_lists_require_kubernetes_1_27() {
+        assert!(!version_supports_streaming("1", "26"));
+        assert!(version_supports_streaming("1", "27"));
+        assert!(version_supports_streaming("1", "37"));
+        assert!(version_supports_streaming("1", "37+"));
+        assert!(version_supports_streaming("2", "0"));
+        assert!(!version_supports_streaming("0", "99"));
+    }
+
+    #[test]
+    fn only_the_initial_events_bookmark_ends_the_stream() {
+        let mut annotations = std::collections::BTreeMap::new();
+        assert!(!bookmark_ends_initial_events(&annotations));
+        annotations.insert("k8s.io/initial-events-end".into(), "false".into());
+        assert!(!bookmark_ends_initial_events(&annotations));
+        annotations.insert("k8s.io/initial-events-end".into(), "true".into());
+        assert!(bookmark_ends_initial_events(&annotations));
     }
 }

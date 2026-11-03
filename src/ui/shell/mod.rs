@@ -620,7 +620,8 @@ impl Workspace {
     }
 
     /// Only the active tab of each visible group is live. Hidden tabs keep
-    /// their retained views but stop receiving watch updates until shown again.
+    /// their retained views and shared watch, but pause snapshot delivery and
+    /// detail/metrics work until shown again.
     fn sync_visibility(&mut self, cx: &mut Context<Self>) {
         let visible = self
             .shell

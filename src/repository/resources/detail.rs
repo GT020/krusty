@@ -1,23 +1,69 @@
-//! Generic one-shot detail fetch for every Kubernetes resource kind.
+//! Live detail follow for every Kubernetes resource kind.
 
-use kube::api::{Api, DynamicObject};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::time::Duration;
+
+use futures::TryStreamExt as _;
+use kube::ResourceExt;
+use kube::api::{Api, DynamicObject, WatchEvent, WatchParams};
 use kube::core::{ApiResource, GroupVersionKind};
 use serde_json::Value;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, watch};
 
 use crate::cluster::ClusterState;
 use crate::models::ResourceKind;
 use crate::models::resources::detail::{ResourceDetail, ResourceDetailUpdate};
+use crate::repository::retry::{self, Retry, RetryAction};
 use gpui_kit::App;
 
+const DETAIL_WATCH_TIMEOUT_SECS: u32 = 280;
+const DETAIL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
+const DETAIL_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const DETAIL_BROADCAST_CAPACITY: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct DetailKey {
+    epoch: u64,
+    kind: ResourceKind,
+    namespace: String,
+    name: String,
+}
+
+struct DetailEntry {
+    updates: broadcast::Sender<ResourceDetailUpdate>,
+    latest: Arc<Mutex<Option<ResourceDetailUpdate>>>,
+    _cancel: watch::Sender<bool>,
+}
+
+fn detail_registry() -> &'static Mutex<HashMap<DetailKey, Weak<DetailEntry>>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<DetailKey, Weak<DetailEntry>>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 pub struct ResourceDetailSubscription {
-    updates: mpsc::UnboundedReceiver<ResourceDetailUpdate>,
+    updates: broadcast::Receiver<ResourceDetailUpdate>,
+    initial: Option<ResourceDetailUpdate>,
     cancel: watch::Sender<bool>,
+    cancel_rx: watch::Receiver<bool>,
+    _entry: Arc<DetailEntry>,
 }
 
 impl ResourceDetailSubscription {
     pub async fn next(&mut self) -> Option<ResourceDetailUpdate> {
-        self.updates.recv().await
+        if let Some(initial) = self.initial.take() {
+            return Some(initial);
+        }
+        loop {
+            tokio::select! {
+                _ = self.cancel_rx.changed() => return None,
+                result = self.updates.recv() => match result {
+                    Ok(update) => return Some(update),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        }
     }
 
     pub fn cancel_handle(&self) -> watch::Sender<bool> {
@@ -40,17 +86,64 @@ pub fn subscribe_detail(
     let state = cx.global::<ClusterState>();
     let client = state.client().ok_or_else(|| "not connected".to_string())?;
     let tokio = state.tokio();
-    let (updates_tx, updates) = mpsc::unbounded_channel();
+    let key = DetailKey {
+        epoch: state.context_epoch(),
+        kind,
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+    };
+
+    let mut registry = detail_registry()
+        .lock()
+        .map_err(|_| "detail registry is poisoned".to_string())?;
+    registry.retain(|_, entry| entry.strong_count() > 0);
+
+    if let Some(entry) = registry.get(&key).and_then(Weak::upgrade) {
+        return Ok(subscription_for(entry));
+    }
+
+    let (updates, _) = broadcast::channel(DETAIL_BROADCAST_CAPACITY);
     let (cancel, cancel_rx) = watch::channel(false);
+    let latest = Arc::new(Mutex::new(None));
+    let entry = Arc::new(DetailEntry {
+        updates: updates.clone(),
+        latest: Arc::clone(&latest),
+        _cancel: cancel,
+    });
+    let receiver = updates.subscribe();
     tokio.spawn(watch_detail(
         client,
         kind,
         namespace.to_string(),
         name.to_string(),
-        updates_tx,
+        updates,
+        latest,
         cancel_rx,
     ));
-    Ok(ResourceDetailSubscription { updates, cancel })
+    registry.insert(key, Arc::downgrade(&entry));
+    drop(registry);
+
+    let (sub_cancel, sub_cancel_rx) = watch::channel(false);
+    Ok(ResourceDetailSubscription {
+        updates: receiver,
+        initial: None,
+        cancel: sub_cancel,
+        cancel_rx: sub_cancel_rx,
+        _entry: entry,
+    })
+}
+
+fn subscription_for(entry: Arc<DetailEntry>) -> ResourceDetailSubscription {
+    let updates = entry.updates.subscribe();
+    let initial = entry.latest.lock().ok().and_then(|latest| latest.clone());
+    let (cancel, cancel_rx) = watch::channel(false);
+    ResourceDetailSubscription {
+        updates,
+        initial,
+        cancel,
+        cancel_rx,
+        _entry: entry,
+    }
 }
 
 async fn watch_detail(
@@ -58,39 +151,301 @@ async fn watch_detail(
     kind: ResourceKind,
     namespace: String,
     name: String,
-    updates: mpsc::UnboundedSender<ResourceDetailUpdate>,
+    updates: broadcast::Sender<ResourceDetailUpdate>,
+    latest: Arc<Mutex<Option<ResourceDetailUpdate>>>,
     mut cancel: watch::Receiver<bool>,
 ) {
-    let resource = api_resource(kind);
-    let api: Api<DynamicObject> = if kind.is_namespaced() {
-        Api::namespaced_with(client, &namespace, &resource)
-    } else {
-        Api::all_with(client, &resource)
-    };
-    let fetched = tokio::select! {
-        _ = cancel.changed() => return,
-        result = api.get(&name) => result,
-    };
-    let result = match fetched {
-        Ok(object) => {
-            let mut value = serde_json::to_value(&object).unwrap_or(Value::Null);
-            sanitize_secret(kind, &mut value);
-            Ok(Box::new(ResourceDetail {
-                kind,
-                namespace: namespace.clone(),
-                name: name.clone(),
-                raw_json: serde_json::to_string_pretty(&value).unwrap_or_default(),
-                value,
-            }))
+    let mut retry = Retry::new();
+    let mut resource_version = String::new();
+    let mut need_get = true;
+
+    loop {
+        let api = api_for(&client, kind, &namespace);
+        if need_get {
+            let fetched = tokio::select! {
+                _ = cancel.changed() => return,
+                result = api.get(&name) => result,
+            };
+            match fetched {
+                Ok(object) => {
+                    retry.list_succeeded();
+                    if let Some(version) = object.resource_version() {
+                        resource_version = version;
+                    }
+                    if !send_detail(&updates, &latest, kind, &namespace, &name, &object) {
+                        return;
+                    }
+                    need_get = false;
+                }
+                Err(error) => {
+                    if !publish(
+                        &updates,
+                        &latest,
+                        ResourceDetailUpdate {
+                            kind,
+                            namespace: namespace.clone(),
+                            name: name.clone(),
+                            result: Err(format!(
+                                "Could not load {} details: {error}",
+                                kind.label()
+                            )),
+                        },
+                    ) {
+                        return;
+                    }
+                    match retry.failed(&error) {
+                        RetryAction::Retry(delay) => {
+                            if !sleep_or_cancel(&mut cancel, delay).await {
+                                return;
+                            }
+                            continue;
+                        }
+                        RetryAction::GiveUp => return,
+                    }
+                }
+            }
         }
-        Err(error) => Err(format!("Could not load {} details: {error}", kind.label())),
-    };
-    let _ = updates.send(ResourceDetailUpdate {
+
+        let params = WatchParams::default()
+            .timeout(DETAIL_WATCH_TIMEOUT_SECS)
+            .fields(&format!("metadata.name={name}"));
+        let watched = tokio::select! {
+            _ = cancel.changed() => return,
+            result = retry::bounded(api.watch(&params, &resource_version)) => result,
+        };
+        let mut stream = match watched {
+            Ok(stream) => {
+                retry.watch_succeeded();
+                Box::pin(stream)
+            }
+            Err(failure) => match failure.action(&mut retry) {
+                RetryAction::Retry(delay) => {
+                    if !sleep_or_cancel(&mut cancel, delay).await {
+                        return;
+                    }
+                    continue;
+                }
+                RetryAction::GiveUp => {
+                    poll_detail(
+                        &client,
+                        kind,
+                        &namespace,
+                        &name,
+                        &updates,
+                        &latest,
+                        &mut cancel,
+                    )
+                    .await;
+                    return;
+                }
+            },
+        };
+
+        let mut relist = false;
+        loop {
+            tokio::select! {
+                _ = cancel.changed() => return,
+                event = stream.try_next() => match event {
+                    Ok(Some(WatchEvent::Added(object) | WatchEvent::Modified(object))) => {
+                        retry.watch_succeeded();
+                        if let Some(version) = object.resource_version() {
+                            resource_version = version;
+                        }
+                        if !send_detail(&updates, &latest, kind, &namespace, &name, &object) {
+                            return;
+                        }
+                    }
+                    Ok(Some(WatchEvent::Deleted(_))) => {
+                        publish(
+                            &updates,
+                            &latest,
+                            ResourceDetailUpdate {
+                                kind,
+                                namespace: namespace.clone(),
+                                name: name.clone(),
+                                result: Err(format!("{} {} was deleted", kind.label(), name)),
+                            },
+                        );
+                        return;
+                    }
+                    Ok(Some(WatchEvent::Bookmark(bookmark))) => {
+                        retry.watch_succeeded();
+                        resource_version = bookmark.metadata.resource_version;
+                    }
+                    Ok(Some(WatchEvent::Error(status))) => {
+                        relist = status.code == 410
+                            || status.reason == "Expired"
+                            || status.reason == "Gone";
+                        match retry.failed_status(status.code) {
+                            RetryAction::Retry(delay) => {
+                                if !sleep_or_cancel(&mut cancel, delay).await {
+                                    return;
+                                }
+                                break;
+                            }
+                            RetryAction::GiveUp => {
+                                poll_detail(
+                                    &client,
+                                    kind,
+                                    &namespace,
+                                    &name,
+                                    &updates,
+                                    &latest,
+                                    &mut cancel,
+                                )
+                                .await;
+                                return;
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(error) => match retry.failed(&error) {
+                        RetryAction::Retry(delay) => {
+                            if !sleep_or_cancel(&mut cancel, delay).await {
+                                return;
+                            }
+                            break;
+                        }
+                        RetryAction::GiveUp => {
+                            poll_detail(
+                                &client,
+                                kind,
+                                &namespace,
+                                &name,
+                                &updates,
+                                &latest,
+                                &mut cancel,
+                            )
+                            .await;
+                            return;
+                        }
+                    },
+                }
+            }
+        }
+
+        if relist {
+            need_get = true;
+        }
+        if !sleep_or_cancel(&mut cancel, DETAIL_RECONNECT_DELAY).await {
+            return;
+        }
+    }
+}
+
+/// Watch was denied (or the object is not watchable): keep the detail fresh
+/// with a low-frequency GET instead of hammering the watch endpoint.
+async fn poll_detail(
+    client: &kube::Client,
+    kind: ResourceKind,
+    namespace: &str,
+    name: &str,
+    updates: &broadcast::Sender<ResourceDetailUpdate>,
+    latest: &Arc<Mutex<Option<ResourceDetailUpdate>>>,
+    cancel: &mut watch::Receiver<bool>,
+) {
+    let mut retry = Retry::new();
+    let api = api_for(client, kind, namespace);
+    loop {
+        let fetched = tokio::select! {
+            _ = cancel.changed() => return,
+            result = api.get(name) => result,
+        };
+        match fetched {
+            Ok(object) => {
+                retry.list_succeeded();
+                if !send_detail(updates, latest, kind, namespace, name, &object) {
+                    return;
+                }
+            }
+            Err(error) => {
+                if !publish(
+                    updates,
+                    latest,
+                    ResourceDetailUpdate {
+                        kind,
+                        namespace: namespace.to_string(),
+                        name: name.to_string(),
+                        result: Err(format!("Could not load {} details: {error}", kind.label())),
+                    },
+                ) {
+                    return;
+                }
+                match retry.failed(&error) {
+                    RetryAction::Retry(delay) => {
+                        if !sleep_or_cancel(cancel, delay).await {
+                            return;
+                        }
+                        continue;
+                    }
+                    RetryAction::GiveUp => return,
+                }
+            }
+        }
+        if !sleep_or_cancel(cancel, DETAIL_POLL_INTERVAL).await {
+            return;
+        }
+    }
+}
+
+fn fmt_detail(
+    kind: ResourceKind,
+    namespace: &str,
+    name: &str,
+    object: &DynamicObject,
+) -> ResourceDetailUpdate {
+    let mut value = serde_json::to_value(object).unwrap_or(Value::Null);
+    sanitize_secret(kind, &mut value);
+    ResourceDetailUpdate {
         kind,
-        namespace,
-        name,
-        result,
-    });
+        namespace: namespace.to_string(),
+        name: name.to_string(),
+        result: Ok(Box::new(ResourceDetail {
+            kind,
+            namespace: namespace.to_string(),
+            name: name.to_string(),
+            raw_json: serde_json::to_string_pretty(&value).unwrap_or_default(),
+            value,
+        })),
+    }
+}
+
+fn send_detail(
+    updates: &broadcast::Sender<ResourceDetailUpdate>,
+    latest: &Arc<Mutex<Option<ResourceDetailUpdate>>>,
+    kind: ResourceKind,
+    namespace: &str,
+    name: &str,
+    object: &DynamicObject,
+) -> bool {
+    publish(updates, latest, fmt_detail(kind, namespace, name, object))
+}
+
+fn publish(
+    updates: &broadcast::Sender<ResourceDetailUpdate>,
+    latest: &Arc<Mutex<Option<ResourceDetailUpdate>>>,
+    update: ResourceDetailUpdate,
+) -> bool {
+    if let Ok(mut latest) = latest.lock() {
+        *latest = Some(update.clone());
+    }
+    updates.send(update).is_ok()
+}
+
+async fn sleep_or_cancel(cancel: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+    tokio::select! {
+        _ = cancel.changed() => false,
+        _ = tokio::time::sleep(duration) => true,
+    }
+}
+
+fn api_for(client: &kube::Client, kind: ResourceKind, namespace: &str) -> Api<DynamicObject> {
+    let resource = api_resource(kind);
+    if kind.is_namespaced() {
+        Api::namespaced_with(client.clone(), namespace, &resource)
+    } else {
+        Api::all_with(client.clone(), &resource)
+    }
 }
 
 fn api_resource(kind: ResourceKind) -> ApiResource {
