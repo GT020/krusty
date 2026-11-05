@@ -254,6 +254,9 @@ where
             Command::SetPrefs(prefs) => {
                 self.prefs = prefs;
                 self.watch_denied = false;
+                if prefs.mode == WatchPreference::Watch {
+                    super::clear_watch_denied(self.epoch, self.kind);
+                }
                 self.mode = match prefs.mode {
                     WatchPreference::Watch => WatchMode::Watch,
                     WatchPreference::Poll => WatchMode::Poll(prefs.rate),
@@ -313,6 +316,7 @@ where
                         "store: watch denied, falling back to polling"
                     );
                     self.watch_denied = true;
+                    super::mark_watch_denied(self.epoch, self.kind);
                     self.mode = WatchMode::Poll(self.prefs.rate);
                     let plan = self.plan.clone().unwrap_or_else(|| self.compute_plan());
                     self.restart_watches(plan);
@@ -345,9 +349,15 @@ where
     }
 
     fn compute_plan(&self) -> StoreWatchPlan {
-        let global = match self.mode {
-            WatchMode::Watch => self.global_watch,
-            WatchMode::Poll(_) => self.global_list,
+        let global = if !self.kind.is_namespaced() {
+            // Cluster-scoped kinds such as Namespaces are inherently global;
+            // the all-namespace RBAC probe must not block them.
+            true
+        } else {
+            match self.mode {
+                WatchMode::Watch => self.global_watch,
+                WatchMode::Poll(_) => self.global_list,
+            }
         };
         watch_plan(
             self.scopes.keys().cloned(),
