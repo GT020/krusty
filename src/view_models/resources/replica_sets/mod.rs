@@ -164,7 +164,7 @@ impl ReplicaSetsViewModel {
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
         let subscription =
-            match repository::resources::replica_sets::subscribe(cx, self.scope.clone()) {
+            match repository::subscribe(cx, ResourceKind::ReplicaSets, self.scope.clone()) {
                 Ok(s) => s,
                 Err(error) => {
                     use crate::models::ResourceSnapshot;

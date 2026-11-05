@@ -4,58 +4,75 @@
 pub mod custom_resources;
 pub mod resources;
 pub mod retry;
+pub mod store;
+pub mod terminal;
 pub mod watch_prefs;
 
 pub use watch_prefs::{WatchPreference, WatchPrefs};
 
+use std::any::Any;
 use std::collections::HashMap;
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 use gpui_kit::{App, BorrowAppContext as _, Global};
 use tokio::sync::watch;
 
-use crate::cluster::ClusterState;
-use crate::models::{NamespaceScope, PollRate, ResourceKind, ResourceSnapshot, WatchMode};
+use crate::models::{NamespaceScope, PollRate, ResourceKind, ResourceSnapshot};
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct SubscriptionKey {
-    epoch: u64,
-    kind: ResourceKind,
-    scope: NamespaceScope,
-}
-
-struct Entry {
-    snapshots: watch::Sender<Arc<ResourceSnapshot>>,
-    _cancel: watch::Sender<bool>,
-    refresh: watch::Sender<u64>,
-    prefs: watch::Sender<WatchPrefs>,
+pub(crate) struct StoreEntry {
+    pub epoch: u64,
+    /// Held strongly for the cluster lifetime. The watch itself still stops
+    /// when the last subscriber leaves; only the cached data is retained.
+    pub store: Arc<store::KubeObjectStoreHandle>,
 }
 
 pub struct Repository {
-    entries: HashMap<SubscriptionKey, Weak<Entry>>,
     watch_prefs: watch_prefs::WatchPrefsStore,
+    pub(crate) stores: HashMap<ResourceKind, StoreEntry>,
+    pub(crate) terminal: terminal::TerminalSessionStore,
 }
 
 impl Global for Repository {}
 
 pub fn init(cx: &mut App) {
     cx.set_global(Repository {
-        entries: HashMap::new(),
         watch_prefs: watch_prefs::WatchPrefsStore::load(),
+        stores: HashMap::new(),
+        terminal: terminal::TerminalSessionStore::default(),
     });
 }
 
-/// A live list/watch subscription. Dropping the last handle for a key cancels
-/// the background watch task.
+/// A live store subscription. Dropping the last handle releases the view and
+/// stops the shared watch when no other view needs it.
+///
+/// The source is intentionally generic: views consume the same snapshot API
+/// regardless of which store feeds them.
 #[derive(Clone)]
 pub struct Subscription {
     rx: watch::Receiver<Arc<ResourceSnapshot>>,
     paused: watch::Sender<bool>,
     paused_rx: watch::Receiver<bool>,
-    _entry: Arc<Entry>,
+    refresh: Arc<dyn Fn() + Send + Sync>,
+    _keep_alive: Arc<dyn Any + Send + Sync>,
 }
 
 impl Subscription {
+    pub(crate) fn new(
+        rx: watch::Receiver<Arc<ResourceSnapshot>>,
+        paused: watch::Sender<bool>,
+        paused_rx: watch::Receiver<bool>,
+        refresh: Arc<dyn Fn() + Send + Sync>,
+        keep_alive: Arc<dyn Any + Send + Sync>,
+    ) -> Self {
+        Self {
+            rx,
+            paused,
+            paused_rx,
+            refresh,
+            _keep_alive: keep_alive,
+        }
+    }
+
     pub fn snapshot(&self) -> Arc<ResourceSnapshot> {
         self.rx.borrow().clone()
     }
@@ -108,9 +125,7 @@ impl Subscription {
 
     /// Ask the shared watch task to perform a fresh list.
     pub fn refresh(&self) {
-        self._entry.refresh.send_modify(|generation| {
-            *generation = generation.wrapping_add(1);
-        });
+        (self.refresh)();
     }
 }
 
@@ -129,97 +144,12 @@ pub(crate) fn subscribe_kind(
     kind: ResourceKind,
     scope: NamespaceScope,
 ) -> Result<Subscription, String> {
-    let state = cx.global::<ClusterState>();
-    let client = state.client().ok_or_else(|| "not connected".to_string())?;
-    let tokio = state.tokio();
-    let scope = if kind.is_namespaced() {
-        scope
-    } else {
-        NamespaceScope::All
-    };
-    let key = SubscriptionKey {
-        epoch: state.context_epoch(),
-        kind,
-        scope: scope.clone(),
-    };
-
-    Ok(cx.update_global::<Repository, _>(|repository, _| {
-        repository
-            .entries
-            .retain(|_, entry| entry.strong_count() > 0);
-
-        if let Some(entry) = repository.entries.get(&key).and_then(Weak::upgrade) {
-            tracing::trace!(
-                ?kind,
-                ?scope,
-                active = repository.entries.len(),
-                "repository: subscription reused"
-            );
-            let (paused, paused_rx) = watch::channel(false);
-            return Subscription {
-                rx: entry.snapshots.subscribe(),
-                paused,
-                paused_rx,
-                _entry: entry,
-            };
-        }
-
-        let mut initial_prefs = repository.watch_prefs.prefs_for(kind);
-        if initial_prefs.mode == WatchPreference::Watch
-            && resources::watcher::watch_denied(key.epoch, kind)
-        {
-            // Watch is known to be denied for this kind: go straight to
-            // polling instead of re-trying the doomed watch on every
-            // namespace filter change. The saved preference stays `Watch`.
-            initial_prefs.mode = WatchPreference::Poll;
-        }
-        let initial_mode = match initial_prefs.mode {
-            WatchPreference::Watch => WatchMode::Watch,
-            WatchPreference::Poll => WatchMode::Poll(initial_prefs.rate),
-        };
-
-        let (snapshots, rx) = watch::channel(Arc::new(
-            ResourceSnapshot::loading().with_mode(initial_mode),
-        ));
-        let (cancel, cancel_rx) = watch::channel(false);
-        let (refresh, refresh_rx) = watch::channel(0u64);
-        let (prefs, prefs_rx) = watch::channel(initial_prefs);
-        let entry = Arc::new(Entry {
-            snapshots: snapshots.clone(),
-            _cancel: cancel,
-            refresh,
-            prefs,
-        });
-        let scope_log = scope.clone();
-        let watch_task = resources::watcher::run(
-            client, kind, scope, key.epoch, snapshots, cancel_rx, refresh_rx, prefs_rx,
-        );
-        tokio.spawn(watch_task);
-        repository.entries.insert(key, Arc::downgrade(&entry));
-        tracing::debug!(
-            ?kind,
-            scope = ?scope_log,
-            active = repository.entries.len(),
-            "repository: subscription created"
-        );
-        let (paused, paused_rx) = watch::channel(false);
-        Subscription {
-            rx,
-            paused,
-            paused_rx,
-            _entry: entry,
-        }
-    }))
+    store::subscribe(cx, kind, scope)
 }
 
 /// Set whether a resource kind is watched live or polled. The saved poll rate
 /// is kept. Applies to every running watch task for the kind and is saved.
 pub fn set_watch_preference(cx: &mut App, kind: ResourceKind, mode: WatchPreference) {
-    if mode == WatchPreference::Watch {
-        // Explicit request: forget any RBAC denial so the watch is retried.
-        let epoch = cx.global::<ClusterState>().context_epoch();
-        resources::watcher::clear_watch_denied(epoch, kind);
-    }
     update_watch_prefs(cx, kind, |prefs| prefs.mode = mode);
 }
 
@@ -233,20 +163,14 @@ pub fn set_poll_rate(cx: &mut App, kind: ResourceKind, rate: PollRate) {
 }
 
 fn update_watch_prefs(cx: &mut App, kind: ResourceKind, change: impl FnOnce(&mut WatchPrefs)) {
-    let epoch = cx.global::<ClusterState>().context_epoch();
     cx.update_global::<Repository, _>(|repository, _| {
         repository.watch_prefs.update(kind, change);
         if let Err(error) = repository.watch_prefs.save() {
             tracing::warn!(%error, "repository: failed to save watch prefs");
         }
         let prefs = repository.watch_prefs.prefs_for(kind);
-        for (key, entry) in &repository.entries {
-            if key.kind == kind
-                && key.epoch == epoch
-                && let Some(entry) = entry.upgrade()
-            {
-                entry.prefs.send_replace(prefs);
-            }
+        if let Some(entry) = repository.stores.get(&kind) {
+            entry.store.set_prefs(prefs);
         }
     });
 }
@@ -261,22 +185,9 @@ mod tests {
     #[tokio::test]
     async fn a_paused_subscription_coalesces_until_resumed() {
         let (snapshots, rx) = watch::channel(Arc::new(ResourceSnapshot::loading()));
-        let (cancel, _) = watch::channel(false);
-        let (refresh, _) = watch::channel(0u64);
-        let (prefs, _) = watch::channel(WatchPrefs::default());
-        let entry = Arc::new(Entry {
-            snapshots: snapshots.clone(),
-            _cancel: cancel,
-            refresh,
-            prefs,
-        });
         let (paused, paused_rx) = watch::channel(false);
-        let mut subscription = Subscription {
-            rx,
-            paused,
-            paused_rx,
-            _entry: entry,
-        };
+        let refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
+        let mut subscription = Subscription::new(rx, paused, paused_rx, refresh, Arc::new(()));
 
         subscription.set_paused(true);
         snapshots.send_replace(Arc::new(ResourceSnapshot::failed("offline")));

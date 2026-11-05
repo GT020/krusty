@@ -7,15 +7,23 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use gpui_kit::{Context, Subscription, Window};
 use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
 use crate::models::resources::node::detail::NodeUsage;
-use crate::models::resources::overview::ClusterOverviewStats;
-use crate::models::{NamespaceScope, ResourceKind, ResourceSnapshot};
+use crate::models::resources::overview::{ClusterOverviewStats, is_unhealthy_pod};
+use crate::models::{Item, NamespaceScope, ResourceKind, ResourceSnapshot};
 use crate::repository;
+
+/// Pods change constantly on a busy cluster. The overview only shows
+/// aggregate counts and a handful of rows, so coalesce watch snapshots instead
+/// of recomputing and repainting for every 50 ms repository flush.
+const OVERVIEW_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+/// Rows shown in the "Pods needing attention" preview.
+const UNHEALTHY_PREVIEW: usize = 8;
 
 pub struct ClusterOverviewViewModel {
     active: Arc<AtomicBool>,
@@ -23,7 +31,10 @@ pub struct ClusterOverviewViewModel {
     node_snapshot: Arc<ResourceSnapshot>,
     pod_snapshot: Arc<ResourceSnapshot>,
     stats: ClusterOverviewStats,
-    metrics: BTreeMap<String, NodeUsage>,
+    /// Sorted unhealthy pods, truncated to [`UNHEALTHY_PREVIEW`], derived once
+    /// per refresh so rendering does not rescan every pod.
+    unhealthy: Arc<[Arc<Item>]>,
+    metrics: Arc<BTreeMap<String, NodeUsage>>,
     metrics_error: Option<String>,
     metrics_generation: u64,
     nodes: Option<repository::Subscription>,
@@ -57,7 +68,8 @@ impl ClusterOverviewViewModel {
             node_snapshot: Arc::new(ResourceSnapshot::loading()),
             pod_snapshot: Arc::new(ResourceSnapshot::loading()),
             stats: ClusterOverviewStats::default(),
-            metrics: BTreeMap::new(),
+            unhealthy: Arc::from(Vec::<Arc<Item>>::new()),
+            metrics: Arc::new(BTreeMap::new()),
             metrics_error: None,
             metrics_generation: 0,
             nodes: None,
@@ -75,15 +87,18 @@ impl ClusterOverviewViewModel {
         &self.stats
     }
 
-    pub fn nodes(&self) -> &[Arc<crate::models::Item>] {
-        self.node_snapshot.items()
+    /// O(1) clone of the current nodes snapshot; the render path uses it
+    /// instead of copying every `Arc<Item>` into a temporary `Vec`.
+    pub fn node_snapshot(&self) -> Arc<ResourceSnapshot> {
+        self.node_snapshot.clone()
     }
 
-    pub fn pods(&self) -> &[Arc<crate::models::Item>] {
-        self.pod_snapshot.items()
+    /// Top unhealthy pods, already sorted and truncated for the preview.
+    pub fn unhealthy_pods(&self) -> Arc<[Arc<Item>]> {
+        self.unhealthy.clone()
     }
 
-    pub fn metrics(&self) -> &BTreeMap<String, NodeUsage> {
+    pub fn metrics(&self) -> &Arc<BTreeMap<String, NodeUsage>> {
         &self.metrics
     }
 
@@ -174,37 +189,64 @@ impl ClusterOverviewViewModel {
         let mut nodes = self.nodes.clone();
         let mut pods = self.pods.clone();
         cx.spawn(async move |this, cx| {
+            let mut last_refresh: Option<Instant> = None;
             loop {
-                tokio::select! {
+                let update = tokio::select! {
                     _ = cancel_rx.changed() => break,
-                    snapshot = next_snapshot(&mut nodes) => {
-                        let Some(snapshot) = snapshot else {
+                    snapshot = next_snapshot(&mut nodes) => match snapshot {
+                        Some(snapshot) => Some((false, snapshot)),
+                        None => {
                             nodes = None;
-                            continue;
-                        };
-                        let applied = this.update(cx, |this, cx| {
-                            this.node_snapshot = snapshot;
-                            this.recompute();
-                            cx.notify();
-                        });
-                        if applied.is_err() {
-                            break;
+                            None
                         }
-                    }
-                    snapshot = next_snapshot(&mut pods) => {
-                        let Some(snapshot) = snapshot else {
+                    },
+                    snapshot = next_snapshot(&mut pods) => match snapshot {
+                        Some(snapshot) => Some((true, snapshot)),
+                        None => {
                             pods = None;
-                            continue;
-                        };
-                        let applied = this.update(cx, |this, cx| {
-                            this.pod_snapshot = snapshot;
-                            this.recompute();
-                            cx.notify();
-                        });
-                        if applied.is_err() {
-                            break;
+                            None
+                        }
+                    },
+                };
+                let Some((pod_update, snapshot)) = update else {
+                    if nodes.is_none() && pods.is_none() {
+                        break;
+                    }
+                    continue;
+                };
+
+                // Coalesce bursts: watch channels keep only the latest value,
+                // so waiting here drops intermediate snapshots instead of
+                // recomputing and repainting for each one.
+                if let Some(last) = last_refresh {
+                    let elapsed = last.elapsed();
+                    if elapsed < OVERVIEW_REFRESH_INTERVAL {
+                        tokio::select! {
+                            _ = cancel_rx.changed() => break,
+                            _ = cx
+                                .background_executor()
+                                .timer(OVERVIEW_REFRESH_INTERVAL - elapsed) => {}
                         }
                     }
+                }
+                last_refresh = Some(Instant::now());
+
+                let applied = this.update(cx, |this, cx| {
+                    if pod_update {
+                        this.pod_snapshot = snapshot;
+                    } else {
+                        this.node_snapshot = snapshot;
+                    }
+                    // A hidden tab may still finish one in-flight refresh.
+                    // Keep the snapshot but skip the work until `set_active`
+                    // recomputes on resume.
+                    if this.is_active() {
+                        this.recompute();
+                        cx.notify();
+                    }
+                });
+                if applied.is_err() {
+                    break;
                 }
             }
         })
@@ -215,6 +257,21 @@ impl ClusterOverviewViewModel {
     fn recompute(&mut self) {
         self.stats =
             ClusterOverviewStats::from_items(self.node_snapshot.items(), self.pod_snapshot.items());
+
+        let mut unhealthy: Vec<Arc<Item>> = self
+            .pod_snapshot
+            .items()
+            .iter()
+            .filter(|pod| is_unhealthy_pod(pod))
+            .cloned()
+            .collect();
+        unhealthy.sort_by(|left, right| {
+            left.namespace
+                .cmp(&right.namespace)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+        unhealthy.truncate(UNHEALTHY_PREVIEW);
+        self.unhealthy = Arc::from(unhealthy);
     }
 
     fn cancel_pump(&mut self) {
@@ -229,7 +286,7 @@ impl ClusterOverviewViewModel {
         if let Some(cancel) = self.metrics_cancel.take() {
             let _ = cancel.send(true);
         }
-        self.metrics.clear();
+        self.metrics = Arc::new(BTreeMap::new());
         self.metrics_error = None;
         self.metrics_generation = self.metrics_generation.wrapping_add(1);
     }
@@ -242,7 +299,7 @@ impl ClusterOverviewViewModel {
         if let Some(cancel) = self.metrics_cancel.take() {
             let _ = cancel.send(true);
         }
-        self.metrics.clear();
+        self.metrics = Arc::new(BTreeMap::new());
         self.metrics_error = None;
         self.metrics_generation = self.metrics_generation.wrapping_add(1);
         let generation = self.metrics_generation;
@@ -264,11 +321,11 @@ impl ClusterOverviewViewModel {
                     }
                     match update {
                         Ok(metrics) => {
-                            this.metrics = metrics;
+                            this.metrics = Arc::new(metrics);
                             this.metrics_error = None;
                         }
                         Err(error) => {
-                            this.metrics.clear();
+                            this.metrics = Arc::new(BTreeMap::new());
                             this.metrics_error = Some(error);
                         }
                     }

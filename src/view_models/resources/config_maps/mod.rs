@@ -160,7 +160,7 @@ impl ConfigMapsViewModel {
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
         let subscription =
-            match repository::resources::config_maps::subscribe(cx, self.scope.clone()) {
+            match repository::subscribe(cx, ResourceKind::ConfigMaps, self.scope.clone()) {
                 Ok(s) => s,
                 Err(error) => {
                     use crate::models::ResourceSnapshot;

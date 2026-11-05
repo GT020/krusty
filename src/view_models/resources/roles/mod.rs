@@ -158,7 +158,8 @@ impl RolesViewModel {
 
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
-        let subscription = match repository::resources::roles::subscribe(cx, self.scope.clone()) {
+        let subscription = match repository::subscribe(cx, ResourceKind::Roles, self.scope.clone())
+        {
             Ok(s) => s,
             Err(error) => {
                 use crate::models::ResourceSnapshot;

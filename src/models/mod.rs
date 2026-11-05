@@ -10,5 +10,5 @@ pub use resources::{
     ConfigMapsModel, DaemonSetsModel, DeploymentsModel, IngressesModel, Item, JobsModel,
     NodesModel, ObjectKey, PersistentVolumeClaimsModel, PersistentVolumesModel, PodsModel,
     PollRate, ResourceDetail, ResourceDetailState, ResourceDetailUpdate, ResourceKind,
-    ResourceSnapshot, ResourceStore, SecretsModel, ServicesModel, SnapshotPhase, WatchMode,
+    ResourceSnapshot, SecretsModel, ServicesModel, SnapshotPhase, WatchMode,
 };

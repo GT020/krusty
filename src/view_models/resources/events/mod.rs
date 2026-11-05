@@ -158,7 +158,8 @@ impl EventsViewModel {
 
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
-        let subscription = match repository::resources::events::subscribe(cx, self.scope.clone()) {
+        let subscription = match repository::subscribe(cx, ResourceKind::Events, self.scope.clone())
+        {
             Ok(s) => s,
             Err(error) => {
                 use crate::models::ResourceSnapshot;
