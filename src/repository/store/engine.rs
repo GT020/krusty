@@ -546,15 +546,12 @@ async fn run_watch<K, F>(
                         need_list = false;
                     }
                     Err(error) => {
-                        let delay = match &error {
-                            kube::Error::Api(response) if response.code == 403 => {
-                                WATCH_DENIED_RETRY
-                            }
-                            _ => RECONNECT_DELAY,
-                        };
                         let message = format!("Could not list resources: {error}");
                         let _ = events.send(StoreEvent::Error(scope.clone(), message));
-                        if !sleep_or_cancel(&mut cancel, delay).await {
+                        if is_forbidden(&error) {
+                            return;
+                        }
+                        if !sleep_or_cancel(&mut cancel, RECONNECT_DELAY).await {
                             return;
                         }
                         continue;
@@ -574,6 +571,9 @@ async fn run_watch<K, F>(
             Err(error) => {
                 let message = format!("Could not watch resources: {error}");
                 let _ = events.send(StoreEvent::WatchError(scope.clone(), message));
+                if is_forbidden(&error) {
+                    return;
+                }
                 if !sleep_or_cancel(&mut cancel, WATCH_DENIED_RETRY).await {
                     return;
                 }
@@ -582,7 +582,6 @@ async fn run_watch<K, F>(
         };
 
         let mut relist = false;
-        let mut denied = false;
         loop {
             let event = tokio::select! {
                 _ = cancel.changed() => return,
@@ -622,8 +621,11 @@ async fn run_watch<K, F>(
                         status.code == 410 || status.reason == "Expired" || status.reason == "Gone";
                     if relist {
                         tracing::debug!(code = status.code, "store: watch expired, relisting");
+                    } else if status.code == 403 {
+                        let message = format!("Watch error (403): {}", status.message);
+                        let _ = events.send(StoreEvent::WatchError(scope.clone(), message));
+                        return;
                     } else {
-                        denied = status.code == 403;
                         let message = format!("Watch error ({}): {}", status.code, status.message);
                         let _ = events.send(StoreEvent::WatchError(scope.clone(), message));
                     }
@@ -644,15 +646,14 @@ async fn run_watch<K, F>(
             need_list = true;
         }
 
-        let delay = if denied {
-            WATCH_DENIED_RETRY
-        } else {
-            RECONNECT_DELAY
-        };
-        if !sleep_or_cancel(&mut cancel, delay).await {
+        if !sleep_or_cancel(&mut cancel, RECONNECT_DELAY).await {
             return;
         }
     }
+}
+
+fn is_forbidden(error: &kube::Error) -> bool {
+    matches!(error, kube::Error::Api(response) if response.code == 403)
 }
 
 async fn sleep_or_cancel(cancel: &mut watch::Receiver<bool>, duration: Duration) -> bool {
