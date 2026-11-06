@@ -1,6 +1,6 @@
 //! Namespace filter shared by repositories and view-models.
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NamespaceScope {
     #[default]
     All,

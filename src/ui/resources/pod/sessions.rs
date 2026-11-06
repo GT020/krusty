@@ -101,7 +101,7 @@ impl PodSession {
     pub fn shutdown(self, cx: &mut App) {
         match self {
             Self::Logs { vm, .. } => vm.update(cx, |vm, _| vm.shutdown()),
-            Self::Exec { vm, .. } => vm.update(cx, |vm, _| vm.shutdown()),
+            Self::Exec { vm, .. } => vm.update(cx, |vm, cx| vm.shutdown(cx)),
         }
     }
 }

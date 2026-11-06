@@ -3,6 +3,10 @@ pub mod kubeconfig;
 use std::time::Duration;
 
 use gpui_kit::{App, BorrowAppContext as _, Global};
+use k8s_openapi::api::authorization::v1::{
+    ResourceAttributes, SelfSubjectAccessReview, SelfSubjectAccessReviewSpec,
+};
+use kube::api::{Api, PostParams};
 use kube::{Client, Config};
 use tokio::sync::watch;
 
@@ -44,6 +48,9 @@ pub struct ClusterState {
     store: kubeconfig::ConfigStore,
     reachable: Option<bool>,
     namespaces: Vec<String>,
+    /// Whether the current credentials may watch across all namespaces. This
+    /// is the Freelens `isGlobalWatchEnabled` equivalent.
+    global_watch: bool,
     context_epoch: u64,
     namespace_cancel: Option<watch::Sender<bool>>,
     /// Kept alive for the app lifetime: the selector's handle on the shared
@@ -91,6 +98,10 @@ impl ClusterState {
 
     pub fn namespaces(&self) -> &[String] {
         &self.namespaces
+    }
+
+    pub fn global_watch(&self) -> bool {
+        self.global_watch
     }
 }
 
@@ -167,6 +178,7 @@ pub fn init(cx: &mut App) {
         store,
         reachable: None,
         namespaces: Vec::new(),
+        global_watch: true,
         context_epoch: 0,
         namespace_cancel: None,
         namespace_subscription: None,
@@ -184,7 +196,7 @@ pub fn init(cx: &mut App) {
 
 /// Start or restart the shared namespace subscription. The selector and the
 /// Namespaces resource page read from the same repository watcher, so
-/// namespaces are fetched once per context and follow the saved poll rate.
+/// namespaces are fetched once per context and kept live by the shared store.
 pub fn refresh_namespaces(cx: &mut App) {
     if cx.global::<ClusterState>().client.is_none() {
         return;
@@ -324,6 +336,52 @@ async fn build_client(
     Ok(client)
 }
 
+/// Ask the API server whether this identity may watch every namespace.
+///
+/// This is the krusty equivalent of Freelens's
+/// `canI({ verb: "watch", resource: "*" })` check. If the review itself cannot
+/// be created we stay optimistic and let the store's error state report any
+/// real denial; a missing authorization.k8s.io API should not disable the
+/// normal all-namespace path.
+async fn probe_global_access(client: &Client, verb: &str) -> bool {
+    let review = SelfSubjectAccessReview {
+        spec: SelfSubjectAccessReviewSpec {
+            resource_attributes: Some(ResourceAttributes {
+                verb: Some(verb.to_string()),
+                resource: Some("*".to_string()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let api: Api<SelfSubjectAccessReview> = Api::all(client.clone());
+    match api.create(&PostParams::default(), &review).await {
+        Ok(review) => {
+            let allowed = review_allows_watch(&review);
+            tracing::debug!(verb, allowed, "cluster: global capability probed");
+            allowed
+        }
+        Err(error) => {
+            tracing::warn!(verb, %error, "cluster: global capability probe failed, staying optimistic");
+            true
+        }
+    }
+}
+
+async fn probe_capabilities(client: &Client) -> bool {
+    probe_global_access(client, "watch").await
+}
+
+fn review_allows_watch(review: &SelfSubjectAccessReview) -> bool {
+    review
+        .status
+        .as_ref()
+        .map(|status| status.allowed)
+        .unwrap_or(false)
+}
+
 /// Build the client for `context` in the background and publish it when ready.
 /// The epoch bump resubscribes every resource view; namespace polling starts
 /// here too. Stale builds (superseded by a newer switch) are discarded.
@@ -338,9 +396,29 @@ fn spawn_client_build(cx: &mut App, context: ContextInfo) {
     };
     let context_id = context.id.clone();
     let started = std::time::Instant::now();
+    let probe_tokio = tokio.clone();
     let building = tokio.spawn(build_client(kubeconfig, context.source, store));
     cx.spawn(async move |cx: &mut gpui_kit::AsyncApp| {
         let built = building.await;
+        let global_watch = match &built {
+            Ok(Ok(client)) => {
+                // The capability probe performs HTTP requests and must run on
+                // the cluster runtime, not on GPUI's executor: hyper's connect
+                // timeout needs the Tokio reactor.
+                let client = client.clone();
+                match probe_tokio
+                    .spawn(async move { probe_capabilities(&client).await })
+                    .await
+                {
+                    Ok(allowed) => allowed,
+                    Err(error) => {
+                        tracing::warn!(%error, "cluster: capability probe task failed");
+                        true
+                    }
+                }
+            }
+            _ => true,
+        };
         cx.update(|cx| {
             let state = cx.global::<ClusterState>();
             if state.active_id() != Some(context_id.as_str()) {
@@ -351,11 +429,13 @@ fn spawn_client_build(cx: &mut App, context: ContextInfo) {
                 Ok(Ok(client)) => {
                     tracing::info!(
                         context = %context_id,
+                        global_watch,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "cluster: client ready"
                     );
                     cx.update_global::<ClusterState, _>(|state, _| {
                         state.client = Some(client);
+                        state.global_watch = global_watch;
                         state.context_epoch = state.context_epoch.wrapping_add(1);
                     });
                     refresh_namespaces(cx);
@@ -550,6 +630,28 @@ users:
         let runtime = tokio::runtime::Runtime::new().expect("runtime");
         let client = runtime.block_on(build_client(None, contexts[0].source.clone(), store));
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn global_watch_review_requires_an_allowed_status() {
+        let mut review = SelfSubjectAccessReview::default();
+        assert!(!review_allows_watch(&review));
+
+        review.status = Some(
+            k8s_openapi::api::authorization::v1::SubjectAccessReviewStatus {
+                allowed: false,
+                ..Default::default()
+            },
+        );
+        assert!(!review_allows_watch(&review));
+
+        review.status = Some(
+            k8s_openapi::api::authorization::v1::SubjectAccessReviewStatus {
+                allowed: true,
+                ..Default::default()
+            },
+        );
+        assert!(review_allows_watch(&review));
     }
 
     #[test]

@@ -1,18 +1,16 @@
 //! Repository for Pods: live list/watch plus one-shot detail and metrics reads.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures::{AsyncBufReadExt, SinkExt, TryStreamExt};
+use futures::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
     Container, ContainerState, ContainerStatus, EnvVar, Pod, PodStatus, Toleration, Volume,
 };
-use kube::api::{
-    Api, AttachParams, DynamicObject, LogParams, TerminalSize, WatchEvent, WatchParams,
-};
+use kube::api::{Api, DynamicObject, LogParams};
 use kube::core::{ApiResource, GroupVersionKind};
 use kube::{Client, ResourceExt};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
 use crate::cluster::ClusterState;
@@ -20,15 +18,13 @@ use crate::models::resources::pod::detail::{
     PodCondition, PodContainer, PodDetail, PodDetailUpdate, PodOwner, PodToleration, PodUsage,
     PodVolume,
 };
-use crate::models::{NamespaceScope, ResourceKind};
+use crate::models::{NamespaceScope, ObjectKey, ResourceKind, SnapshotPhase};
 use gpui_kit::App;
 
-use crate::repository::retry::{self, Retry, RetryAction};
+use crate::repository::retry::{Retry, RetryAction};
 use crate::repository::{Subscription, subscribe_kind};
 
 const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
-const DETAIL_WATCH_TIMEOUT_SECS: u32 = 280;
-const DETAIL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 
 /// Subscribe to the live Pods stream.
 /// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
@@ -222,222 +218,26 @@ async fn watch_logs(
     }
 }
 
-/// An interactive TTY exec session for one pod container.
-pub struct PodExecSession {
-    updates: mpsc::UnboundedReceiver<Result<Vec<u8>, String>>,
-    input: mpsc::UnboundedSender<Vec<u8>>,
-    resize: mpsc::UnboundedSender<(u16, u16)>,
-    cancel: watch::Sender<bool>,
+/// Read the cached container names without creating a subscription or a
+/// network request. Returns `None` when the pod is not cached yet.
+pub fn cached_containers(cx: &App, namespace: &str, name: &str) -> Option<Vec<String>> {
+    let key = ObjectKey::new(namespace, name);
+    let record = crate::repository::store::cached_object(cx, ResourceKind::Pods, &key)?;
+    let pod = record.typed::<Pod>()?;
+    Some(
+        pod.spec
+            .as_ref()?
+            .containers
+            .iter()
+            .map(|container| container.name.clone())
+            .collect(),
+    )
 }
 
-impl PodExecSession {
-    pub async fn next(&mut self) -> Option<Result<Vec<u8>, String>> {
-        self.updates.recv().await
-    }
-
-    /// Clone the input channel so the UI can keep sending after the session
-    /// itself has been moved into a background task.
-    pub fn input_handle(&self) -> mpsc::UnboundedSender<Vec<u8>> {
-        self.input.clone()
-    }
-
-    /// Notify the remote TTY about a new size in columns and rows.
-    pub fn resize_handle(&self) -> mpsc::UnboundedSender<(u16, u16)> {
-        self.resize.clone()
-    }
-
-    pub fn cancel_handle(&self) -> watch::Sender<bool> {
-        self.cancel.clone()
-    }
-}
-
-impl Drop for PodExecSession {
-    fn drop(&mut self) {
-        let _ = self.cancel.send(true);
-    }
-}
-
-/// Start an interactive TTY shell in a running pod container.
-pub fn exec_shell(
-    cx: &mut App,
-    namespace: &str,
-    name: &str,
-    container: &str,
-    shell: &str,
-) -> Result<PodExecSession, String> {
-    if container.is_empty() {
-        return Err("This pod has no containers to exec into.".to_string());
-    }
-    let state = cx.global::<ClusterState>();
-    let client = state.client().ok_or_else(|| "not connected".to_string())?;
-    let tokio = state.tokio();
-    let (updates_tx, updates) = mpsc::unbounded_channel();
-    let (input_tx, input_rx) = mpsc::unbounded_channel();
-    let (resize_tx, resize_rx) = mpsc::unbounded_channel();
-    let (cancel, cancel_rx) = watch::channel(false);
-    tokio.spawn(run_exec(
-        client,
-        namespace.to_string(),
-        name.to_string(),
-        container.to_string(),
-        shell.to_string(),
-        updates_tx,
-        input_rx,
-        resize_rx,
-        cancel_rx,
-    ));
-    Ok(PodExecSession {
-        updates,
-        input: input_tx,
-        resize: resize_tx,
-        cancel,
-    })
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_exec(
-    client: Client,
-    namespace: String,
-    name: String,
-    container: String,
-    shell: String,
-    updates: mpsc::UnboundedSender<Result<Vec<u8>, String>>,
-    mut input: mpsc::UnboundedReceiver<Vec<u8>>,
-    mut resize: mpsc::UnboundedReceiver<(u16, u16)>,
-    mut cancel: watch::Receiver<bool>,
-) {
-    let api: Api<Pod> = Api::namespaced(client, &namespace);
-    let params = AttachParams {
-        container: Some(container.clone()),
-        stdin: true,
-        stdout: true,
-        stderr: false,
-        tty: true,
-        ..AttachParams::default()
-    };
-    tracing::debug!(
-        namespace = %namespace,
-        pod = %name,
-        container = %container,
-        shell = %shell,
-        "pod exec: connecting"
-    );
-    let mut process = match api.exec(&name, [shell.as_str()], &params).await {
-        Ok(process) => process,
-        Err(error) => {
-            tracing::warn!(%error, pod = %name, container = %container, "pod exec: connect failed");
-            let _ = updates.send(Err(format!("Could not start exec session: {error}")));
-            return;
-        }
-    };
-    tracing::debug!(pod = %name, container = %container, "pod exec: connected");
-    let Some(mut stdin) = process.stdin() else {
-        let _ = updates.send(Err("Exec session has no stdin channel.".to_string()));
-        process.abort();
-        return;
-    };
-    let Some(stdout) = process.stdout() else {
-        let _ = updates.send(Err("Exec session has no stdout channel.".to_string()));
-        process.abort();
-        return;
-    };
-    let stderr = process.stderr();
-
-    let writer = tokio::spawn(async move {
-        while let Some(bytes) = input.recv().await {
-            if stdin.write_all(&bytes).await.is_err() || stdin.flush().await.is_err() {
-                break;
-            }
-        }
-    });
-    let stdout_task = tokio::spawn(read_exec_output(stdout, updates.clone()));
-    let stderr_task = stderr.map(|stderr| tokio::spawn(read_exec_output(stderr, updates.clone())));
-
-    let mut resize_task = process.terminal_size().map(|size_sender| {
-        tokio::spawn(async move {
-            let mut size_sender = size_sender;
-            while let Some((cols, rows)) = resize.recv().await {
-                let size = TerminalSize {
-                    width: cols,
-                    height: rows,
-                };
-                if size_sender.send(size).await.is_err() {
-                    break;
-                }
-            }
-        })
-    });
-
-    let mut status_future = process.take_status();
-    let status = tokio::select! {
-        _ = cancel.changed() => {
-            process.abort();
-            writer.abort();
-            stdout_task.abort();
-            if let Some(task) = stderr_task { task.abort(); }
-            if let Some(task) = resize_task.take() { task.abort(); }
-            return;
-        }
-        status = async {
-            match status_future.take() {
-                Some(status) => status.await,
-                None => None,
-            }
-        } => status,
-    };
-    process.abort();
-    writer.abort();
-    stdout_task.abort();
-    if let Some(task) = stderr_task {
-        task.abort();
-    }
-    if let Some(task) = resize_task.take() {
-        task.abort();
-    }
-    match status {
-        Some(status) if status.status.as_deref() == Some("Success") => {
-            tracing::debug!(pod = %name, container = %container, "pod exec: session ended");
-            let _ = updates.send(Ok(b"\r\n[session ended]\r\n".to_vec()));
-        }
-        Some(status) => {
-            let message = status
-                .message
-                .as_deref()
-                .filter(|message| !message.is_empty())
-                .map(|message| format!("Exec session ended: {message}"))
-                .unwrap_or_else(|| "Exec session ended".to_string());
-            tracing::warn!(%message, pod = %name, container = %container, "pod exec: session failed");
-            let _ = updates.send(Err(message));
-        }
-        None => {
-            tracing::debug!(pod = %name, container = %container, "pod exec: session closed");
-            let _ = updates.send(Ok(b"\r\n[session closed]\r\n".to_vec()));
-        }
-    }
-}
-
-async fn read_exec_output<R>(mut reader: R, updates: mpsc::UnboundedSender<Result<Vec<u8>, String>>)
-where
-    R: AsyncRead + Unpin,
-{
-    let mut buffer = [0u8; 8192];
-    loop {
-        match reader.read(&mut buffer).await {
-            Ok(0) => return,
-            Ok(read) => {
-                if updates.send(Ok(buffer[..read].to_vec())).is_err() {
-                    return;
-                }
-            }
-            Err(error) => {
-                let _ = updates.send(Err(format!("Exec stream error: {error}")));
-                return;
-            }
-        }
-    }
-}
-
-/// Start loading a pod's full description and live usage samples.
+/// Start loading a pod's full description from the shared store, with one
+/// `GET` fallback when the object is not cached yet. A detail pane never
+/// starts a watch; it observes the store only when a list view already runs.
+/// Usage samples still come from metrics-server on the existing cadence.
 pub fn subscribe_detail(
     cx: &mut App,
     namespace: &str,
@@ -446,200 +246,142 @@ pub fn subscribe_detail(
     let state = cx.global::<ClusterState>();
     let client = state.client().ok_or_else(|| "not connected".to_string())?;
     let tokio = state.tokio();
+    let key = ObjectKey::new(namespace, name);
+    let initial = crate::repository::store::cached_object(cx, ResourceKind::Pods, &key);
+    let snapshots = crate::repository::store::existing_store_snapshot(cx, ResourceKind::Pods);
     let (updates_tx, updates) = mpsc::unbounded_channel();
     let (cancel, cancel_rx) = watch::channel(false);
-    tokio.spawn(watch_pod_detail(
+    tokio.spawn(watch_pod_detail_from_store(
         client,
         namespace.to_string(),
         name.to_string(),
+        initial,
+        snapshots,
         updates_tx,
         cancel_rx,
     ));
     Ok(PodDetailSubscription { updates, cancel })
 }
 
-async fn watch_pod_detail(
+#[allow(clippy::too_many_arguments)]
+async fn watch_pod_detail_from_store(
     client: Client,
     namespace: String,
     name: String,
+    initial: Option<Arc<crate::repository::store::KubeObjectRecord>>,
+    mut snapshots: Option<watch::Receiver<Arc<crate::repository::store::StoreSnapshot>>>,
     updates: mpsc::UnboundedSender<PodDetailUpdate>,
     mut cancel: watch::Receiver<bool>,
 ) {
-    let api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
-    let mut retry = Retry::new();
-    let mut resource_version = String::new();
-    let mut need_get = true;
+    let key = ObjectKey::new(&namespace, &name);
+    let mut last_version = String::new();
     let mut cpu_capacity = None;
     let mut memory_capacity = None;
+    let mut saw_store_object = false;
+    let mut deleted_reported = false;
+    let mut initial_get_done = false;
     let mut ticker = tokio::time::interval(METRICS_POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    if let Some(record) = initial.as_ref()
+        && let Some(pod) = record.typed::<Pod>()
+    {
+        last_version.clone_from(&record.resource_version);
+        (cpu_capacity, memory_capacity) = capacity_from_pod(pod);
+        if !send_pod_detail(&updates, &namespace, &name, pod) {
+            return;
+        }
+        saw_store_object = true;
+        initial_get_done = true;
+    }
+
     loop {
-        if need_get {
+        let snapshot = snapshots
+            .as_mut()
+            .map(|receiver| receiver.borrow_and_update().clone());
+
+        if let Some(snapshot) = snapshot.as_ref() {
+            if let Some(record) = snapshot.object(&key) {
+                if let Some(pod) = record.typed::<Pod>()
+                    && record.resource_version != last_version
+                {
+                    last_version.clone_from(&record.resource_version);
+                    (cpu_capacity, memory_capacity) = capacity_from_pod(pod);
+                    if !send_pod_detail(&updates, &namespace, &name, pod) {
+                        return;
+                    }
+                    saw_store_object = true;
+                    deleted_reported = false;
+                    initial_get_done = true;
+                }
+            } else if saw_store_object
+                && !deleted_reported
+                && matches!(snapshot.phase(), SnapshotPhase::Ready)
+            {
+                let _ = updates.send(PodDetailUpdate::Detail {
+                    namespace: namespace.clone(),
+                    name: name.clone(),
+                    result: Err("This pod was deleted".to_string()),
+                });
+                deleted_reported = true;
+            }
+        }
+
+        let store_ready = snapshot.as_ref().is_none_or(|snapshot| {
+            matches!(
+                snapshot.phase(),
+                SnapshotPhase::Ready | SnapshotPhase::Error(_)
+            )
+        });
+
+        if !initial_get_done && store_ready {
+            // The store does not know this object yet (for example, a kubectl
+            // describe target outside the loaded namespace). A detail miss is
+            // one GET, never a watch.
+            initial_get_done = true;
+            let api: Api<Pod> = Api::namespaced(client.clone(), &namespace);
             let fetched = tokio::select! {
                 _ = cancel.changed() => return,
                 result = api.get(&name) => result,
             };
-            let pod = match fetched {
-                Ok(pod) => pod,
+
+            match fetched {
+                Ok(pod) => {
+                    (cpu_capacity, memory_capacity) = capacity_from_pod(&pod);
+                    if !send_pod_detail(&updates, &namespace, &name, &pod) {
+                        return;
+                    }
+                }
                 Err(error) => {
                     let _ = updates.send(PodDetailUpdate::Detail {
-                        namespace,
-                        name,
+                        namespace: namespace.clone(),
+                        name: name.clone(),
                         result: Err(format!("Could not load pod details: {error}")),
                     });
                     return;
                 }
-            };
-            retry.list_succeeded();
-            if let Some(version) = pod.resource_version() {
-                resource_version = version;
             }
-            (cpu_capacity, memory_capacity) = capacity_from_pod(&pod);
-            if !send_pod_detail(&updates, &namespace, &name, &pod) {
-                return;
-            }
-            need_get = false;
         }
 
-        let params = WatchParams::default()
-            .timeout(DETAIL_WATCH_TIMEOUT_SECS)
-            .fields(&format!("metadata.name={name}"));
-        let watched = tokio::select! {
+        tokio::select! {
             _ = cancel.changed() => return,
-            result = retry::bounded(api.watch(&params, &resource_version)) => result,
-        };
-        let mut stream = match watched {
-            Ok(stream) => {
-                retry.watch_succeeded();
-                Box::pin(stream)
-            }
-            Err(failure) => match failure.action(&mut retry) {
-                RetryAction::Retry(delay) => {
-                    if !sleep_or_cancel(&mut cancel, delay).await {
-                        return;
-                    }
-                    continue;
+            changed = async {
+                match snapshots.as_mut() {
+                    Some(receiver) => receiver.changed().await.is_ok(),
+                    None => std::future::pending::<bool>().await,
                 }
-                RetryAction::GiveUp => {
-                    poll_pod_detail(&client, &namespace, &name, &updates, &mut cancel).await;
+            } => {
+                if !changed {
                     return;
                 }
-            },
-        };
-
-        let mut relist = false;
-        loop {
-            tokio::select! {
-                _ = cancel.changed() => return,
-                _ = ticker.tick() => {
-                    let usage = fetch_usage(&client, &namespace, &name, cpu_capacity, memory_capacity).await;
-                    if updates
-                        .send(PodDetailUpdate::Usage {
-                            namespace: namespace.clone(),
-                            name: name.clone(),
-                            result: usage,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                event = stream.try_next() => match event {
-                    Ok(Some(WatchEvent::Added(pod) | WatchEvent::Modified(pod))) => {
-                        retry.watch_succeeded();
-                        if let Some(version) = pod.resource_version() {
-                            resource_version = version;
-                        }
-                        (cpu_capacity, memory_capacity) = capacity_from_pod(&pod);
-                        if !send_pod_detail(&updates, &namespace, &name, &pod) {
-                            return;
-                        }
-                    }
-                    Ok(Some(WatchEvent::Deleted(_))) => {
-                        let _ = updates.send(PodDetailUpdate::Detail {
-                            namespace,
-                            name,
-                            result: Err("This pod was deleted".to_string()),
-                        });
-                        return;
-                    }
-                    Ok(Some(WatchEvent::Bookmark(bookmark))) => {
-                        retry.watch_succeeded();
-                        resource_version = bookmark.metadata.resource_version;
-                    }
-                    Ok(Some(WatchEvent::Error(status))) => {
-                        relist = status.code == 410
-                            || status.reason == "Expired"
-                            || status.reason == "Gone";
-                        match retry.failed_status(status.code) {
-                            RetryAction::Retry(delay) => {
-                                if !sleep_or_cancel(&mut cancel, delay).await {
-                                    return;
-                                }
-                                break;
-                            }
-                            RetryAction::GiveUp => {
-                                poll_pod_detail(&client, &namespace, &name, &updates, &mut cancel)
-                                    .await;
-                                return;
-                            }
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => match retry.failed(&error) {
-                        RetryAction::Retry(delay) => {
-                            if !sleep_or_cancel(&mut cancel, delay).await {
-                                return;
-                            }
-                            break;
-                        }
-                        RetryAction::GiveUp => {
-                            poll_pod_detail(&client, &namespace, &name, &updates, &mut cancel).await;
-                            return;
-                        }
-                    },
-                }
             }
-        }
-
-        if relist {
-            need_get = true;
-        }
-        if !sleep_or_cancel(&mut cancel, DETAIL_RECONNECT_DELAY).await {
-            return;
-        }
-    }
-}
-
-/// Watch is not permitted: keep both the object and its usage fresh with GETs.
-async fn poll_pod_detail(
-    client: &Client,
-    namespace: &str,
-    name: &str,
-    updates: &mpsc::UnboundedSender<PodDetailUpdate>,
-    cancel: &mut watch::Receiver<bool>,
-) {
-    let api: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let mut retry = Retry::new();
-    loop {
-        let fetched = tokio::select! {
-            _ = cancel.changed() => return,
-            result = api.get(name) => result,
-        };
-        match fetched {
-            Ok(pod) => {
-                retry.list_succeeded();
-                let (cpu_capacity, memory_capacity) = capacity_from_pod(&pod);
-                if !send_pod_detail(updates, namespace, name, &pod) {
-                    return;
-                }
+            _ = ticker.tick() => {
                 let usage =
-                    fetch_usage(client, namespace, name, cpu_capacity, memory_capacity).await;
+                    fetch_usage(&client, &namespace, &name, cpu_capacity, memory_capacity).await;
                 if updates
                     .send(PodDetailUpdate::Usage {
-                        namespace: namespace.to_string(),
-                        name: name.to_string(),
+                        namespace: namespace.clone(),
+                        name: name.clone(),
                         result: usage,
                     })
                     .is_err()
@@ -647,30 +389,6 @@ async fn poll_pod_detail(
                     return;
                 }
             }
-            Err(error) => {
-                if updates
-                    .send(PodDetailUpdate::Detail {
-                        namespace: namespace.to_string(),
-                        name: name.to_string(),
-                        result: Err(format!("Could not load pod details: {error}")),
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                match retry.failed(&error) {
-                    RetryAction::Retry(delay) => {
-                        if !sleep_or_cancel(cancel, delay).await {
-                            return;
-                        }
-                        continue;
-                    }
-                    RetryAction::GiveUp => return,
-                }
-            }
-        }
-        if !sleep_or_cancel(cancel, METRICS_POLL_INTERVAL).await {
-            return;
         }
     }
 }
@@ -688,13 +406,6 @@ fn send_pod_detail(
             result: Ok(Box::new(detail_from_pod(pod))),
         })
         .is_ok()
-}
-
-async fn sleep_or_cancel(cancel: &mut watch::Receiver<bool>, duration: Duration) -> bool {
-    tokio::select! {
-        _ = cancel.changed() => false,
-        _ = tokio::time::sleep(duration) => true,
-    }
 }
 
 async fn fetch_usage(

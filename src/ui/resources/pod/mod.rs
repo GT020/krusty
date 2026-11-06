@@ -144,6 +144,13 @@ impl PodsView {
             return;
         }
 
+        if let Some(containers) =
+            repository::resources::pods::cached_containers(cx, &namespace, &name)
+        {
+            self.open_logs(namespace, name, containers, container, follow, cx);
+            return;
+        }
+
         let mut subscription =
             match repository::resources::pods::subscribe_detail(cx, &namespace, &name) {
                 Ok(subscription) => subscription,

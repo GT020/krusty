@@ -1,11 +1,15 @@
 //! ViewModel for an interactive TTY exec session in a pod container.
+//!
+//! The session itself lives in [`crate::repository::terminal`]. This view model
+//! only attaches to it, so recreating the view does not kill the shell.
 
 use std::num::NonZeroU16;
+use std::sync::Arc;
 
 use gpui_kit::Context;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{broadcast, mpsc};
 
-use crate::repository::resources::pods;
+use crate::repository::terminal::{self, TerminalEvent, TerminalSession};
 
 const SCROLLBACK_LINES: usize = 5_000;
 const DEFAULT_COLS: u16 = 80;
@@ -24,8 +28,8 @@ pub struct PodExecViewModel {
     error: Option<String>,
     input_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
     resize_tx: Option<mpsc::UnboundedSender<(u16, u16)>>,
+    session: Option<Arc<TerminalSession>>,
     generation: u64,
-    cancel: Option<watch::Sender<bool>>,
 }
 
 impl PodExecViewModel {
@@ -54,8 +58,8 @@ impl PodExecViewModel {
             error: None,
             input_tx: None,
             resize_tx: None,
+            session: None,
             generation: 0,
-            cancel: None,
         };
         this.start_session(cx);
         this
@@ -151,12 +155,14 @@ impl PodExecViewModel {
         cx.notify();
     }
 
-    pub fn shutdown(&mut self) {
-        if let Some(cancel) = self.cancel.take() {
-            let _ = cancel.send(true);
+    /// Destroy the stored session. Called when the terminal tab is closed.
+    pub fn shutdown(&mut self, cx: &mut gpui_kit::App) {
+        if let Some(session) = self.session.take() {
+            terminal::destroy(cx, session.key());
         }
         self.input_tx = None;
         self.resize_tx = None;
+        self.generation = self.generation.wrapping_add(1);
     }
 
     fn restart(&mut self, cx: &mut Context<Self>) {
@@ -166,8 +172,8 @@ impl PodExecViewModel {
     }
 
     fn start_session(&mut self, cx: &mut Context<Self>) {
-        if let Some(cancel) = self.cancel.take() {
-            let _ = cancel.send(true);
+        if let Some(session) = self.session.take() {
+            terminal::destroy(cx, session.key());
         }
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
@@ -177,7 +183,7 @@ impl PodExecViewModel {
         self.status = format!("Starting {} in {}…", self.shell, self.container);
         cx.notify();
 
-        let session = match pods::exec_shell(
+        let session = match terminal::open(
             cx,
             &self.namespace,
             &self.name,
@@ -193,51 +199,63 @@ impl PodExecViewModel {
                 return;
             }
         };
-        self.cancel = Some(session.cancel_handle());
+
+        let attachment = session.attach();
+        if !attachment.history.is_empty() {
+            self.parser.process(&attachment.history);
+        }
         self.input_tx = Some(session.input_handle());
         let resize = session.resize_handle();
         let (rows, cols) = self.parser.screen().size();
         let _ = resize.send((cols.get(), rows.get()));
         self.resize_tx = Some(resize);
+        self.session = Some(session);
         self.status = format!("Connecting · {} · {}", self.container, self.shell);
 
+        let mut updates = attachment.updates;
         cx.spawn(async move |this, cx| {
-            let mut session = session;
-            while let Some(update) = session.next().await {
+            loop {
+                let event = match updates.recv().await {
+                    Ok(event) => event,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+
                 let current = this.update(cx, |this, cx| {
                     if this.generation != generation {
                         return false;
                     }
-                    match update {
-                        Ok(bytes) => {
+                    match event {
+                        TerminalEvent::Data(bytes) => {
                             this.parser.process(&bytes);
                             this.error = None;
                             this.status =
                                 format!("Connected · {} · {}", this.container, this.shell);
                         }
-                        Err(error) => {
+                        TerminalEvent::Error(error) => {
                             this.process_error(&error);
                             this.error = Some(error);
                             this.status = "Exec session error".to_string();
+                        }
+                        TerminalEvent::Ended => {
+                            if this.error.is_none() {
+                                this.parser.process(b"\r\n[session ended]\r\n");
+                                this.status = "Exec session ended".to_string();
+                            }
+                            this.input_tx = None;
+                            this.resize_tx = None;
+                            this.session = None;
+                            cx.notify();
+                            return false;
                         }
                     }
                     cx.notify();
                     true
                 });
-                match current {
-                    Ok(true) => {}
-                    _ => break,
+                if !matches!(current, Ok(true)) {
+                    break;
                 }
             }
-            let _ = this.update(cx, |this, cx| {
-                if this.generation == generation {
-                    this.parser.process(b"\r\n[session ended]\r\n");
-                    this.status = "Exec session ended".to_string();
-                    this.input_tx = None;
-                    this.resize_tx = None;
-                    cx.notify();
-                }
-            });
         })
         .detach();
     }
@@ -250,8 +268,9 @@ impl PodExecViewModel {
 
 impl Drop for PodExecViewModel {
     fn drop(&mut self) {
-        if let Some(cancel) = self.cancel.take() {
-            let _ = cancel.send(true);
-        }
+        // Detaching from the view must not destroy the stored session. Closing
+        // the tab calls `shutdown`, which performs the explicit destroy.
+        self.input_tx = None;
+        self.resize_tx = None;
     }
 }

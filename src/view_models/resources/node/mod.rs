@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use gpui_kit::component::table::{Column, TableDelegate, TableEvent, TableState};
 use gpui_kit::px;
@@ -16,6 +17,10 @@ use crate::models::resources::node::NodesModel;
 use crate::models::resources::node::detail::{NodeDetailState, UsageHistory};
 use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository;
+
+/// Large clusters emit node updates continuously. Repainting the table for
+/// every repository flush makes it feel sluggish, so coalesce snapshots.
+const NODES_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct NodesViewModel {
     active: Arc<AtomicBool>,
@@ -305,6 +310,7 @@ impl NodesViewModel {
         let model = self.model.downgrade();
         let mut pump = subscription.clone();
         cx.spawn(async move |_, cx: &mut gpui_kit::AsyncApp| {
+            let mut last_refresh: Option<Instant> = None;
             loop {
                 let snapshot = tokio::select! {
                     _ = cancel_rx.changed() => break,
@@ -313,6 +319,21 @@ impl NodesViewModel {
                 let Some(snapshot) = snapshot else {
                     break;
                 };
+
+                // The watch channel keeps only the latest snapshot, so waiting
+                // here skips intermediate flushes instead of rendering them.
+                if let Some(last) = last_refresh {
+                    let elapsed = last.elapsed();
+                    if elapsed < NODES_REFRESH_INTERVAL {
+                        tokio::select! {
+                            _ = cancel_rx.changed() => break,
+                            _ = cx
+                                .background_executor()
+                                .timer(NODES_REFRESH_INTERVAL - elapsed) => {}
+                        }
+                    }
+                }
+                last_refresh = Some(Instant::now());
                 let applied = model.update(cx, |model, cx| {
                     model.apply_snapshot(snapshot);
                     cx.notify();

@@ -1,11 +1,11 @@
 //! Repository for Nodes: live list/watch plus one-shot detail and metrics reads.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use futures::TryStreamExt as _;
 use k8s_openapi::api::core::v1::Node;
-use kube::api::{Api, DynamicObject, ListParams, WatchEvent, WatchParams};
+use kube::api::{Api, DynamicObject, ListParams};
 use kube::core::{ApiResource, GroupVersionKind};
 use kube::{Client, ResourceExt};
 use tokio::sync::{mpsc, watch};
@@ -15,15 +15,12 @@ use crate::models::resources::node::detail::{
     NodeAddress, NodeCondition, NodeDetail, NodeDetailUpdate, NodeImage, NodeSystemInfo, NodeTaint,
     NodeUsage,
 };
-use crate::models::{NamespaceScope, ResourceKind};
-use crate::repository::retry::{self, Retry, RetryAction};
+use crate::models::{NamespaceScope, ObjectKey, ResourceKind, SnapshotPhase};
 use gpui_kit::App;
 
 use crate::repository::{Subscription, subscribe_kind};
 
 const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
-const DETAIL_WATCH_TIMEOUT_SECS: u32 = 280;
-const DETAIL_RECONNECT_DELAY: Duration = Duration::from_millis(250);
 
 /// Subscribe to the live Nodes stream.
 /// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
@@ -141,199 +138,137 @@ async fn fetch_all_usage(client: &Client) -> Result<BTreeMap<String, NodeUsage>,
     Ok(usages)
 }
 
-/// Start loading a node's full description and live usage samples.
+/// Start loading a node's full description from the shared store, with one
+/// `GET` fallback when the object is not cached. Usage samples remain on the
+/// existing metrics-server cadence.
 pub fn subscribe_detail(cx: &mut App, node: &str) -> Result<NodeDetailSubscription, String> {
     let state = cx.global::<ClusterState>();
     let client = state.client().ok_or_else(|| "not connected".to_string())?;
     let tokio = state.tokio();
+    let key = ObjectKey::new("", node);
+    let initial = crate::repository::store::cached_object(cx, ResourceKind::Nodes, &key);
+    let snapshots = crate::repository::store::existing_store_snapshot(cx, ResourceKind::Nodes);
     let (updates_tx, updates) = mpsc::unbounded_channel();
     let (cancel, cancel_rx) = watch::channel(false);
-    tokio.spawn(watch_node_detail(
+    tokio.spawn(watch_node_detail_from_store(
         client,
         node.to_string(),
+        initial,
+        snapshots,
         updates_tx,
         cancel_rx,
     ));
     Ok(NodeDetailSubscription { updates, cancel })
 }
 
-async fn watch_node_detail(
+#[allow(clippy::too_many_arguments)]
+async fn watch_node_detail_from_store(
     client: Client,
     node: String,
+    initial: Option<Arc<crate::repository::store::KubeObjectRecord>>,
+    mut snapshots: Option<watch::Receiver<Arc<crate::repository::store::StoreSnapshot>>>,
     updates: mpsc::UnboundedSender<NodeDetailUpdate>,
     mut cancel: watch::Receiver<bool>,
 ) {
-    let api: Api<Node> = Api::all(client.clone());
-    let mut retry = Retry::new();
-    let mut resource_version = String::new();
-    let mut need_get = true;
+    let key = ObjectKey::new("", &node);
+    let mut last_version = String::new();
     let mut cpu_capacity = None;
     let mut memory_capacity = None;
+    let mut saw_store_object = false;
+    let mut initial_get_done = false;
     let mut ticker = tokio::time::interval(METRICS_POLL_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+    if let Some(record) = initial.as_ref()
+        && let Some(object) = record.typed::<Node>()
+    {
+        last_version.clone_from(&record.resource_version);
+        let detail = detail_from_node(object);
+        (cpu_capacity, memory_capacity) = capacity_from_detail(&detail);
+        if !send_node_detail(&updates, &node, detail) {
+            return;
+        }
+        saw_store_object = true;
+        initial_get_done = true;
+    }
+
     loop {
-        if need_get {
+        let snapshot = snapshots
+            .as_mut()
+            .map(|receiver| receiver.borrow_and_update().clone());
+
+        if let Some(snapshot) = snapshot.as_ref() {
+            if let Some(record) = snapshot.object(&key) {
+                if let Some(object) = record.typed::<Node>()
+                    && record.resource_version != last_version
+                {
+                    last_version.clone_from(&record.resource_version);
+                    let detail = detail_from_node(object);
+                    (cpu_capacity, memory_capacity) = capacity_from_detail(&detail);
+                    if !send_node_detail(&updates, &node, detail) {
+                        return;
+                    }
+                    saw_store_object = true;
+                    initial_get_done = true;
+                }
+            } else if saw_store_object && matches!(snapshot.phase(), SnapshotPhase::Ready) {
+                let _ = updates.send(NodeDetailUpdate::Detail {
+                    node: node.clone(),
+                    result: Err("This node was deleted".to_string()),
+                });
+                return;
+            }
+        }
+
+        let store_ready = snapshot.as_ref().is_none_or(|snapshot| {
+            matches!(
+                snapshot.phase(),
+                SnapshotPhase::Ready | SnapshotPhase::Error(_)
+            )
+        });
+
+        if !initial_get_done && store_ready {
+            initial_get_done = true;
+            let api: Api<Node> = Api::all(client.clone());
             let fetched = tokio::select! {
                 _ = cancel.changed() => return,
                 result = api.get(&node) => result,
             };
-            let object = match fetched {
-                Ok(object) => object,
+            match fetched {
+                Ok(object) => {
+                    let detail = detail_from_node(&object);
+                    (cpu_capacity, memory_capacity) = capacity_from_detail(&detail);
+                    if !send_node_detail(&updates, &node, detail) {
+                        return;
+                    }
+                }
                 Err(error) => {
                     let _ = updates.send(NodeDetailUpdate::Detail {
-                        node,
+                        node: node.clone(),
                         result: Err(format!("Could not load node details: {error}")),
                     });
                     return;
                 }
-            };
-            retry.list_succeeded();
-            if let Some(version) = object.resource_version() {
-                resource_version = version;
             }
-            let detail = detail_from_node(&object);
-            (cpu_capacity, memory_capacity) = capacity_from_detail(&detail);
-            if !send_node_detail(&updates, &node, detail) {
-                return;
-            }
-            need_get = false;
         }
 
-        let params = WatchParams::default()
-            .timeout(DETAIL_WATCH_TIMEOUT_SECS)
-            .fields(&format!("metadata.name={node}"));
-        let watched = tokio::select! {
+        tokio::select! {
             _ = cancel.changed() => return,
-            result = retry::bounded(api.watch(&params, &resource_version)) => result,
-        };
-        let mut stream = match watched {
-            Ok(stream) => {
-                retry.watch_succeeded();
-                Box::pin(stream)
-            }
-            Err(failure) => match failure.action(&mut retry) {
-                RetryAction::Retry(delay) => {
-                    if !sleep_or_cancel(&mut cancel, delay).await {
-                        return;
-                    }
-                    continue;
+            changed = async {
+                match snapshots.as_mut() {
+                    Some(receiver) => receiver.changed().await.is_ok(),
+                    None => std::future::pending::<bool>().await,
                 }
-                RetryAction::GiveUp => {
-                    poll_node_detail(&client, &node, &updates, &mut cancel).await;
+            } => {
+                if !changed {
                     return;
                 }
-            },
-        };
-
-        let mut relist = false;
-        loop {
-            tokio::select! {
-                _ = cancel.changed() => return,
-                _ = ticker.tick() => {
-                    let usage = fetch_usage(&client, &node, cpu_capacity, memory_capacity).await;
-                    if updates
-                        .send(NodeDetailUpdate::Usage {
-                            node: node.clone(),
-                            result: usage,
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                event = stream.try_next() => match event {
-                    Ok(Some(WatchEvent::Added(object) | WatchEvent::Modified(object))) => {
-                        retry.watch_succeeded();
-                        if let Some(version) = object.resource_version() {
-                            resource_version = version;
-                        }
-                        let detail = detail_from_node(&object);
-                        (cpu_capacity, memory_capacity) = capacity_from_detail(&detail);
-                        if !send_node_detail(&updates, &node, detail) {
-                            return;
-                        }
-                    }
-                    Ok(Some(WatchEvent::Deleted(_))) => {
-                        let _ = updates.send(NodeDetailUpdate::Detail {
-                            node,
-                            result: Err("This node was deleted".to_string()),
-                        });
-                        return;
-                    }
-                    Ok(Some(WatchEvent::Bookmark(bookmark))) => {
-                        retry.watch_succeeded();
-                        resource_version = bookmark.metadata.resource_version;
-                    }
-                    Ok(Some(WatchEvent::Error(status))) => {
-                        relist = status.code == 410
-                            || status.reason == "Expired"
-                            || status.reason == "Gone";
-                        match retry.failed_status(status.code) {
-                            RetryAction::Retry(delay) => {
-                                if !sleep_or_cancel(&mut cancel, delay).await {
-                                    return;
-                                }
-                                break;
-                            }
-                            RetryAction::GiveUp => {
-                                poll_node_detail(&client, &node, &updates, &mut cancel).await;
-                                return;
-                            }
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(error) => match retry.failed(&error) {
-                        RetryAction::Retry(delay) => {
-                            if !sleep_or_cancel(&mut cancel, delay).await {
-                                return;
-                            }
-                            break;
-                        }
-                        RetryAction::GiveUp => {
-                            poll_node_detail(&client, &node, &updates, &mut cancel).await;
-                            return;
-                        }
-                    },
-                }
             }
-        }
-
-        if relist {
-            need_get = true;
-        }
-        if !sleep_or_cancel(&mut cancel, DETAIL_RECONNECT_DELAY).await {
-            return;
-        }
-    }
-}
-
-/// Watch is not permitted: keep both the object and its usage fresh with GETs.
-async fn poll_node_detail(
-    client: &Client,
-    node: &str,
-    updates: &mpsc::UnboundedSender<NodeDetailUpdate>,
-    cancel: &mut watch::Receiver<bool>,
-) {
-    let api: Api<Node> = Api::all(client.clone());
-    let mut retry = Retry::new();
-    loop {
-        let fetched = tokio::select! {
-            _ = cancel.changed() => return,
-            result = api.get(node) => result,
-        };
-        match fetched {
-            Ok(object) => {
-                retry.list_succeeded();
-                let detail = detail_from_node(&object);
-                let (cpu_capacity, memory_capacity) = capacity_from_detail(&detail);
-                if !send_node_detail(updates, node, detail) {
-                    return;
-                }
-                let usage = fetch_usage(client, node, cpu_capacity, memory_capacity).await;
+            _ = ticker.tick() => {
+                let usage = fetch_usage(&client, &node, cpu_capacity, memory_capacity).await;
                 if updates
                     .send(NodeDetailUpdate::Usage {
-                        node: node.to_string(),
+                        node: node.clone(),
                         result: usage,
                     })
                     .is_err()
@@ -341,29 +276,6 @@ async fn poll_node_detail(
                     return;
                 }
             }
-            Err(error) => {
-                if updates
-                    .send(NodeDetailUpdate::Detail {
-                        node: node.to_string(),
-                        result: Err(format!("Could not load node details: {error}")),
-                    })
-                    .is_err()
-                {
-                    return;
-                }
-                match retry.failed(&error) {
-                    RetryAction::Retry(delay) => {
-                        if !sleep_or_cancel(cancel, delay).await {
-                            return;
-                        }
-                        continue;
-                    }
-                    RetryAction::GiveUp => return,
-                }
-            }
-        }
-        if !sleep_or_cancel(cancel, METRICS_POLL_INTERVAL).await {
-            return;
         }
     }
 }
@@ -393,13 +305,6 @@ fn send_node_detail(
             result: Ok(Box::new(detail)),
         })
         .is_ok()
-}
-
-async fn sleep_or_cancel(cancel: &mut watch::Receiver<bool>, duration: Duration) -> bool {
-    tokio::select! {
-        _ = cancel.changed() => false,
-        _ = tokio::time::sleep(duration) => true,
-    }
 }
 
 async fn fetch_usage(

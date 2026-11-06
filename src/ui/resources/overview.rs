@@ -18,7 +18,7 @@ use gpui_kit::{
 use crate::cluster::ClusterState;
 use crate::models::Item;
 use crate::models::resources::node::detail::NodeUsage;
-use crate::models::resources::overview::{ClusterOverviewStats, PodHealth, is_unhealthy_pod};
+use crate::models::resources::overview::{ClusterOverviewStats, PodHealth};
 use crate::view_models::ClusterOverviewViewModel;
 
 pub struct OverviewView {
@@ -96,12 +96,18 @@ impl OverviewView {
 
 impl Render for OverviewView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let vm = self.vm.read(cx);
-        let stats = vm.stats().clone();
-        let nodes = vm.nodes().to_vec();
-        let pods = vm.pods().to_vec();
-        let metrics = vm.metrics().clone();
-        let metrics_error = vm.metrics_error().map(str::to_string);
+        // Clone cheap handles only: the VM already cached the derived pod
+        // preview, and node snapshots/metrics are `Arc`s.
+        let (stats, nodes, unhealthy, metrics, metrics_error) = {
+            let vm = self.vm.read(cx);
+            (
+                vm.stats().clone(),
+                vm.node_snapshot(),
+                vm.unhealthy_pods(),
+                vm.metrics().clone(),
+                vm.metrics_error().map(str::to_string),
+            )
+        };
         let header = self.header(&stats, cx);
 
         let cards = h_flex()
@@ -164,13 +170,13 @@ impl Render for OverviewView {
             .p_4()
             .child(cards)
             .child(node_section(
-                &nodes,
+                nodes.items(),
                 &stats,
-                &metrics,
+                metrics.as_ref(),
                 metrics_error.as_deref(),
                 cx,
             ))
-            .child(pod_section(&stats, &pods, cx));
+            .child(pod_section(&stats, &unhealthy, cx));
 
         v_flex()
             .size_full()
@@ -349,7 +355,7 @@ fn node_header_row(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
-fn pod_section(stats: &ClusterOverviewStats, pods: &[Arc<Item>], cx: &App) -> AnyElement {
+fn pod_section(stats: &ClusterOverviewStats, unhealthy: &[Arc<Item>], cx: &App) -> AnyElement {
     let mut health = h_flex().gap_2().items_center();
     for (label, count, color) in [
         ("Running", stats.pods_running, cx.theme().success),
@@ -370,18 +376,9 @@ fn pod_section(stats: &ClusterOverviewStats, pods: &[Arc<Item>], cx: &App) -> An
         health = health.child(health_chip(label, count, color, cx));
     }
 
-    let mut unhealthy = pods
-        .iter()
-        .filter(|pod| is_unhealthy_pod(pod))
-        .collect::<Vec<_>>();
-    unhealthy.sort_by(|left, right| {
-        left.namespace
-            .cmp(&right.namespace)
-            .then_with(|| left.name.cmp(&right.name))
-    });
-
+    let unhealthy_total = stats.pods_unhealthy();
     let mut body = v_flex().gap_3().child(health);
-    if unhealthy.is_empty() {
+    if unhealthy_total == 0 {
         body = body.child(
             div()
                 .text_xs()
@@ -394,7 +391,7 @@ fn pod_section(stats: &ClusterOverviewStats, pods: &[Arc<Item>], cx: &App) -> An
                 .pt_1()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child(format!("{} pods need attention", unhealthy.len())),
+                .child(format!("{unhealthy_total} pods need attention")),
         );
         body = body.child(
             h_flex()
@@ -409,7 +406,7 @@ fn pod_section(stats: &ClusterOverviewStats, pods: &[Arc<Item>], cx: &App) -> An
                 .child(div().w(px(72.)).text_right().child("Restarts"))
                 .child(div().w(px(56.)).text_right().child("Age")),
         );
-        for pod in unhealthy.iter().take(8) {
+        for pod in unhealthy {
             let status = PodHealth::from_status(&pod.status);
             body = body.child(
                 h_flex()
@@ -461,13 +458,14 @@ fn pod_section(stats: &ClusterOverviewStats, pods: &[Arc<Item>], cx: &App) -> An
                     ),
             );
         }
-        if unhealthy.len() > 8 {
+        let hidden = unhealthy_total.saturating_sub(unhealthy.len());
+        if hidden > 0 {
             body = body.child(
                 div()
                     .pt_1()
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
-                    .child(format!("+{} more", unhealthy.len() - 8)),
+                    .child(format!("+{hidden} more")),
             );
         }
     }

@@ -28,51 +28,6 @@ pub enum RetryAction {
     GiveUp,
 }
 
-/// Longest a single list/watch-establishment request may take before it feeds
-/// the retry policy. kube leaves `read_timeout` unset, so without this a
-/// stalled connection hangs until the OS gives up on the TCP connection
-/// (~40s+). Watch streams and log follows are unaffected.
-pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
-
-/// Run one API request with a timeout so a stalled connection fails fast.
-pub async fn bounded<T>(
-    request: impl std::future::Future<Output = Result<T, kube::Error>>,
-) -> Result<T, RequestFailure> {
-    match tokio::time::timeout(REQUEST_TIMEOUT, request).await {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(RequestFailure::Api(error)),
-        Err(_) => Err(RequestFailure::TimedOut),
-    }
-}
-
-/// A failed Kubernetes API request.
-#[derive(Debug)]
-pub enum RequestFailure {
-    /// The API server answered with an error status.
-    Api(kube::Error),
-    /// The request produced nothing within [`REQUEST_TIMEOUT`].
-    TimedOut,
-}
-
-impl RequestFailure {
-    /// Classify into the retry policy; timeouts are always soft.
-    pub fn action(&self, retry: &mut Retry) -> RetryAction {
-        match self {
-            Self::Api(error) => retry.failed(error),
-            Self::TimedOut => retry.failed_soft(),
-        }
-    }
-}
-
-impl std::fmt::Display for RequestFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Api(error) => write!(f, "{error}"),
-            Self::TimedOut => write!(f, "no response for {}s", REQUEST_TIMEOUT.as_secs()),
-        }
-    }
-}
-
 /// True when the HTTP status will never succeed on retry for a list/watch.
 pub fn is_hard_status(code: u16) -> bool {
     matches!(code, 400 | 401 | 403 | 404 | 405 | 422)
@@ -118,6 +73,7 @@ impl Retry {
     }
 
     /// Decide what to do after a watch `Error` event carrying only a status.
+    #[allow(dead_code)]
     pub fn failed_status(&mut self, code: u16) -> RetryAction {
         self.fail(is_hard_status(code))
     }
@@ -228,18 +184,5 @@ mod tests {
         for code in [410, 429, 500, 502, 503] {
             assert!(!is_hard_status(code), "{code} should be soft");
         }
-    }
-
-    #[test]
-    fn timeouts_are_soft_and_back_off() {
-        let mut retry = Retry::new();
-        assert_eq!(
-            RequestFailure::TimedOut.action(&mut retry),
-            RetryAction::Retry(Duration::from_millis(500))
-        );
-        assert_eq!(
-            RequestFailure::TimedOut.action(&mut retry),
-            RetryAction::Retry(Duration::from_secs(1))
-        );
     }
 }

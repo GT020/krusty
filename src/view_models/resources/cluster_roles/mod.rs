@@ -164,7 +164,7 @@ impl ClusterRolesViewModel {
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
         let subscription =
-            match repository::resources::cluster_roles::subscribe(cx, self.scope.clone()) {
+            match repository::subscribe(cx, ResourceKind::ClusterRoles, self.scope.clone()) {
                 Ok(s) => s,
                 Err(error) => {
                     use crate::models::ResourceSnapshot;
