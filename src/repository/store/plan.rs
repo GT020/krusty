@@ -48,6 +48,9 @@ where
             NamespaceScope::One(namespace) => {
                 namespaces.insert(namespace);
             }
+            NamespaceScope::Many(many) => {
+                namespaces.extend(many);
+            }
         }
     }
 
@@ -99,6 +102,17 @@ mod tests {
                     NamespaceScope::One("ns-1".into()),
                     NamespaceScope::One("ns-2".into()),
                 ],
+                &capabilities(false),
+            ),
+            StoreWatchPlan::PerNamespace(vec!["ns-1".into(), "ns-2".into()])
+        );
+    }
+
+    #[test]
+    fn multi_namespace_scopes_watch_each_namespace() {
+        assert_eq!(
+            watch_plan(
+                [NamespaceScope::Many(vec!["ns-2".into(), "ns-1".into()])],
                 &capabilities(false),
             ),
             StoreWatchPlan::PerNamespace(vec!["ns-1".into(), "ns-2".into()])
