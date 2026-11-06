@@ -197,8 +197,7 @@ impl ClusterOverviewViewModel {
                         Some(snapshot) => Some((false, snapshot)),
                         None => {
                             nodes = None;
-                            None
-                        }
+                            None                        }
                     },
                     snapshot = next_snapshot(&mut pods) => match snapshot {
                         Some(snapshot) => Some((true, snapshot)),
@@ -225,8 +224,7 @@ impl ClusterOverviewViewModel {
                             _ = cancel_rx.changed() => break,
                             _ = cx
                                 .background_executor()
-                                .timer(OVERVIEW_REFRESH_INTERVAL - elapsed) => {}
-                        }
+                                .timer(OVERVIEW_REFRESH_INTERVAL - elapsed) => {}                        }
                     }
                 }
                 last_refresh = Some(Instant::now());

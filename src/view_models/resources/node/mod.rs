@@ -334,7 +334,6 @@ impl NodesViewModel {
                     }
                 }
                 last_refresh = Some(Instant::now());
-
                 let applied = model.update(cx, |model, cx| {
                     model.apply_snapshot(snapshot);
                     cx.notify();
