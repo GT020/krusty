@@ -6,18 +6,15 @@ pub mod resources;
 pub mod retry;
 pub mod store;
 pub mod terminal;
-pub mod watch_prefs;
-
-pub use watch_prefs::{WatchPreference, WatchPrefs};
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use gpui_kit::{App, BorrowAppContext as _, Global};
+use gpui_kit::{App, Global};
 use tokio::sync::watch;
 
-use crate::models::{NamespaceScope, PollRate, ResourceKind, ResourceSnapshot};
+use crate::models::{NamespaceScope, ResourceKind, ResourceSnapshot};
 
 pub(crate) struct StoreEntry {
     pub epoch: u64,
@@ -27,7 +24,6 @@ pub(crate) struct StoreEntry {
 }
 
 pub struct Repository {
-    watch_prefs: watch_prefs::WatchPrefsStore,
     pub(crate) stores: HashMap<ResourceKind, StoreEntry>,
     pub(crate) terminal: terminal::TerminalSessionStore,
 }
@@ -36,7 +32,6 @@ impl Global for Repository {}
 
 pub fn init(cx: &mut App) {
     cx.set_global(Repository {
-        watch_prefs: watch_prefs::WatchPrefsStore::load(),
         stores: HashMap::new(),
         terminal: terminal::TerminalSessionStore::default(),
     });
@@ -145,34 +140,6 @@ pub(crate) fn subscribe_kind(
     scope: NamespaceScope,
 ) -> Result<Subscription, String> {
     store::subscribe(cx, kind, scope)
-}
-
-/// Set whether a resource kind is watched live or polled. The saved poll rate
-/// is kept. Applies to every running watch task for the kind and is saved.
-pub fn set_watch_preference(cx: &mut App, kind: ResourceKind, mode: WatchPreference) {
-    update_watch_prefs(cx, kind, |prefs| prefs.mode = mode);
-}
-
-/// Set a kind's poll rate and switch it to poll mode. Applies to every
-/// running watch task for the kind and is saved.
-pub fn set_poll_rate(cx: &mut App, kind: ResourceKind, rate: PollRate) {
-    update_watch_prefs(cx, kind, |prefs| {
-        prefs.mode = WatchPreference::Poll;
-        prefs.rate = rate;
-    });
-}
-
-fn update_watch_prefs(cx: &mut App, kind: ResourceKind, change: impl FnOnce(&mut WatchPrefs)) {
-    cx.update_global::<Repository, _>(|repository, _| {
-        repository.watch_prefs.update(kind, change);
-        if let Err(error) = repository.watch_prefs.save() {
-            tracing::warn!(%error, "repository: failed to save watch prefs");
-        }
-        let prefs = repository.watch_prefs.prefs_for(kind);
-        if let Some(entry) = repository.stores.get(&kind) {
-            entry.store.set_prefs(prefs);
-        }
-    });
 }
 
 #[cfg(test)]

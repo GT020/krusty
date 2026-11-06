@@ -51,10 +51,6 @@ pub struct ClusterState {
     /// Whether the current credentials may watch across all namespaces. This
     /// is the Freelens `isGlobalWatchEnabled` equivalent.
     global_watch: bool,
-    /// Whether the current credentials may list across all namespaces. Polling
-    /// uses this when watch is denied, so a list-capable identity can still
-    /// keep the all-namespaces store warm.
-    global_list: bool,
     context_epoch: u64,
     namespace_cancel: Option<watch::Sender<bool>>,
     /// Kept alive for the app lifetime: the selector's handle on the shared
@@ -106,10 +102,6 @@ impl ClusterState {
 
     pub fn global_watch(&self) -> bool {
         self.global_watch
-    }
-
-    pub fn global_list(&self) -> bool {
-        self.global_list
     }
 }
 
@@ -187,7 +179,6 @@ pub fn init(cx: &mut App) {
         reachable: None,
         namespaces: Vec::new(),
         global_watch: true,
-        global_list: true,
         context_epoch: 0,
         namespace_cancel: None,
         namespace_subscription: None,
@@ -205,7 +196,7 @@ pub fn init(cx: &mut App) {
 
 /// Start or restart the shared namespace subscription. The selector and the
 /// Namespaces resource page read from the same repository watcher, so
-/// namespaces are fetched once per context and follow the saved poll rate.
+/// namespaces are fetched once per context and kept live by the shared store.
 pub fn refresh_namespaces(cx: &mut App) {
     if cx.global::<ClusterState>().client.is_none() {
         return;
@@ -379,10 +370,8 @@ async fn probe_global_access(client: &Client, verb: &str) -> bool {
     }
 }
 
-async fn probe_capabilities(client: &Client) -> (bool, bool) {
-    let global_watch = probe_global_access(client, "watch").await;
-    let global_list = probe_global_access(client, "list").await;
-    (global_watch, global_list)
+async fn probe_capabilities(client: &Client) -> bool {
+    probe_global_access(client, "watch").await
 }
 
 fn review_allows_watch(review: &SelfSubjectAccessReview) -> bool {
@@ -411,7 +400,7 @@ fn spawn_client_build(cx: &mut App, context: ContextInfo) {
     let building = tokio.spawn(build_client(kubeconfig, context.source, store));
     cx.spawn(async move |cx: &mut gpui_kit::AsyncApp| {
         let built = building.await;
-        let (global_watch, global_list) = match &built {
+        let global_watch = match &built {
             Ok(Ok(client)) => {
                 // The capability probe performs HTTP requests and must run on
                 // the cluster runtime, not on GPUI's executor: hyper's connect
@@ -421,14 +410,14 @@ fn spawn_client_build(cx: &mut App, context: ContextInfo) {
                     .spawn(async move { probe_capabilities(&client).await })
                     .await
                 {
-                    Ok(capabilities) => capabilities,
+                    Ok(allowed) => allowed,
                     Err(error) => {
                         tracing::warn!(%error, "cluster: capability probe task failed");
-                        (true, true)
+                        true
                     }
                 }
             }
-            _ => (true, true),
+            _ => true,
         };
         cx.update(|cx| {
             let state = cx.global::<ClusterState>();
@@ -441,14 +430,12 @@ fn spawn_client_build(cx: &mut App, context: ContextInfo) {
                     tracing::info!(
                         context = %context_id,
                         global_watch,
-                        global_list,
                         elapsed_ms = started.elapsed().as_millis() as u64,
                         "cluster: client ready"
                     );
                     cx.update_global::<ClusterState, _>(|state, _| {
                         state.client = Some(client);
                         state.global_watch = global_watch;
-                        state.global_list = global_list;
                         state.context_epoch = state.context_epoch.wrapping_add(1);
                     });
                     refresh_namespaces(cx);

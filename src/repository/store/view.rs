@@ -109,7 +109,7 @@ fn visible_objects<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{NamespaceScope, PollRate, ResourceSnapshot, SnapshotPhase, WatchMode};
+    use crate::models::{NamespaceScope, ResourceSnapshot, SnapshotPhase, WatchMode};
 
     fn view_for(scope: NamespaceScope, snapshot: &StoreSnapshot) -> StoreView {
         let mut view = StoreView::new(scope);
@@ -181,18 +181,12 @@ mod tests {
     }
 
     #[test]
-    fn phase_and_mode_changes_always_emit() {
+    fn phase_changes_always_emit() {
         let mut data = super::super::data::StoreData::new();
         let mut view = StoreView::new(NamespaceScope::All);
         let ready = data.snapshot(SnapshotPhase::Ready, WatchMode::Watch);
         let first = view.apply(&ready).expect("initial emit");
         assert_eq!(first.mode(), WatchMode::Watch);
-
-        let mut data = super::super::data::StoreData::new();
-        data.upsert(test_record("a", "ns-1", "uid-a", "1"));
-        let polled = data.snapshot(SnapshotPhase::Ready, WatchMode::Poll(PollRate::Every(5)));
-        let emitted = view.apply(&polled).expect("mode change emits");
-        assert_eq!(emitted.mode(), WatchMode::Poll(PollRate::Every(5)));
 
         let mut errored_data = super::super::data::StoreData::new();
         errored_data.upsert(test_record("a", "ns-1", "uid-a", "1"));

@@ -101,6 +101,10 @@ impl StoreData {
         self.pending
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.objects.is_empty()
+    }
+
     #[cfg(test)]
     pub fn get_by_uid(&self, uid: &str) -> Option<&Arc<KubeObjectRecord>> {
         self.by_uid.get(uid).and_then(|key| self.objects.get(key))
@@ -487,15 +491,9 @@ mod tests {
     fn snapshot_exposes_scope_and_summary() {
         let mut data = StoreData::new();
         data.upsert(record("pod-a", "ns-a", "uid-a", "1"));
-        let snapshot = data.snapshot(
-            SnapshotPhase::Error("offline".into()),
-            WatchMode::Poll(crate::models::PollRate::Every(5)),
-        );
+        let snapshot = data.snapshot(SnapshotPhase::Error("offline".into()), WatchMode::Watch);
         assert_eq!(snapshot.phase(), &SnapshotPhase::Error("offline".into()));
-        assert_eq!(
-            snapshot.mode(),
-            WatchMode::Poll(crate::models::PollRate::Every(5))
-        );
+        assert_eq!(snapshot.mode(), WatchMode::Watch);
         assert_eq!(snapshot.summary_items().len(), 1);
     }
 

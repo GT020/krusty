@@ -30,9 +30,7 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, watch};
 
-use crate::models::{
-    Item, NamespaceScope, ObjectKey, PollRate, ResourceKind, SnapshotPhase, WatchMode,
-};
+use crate::models::{Item, NamespaceScope, ObjectKey, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository::Subscription;
 use crate::repository::store::mapping::{
     cluster_role_item, config_map_item, cron_job_item, custom_item, daemon_set_item,
@@ -46,11 +44,11 @@ use crate::repository::store::{
     ClusterCapabilities, KubeObjectRecord, StoreData, StoreSnapshot, StoreView, StoreWatchPlan,
     watch_plan,
 };
-use crate::repository::watch_prefs::{WatchPreference, WatchPrefs};
 
 const EVENT_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 const WATCH_TIMEOUT_SECS: u32 = 280;
 const RECONNECT_DELAY: Duration = Duration::from_millis(500);
+const WATCH_DENIED_RETRY: Duration = Duration::from_secs(5);
 const STREAM_INITIAL_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
 const STREAM_INITIAL_TOTAL_TIMEOUT: Duration = Duration::from_secs(60);
 const STORE_ITEM_CAP: usize = 50_000;
@@ -70,10 +68,6 @@ impl KubeObjectStoreHandle {
 
     pub(crate) fn snapshot_receiver(&self) -> watch::Receiver<Arc<StoreSnapshot>> {
         self.snapshots.subscribe()
-    }
-
-    pub(crate) fn set_prefs(&self, prefs: WatchPrefs) {
-        let _ = self.commands.send(Command::SetPrefs(prefs));
     }
 
     pub(crate) fn subscribe(
@@ -142,13 +136,11 @@ enum Command {
     Subscribe(NamespaceScope),
     Unsubscribe(NamespaceScope),
     Refresh,
-    SetPrefs(WatchPrefs),
 }
 
 enum InitialStream {
     Listed { resource_version: String },
     Unsupported,
-    Denied(String),
     Cancelled,
 }
 
@@ -157,7 +149,7 @@ enum StoreEvent {
     Upsert(KubeObjectRecord),
     Remove(ObjectKey),
     Error(NamespaceScope, String),
-    WatchDenied(NamespaceScope, String),
+    WatchError(NamespaceScope, String),
 }
 
 struct StoreTask<K, F>
@@ -170,7 +162,6 @@ where
     epoch: u64,
     kind: ResourceKind,
     global_watch: bool,
-    global_list: bool,
     data: StoreData,
     scopes: HashMap<NamespaceScope, usize>,
     plan: Option<StoreWatchPlan>,
@@ -180,9 +171,6 @@ where
     command_rx: mpsc::UnboundedReceiver<Command>,
     snapshots: watch::Sender<Arc<StoreSnapshot>>,
     phase: SnapshotPhase,
-    mode: WatchMode,
-    prefs: WatchPrefs,
-    watch_denied: bool,
     map: F,
     make_api: ApiFactory<K>,
 }
@@ -251,24 +239,6 @@ where
                 let plan = self.plan.clone().unwrap_or_else(|| self.compute_plan());
                 self.restart_watches(plan);
             }
-            Command::SetPrefs(prefs) => {
-                self.prefs = prefs;
-                self.watch_denied = false;
-                if prefs.mode == WatchPreference::Watch {
-                    super::clear_watch_denied(self.epoch, self.kind);
-                }
-                self.mode = match prefs.mode {
-                    WatchPreference::Watch => WatchMode::Watch,
-                    WatchPreference::Poll => WatchMode::Poll(prefs.rate),
-                };
-                tracing::info!(
-                    kind = ?self.kind,
-                    mode = ?self.mode,
-                    "store: update mode"
-                );
-                let plan = self.plan.clone().unwrap_or_else(|| self.compute_plan());
-                self.restart_watches(plan);
-            }
         }
     }
 
@@ -303,30 +273,18 @@ where
                 self.flush(false);
             }
             StoreEvent::Error(scope, message) => {
-                tracing::warn!(kind = ?self.kind, ?scope, %message, "store: watch error");
+                tracing::warn!(kind = ?self.kind, ?scope, %message, "store: list error");
                 self.phase = SnapshotPhase::Error(message);
                 self.flush(true);
             }
-            StoreEvent::WatchDenied(scope, message) => {
-                if self.prefs.mode == WatchPreference::Watch && !self.watch_denied {
-                    tracing::warn!(
-                        kind = ?self.kind,
-                        ?scope,
-                        %message,
-                        "store: watch denied, falling back to polling"
-                    );
-                    self.watch_denied = true;
-                    super::mark_watch_denied(self.epoch, self.kind);
-                    self.mode = WatchMode::Poll(self.prefs.rate);
-                    let plan = self.plan.clone().unwrap_or_else(|| self.compute_plan());
-                    self.restart_watches(plan);
-                } else {
-                    // Even polling cannot read this resource, so surface the
-                    // permission problem instead of silently retaining stale
-                    // data.
+            StoreEvent::WatchError(scope, message) => {
+                tracing::warn!(kind = ?self.kind, ?scope, %message, "store: watch error");
+                if self.data.is_empty() {
                     self.phase = SnapshotPhase::Error(message);
                     self.flush(true);
                 }
+                // With data from the initial list, watch failures are
+                // transient: keep serving the cached rows and retry.
             }
         }
     }
@@ -350,14 +308,9 @@ where
 
     fn compute_plan(&self) -> StoreWatchPlan {
         let global = if !self.kind.is_namespaced() {
-            // Cluster-scoped kinds such as Namespaces are inherently global;
-            // the all-namespace RBAC probe must not block them.
             true
         } else {
-            match self.mode {
-                WatchMode::Watch => self.global_watch,
-                WatchMode::Poll(_) => self.global_list,
-            }
+            self.global_watch
         };
         watch_plan(
             self.scopes.keys().cloned(),
@@ -396,17 +349,8 @@ where
         let client = self.client.clone();
         let map = self.map;
         let make_api = self.make_api.clone();
-        match self.mode {
-            WatchMode::Watch => {
-                self.tokio
-                    .spawn(run_watch(client, scope, events, cancel_rx, map, make_api));
-            }
-            WatchMode::Poll(rate) => {
-                self.tokio.spawn(run_poll(
-                    client, scope, events, cancel_rx, map, make_api, rate,
-                ));
-            }
-        }
+        self.tokio
+            .spawn(run_watch(client, scope, events, cancel_rx, map, make_api));
         self.watches.push(cancel);
     }
 
@@ -421,7 +365,7 @@ where
             return;
         }
 
-        let snapshot = Arc::new(self.data.snapshot(self.phase.clone(), self.mode));
+        let snapshot = Arc::new(self.data.snapshot(self.phase.clone(), WatchMode::Watch));
         tracing::trace!(
             epoch = self.epoch,
             kind = ?self.kind,
@@ -466,12 +410,7 @@ where
     };
     let mut stream = match watched {
         Ok(stream) => Box::pin(stream),
-        Err(error) => {
-            if is_forbidden(&error) {
-                return InitialStream::Denied(format!("Watch denied: {error}"));
-            }
-            return InitialStream::Unsupported;
-        }
+        Err(_) => return InitialStream::Unsupported,
     };
 
     let mut records: BTreeMap<ObjectKey, KubeObjectRecord> = BTreeMap::new();
@@ -525,15 +464,7 @@ where
                     }
                     return InitialStream::Listed { resource_version };
                 }
-                Ok(Some(WatchEvent::Error(status))) => {
-                    if status.code == 403 {
-                        return InitialStream::Denied(format!(
-                            "Watch denied: {}",
-                            status.message
-                        ));
-                    }
-                    return InitialStream::Unsupported;
-                }
+                Ok(Some(WatchEvent::Error(_))) => return InitialStream::Unsupported,
                 Ok(None) | Err(_) => return InitialStream::Unsupported,
             }
         }
@@ -585,10 +516,6 @@ async fn run_watch<K, F>(
                         );
                         stream_initial_disabled = true;
                     }
-                    InitialStream::Denied(message) => {
-                        let _ = events.send(StoreEvent::WatchDenied(scope.clone(), message));
-                        return;
-                    }
                     InitialStream::Cancelled => return,
                 }
             }
@@ -619,16 +546,15 @@ async fn run_watch<K, F>(
                         need_list = false;
                     }
                     Err(error) => {
-                        if is_forbidden(&error) {
-                            let _ = events.send(StoreEvent::WatchDenied(
-                                scope.clone(),
-                                format!("Watch denied: {error}"),
-                            ));
-                            return;
-                        }
+                        let delay = match &error {
+                            kube::Error::Api(response) if response.code == 403 => {
+                                WATCH_DENIED_RETRY
+                            }
+                            _ => RECONNECT_DELAY,
+                        };
                         let message = format!("Could not list resources: {error}");
                         let _ = events.send(StoreEvent::Error(scope.clone(), message));
-                        if !sleep_or_cancel(&mut cancel, RECONNECT_DELAY).await {
+                        if !sleep_or_cancel(&mut cancel, delay).await {
                             return;
                         }
                         continue;
@@ -646,17 +572,9 @@ async fn run_watch<K, F>(
         let mut stream = match watched {
             Ok(stream) => Box::pin(stream),
             Err(error) => {
-                if is_forbidden(&error) {
-                    let _ = events.send(StoreEvent::WatchDenied(
-                        scope.clone(),
-                        format!("Watch denied: {error}"),
-                    ));
-                    return;
-                }
                 let message = format!("Could not watch resources: {error}");
-                let _ = events.send(StoreEvent::Error(scope.clone(), message));
-                need_list = true;
-                if !sleep_or_cancel(&mut cancel, RECONNECT_DELAY).await {
+                let _ = events.send(StoreEvent::WatchError(scope.clone(), message));
+                if !sleep_or_cancel(&mut cancel, WATCH_DENIED_RETRY).await {
                     return;
                 }
                 continue;
@@ -664,6 +582,7 @@ async fn run_watch<K, F>(
         };
 
         let mut relist = false;
+        let mut denied = false;
         loop {
             let event = tokio::select! {
                 _ = cancel.changed() => return,
@@ -701,24 +620,18 @@ async fn run_watch<K, F>(
                 Ok(Some(WatchEvent::Error(status))) => {
                     relist =
                         status.code == 410 || status.reason == "Expired" || status.reason == "Gone";
-                    if status.code == 403 {
-                        let _ = events.send(StoreEvent::WatchDenied(
-                            scope.clone(),
-                            format!("Watch denied: {}", status.message),
-                        ));
-                        return;
-                    }
                     if relist {
                         tracing::debug!(code = status.code, "store: watch expired, relisting");
                     } else {
+                        denied = status.code == 403;
                         let message = format!("Watch error ({}): {}", status.code, status.message);
-                        let _ = events.send(StoreEvent::Error(scope.clone(), message));
+                        let _ = events.send(StoreEvent::WatchError(scope.clone(), message));
                     }
                     break;
                 }
                 Ok(None) => break,
                 Err(error) => {
-                    let _ = events.send(StoreEvent::Error(
+                    let _ = events.send(StoreEvent::WatchError(
                         scope.clone(),
                         format!("Watch stream failed: {error}"),
                     ));
@@ -731,87 +644,15 @@ async fn run_watch<K, F>(
             need_list = true;
         }
 
-        if !sleep_or_cancel(&mut cancel, RECONNECT_DELAY).await {
+        let delay = if denied {
+            WATCH_DENIED_RETRY
+        } else {
+            RECONNECT_DELAY
+        };
+        if !sleep_or_cancel(&mut cancel, delay).await {
             return;
         }
     }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn run_poll<K, F>(
-    client: Client,
-    scope: NamespaceScope,
-    events: mpsc::UnboundedSender<StoreEvent>,
-    mut cancel: watch::Receiver<bool>,
-    map: F,
-    make_api: ApiFactory<K>,
-    rate: PollRate,
-) where
-    K: Resource
-        + ResourceExt
-        + Clone
-        + Debug
-        + DeserializeOwned
-        + Serialize
-        + Send
-        + Sync
-        + 'static
-        + crate::repository::store::StoredObject,
-    F: Fn(&K) -> Item + Copy + Send + Sync + 'static,
-{
-    loop {
-        let api = make_api(&client, &scope);
-        let params = ListParams::default();
-        let listed = tokio::select! {
-            _ = cancel.changed() => return,
-            result = api.list(&params) => result,
-        };
-
-        match listed {
-            Ok(list) => {
-                let records = list
-                    .items
-                    .iter()
-                    .map(|object| KubeObjectRecord::new(object.clone(), map(object)))
-                    .collect();
-                if events
-                    .send(StoreEvent::Replace(scope.clone(), records))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-            Err(error) => {
-                if is_forbidden(&error) {
-                    let _ = events.send(StoreEvent::WatchDenied(
-                        scope.clone(),
-                        format!("List denied: {error}"),
-                    ));
-                    return;
-                }
-                let message = format!("Could not list resources: {error}");
-                let _ = events.send(StoreEvent::Error(scope.clone(), message));
-            }
-        }
-
-        let delay = match rate {
-            PollRate::Off => None,
-            PollRate::Every(seconds) => Some(Duration::from_secs(seconds.max(1))),
-        };
-        tokio::select! {
-            _ = cancel.changed() => return,
-            _ = async {
-                match delay {
-                    Some(delay) => tokio::time::sleep(delay).await,
-                    None => std::future::pending().await,
-                }
-            } => {}
-        }
-    }
-}
-
-fn is_forbidden(error: &kube::Error) -> bool {
-    matches!(error, kube::Error::Api(response) if response.code == 403)
 }
 
 async fn sleep_or_cancel(cancel: &mut watch::Receiver<bool>, duration: Duration) -> bool {
@@ -829,8 +670,6 @@ pub(crate) fn spawn(
     tokio: tokio::runtime::Handle,
     epoch: u64,
     global_watch: bool,
-    global_list: bool,
-    prefs: WatchPrefs,
 ) -> Option<Arc<KubeObjectStoreHandle>> {
     match kind {
         ResourceKind::Pods => Some(spawn_typed(
@@ -839,8 +678,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             pod_item,
             namespaced_api::<Pod>,
         )),
@@ -850,8 +687,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             deployment_item,
             namespaced_api::<Deployment>,
         )),
@@ -861,8 +696,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             stateful_set_item,
             namespaced_api::<StatefulSet>,
         )),
@@ -872,8 +705,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             replica_set_item,
             namespaced_api::<ReplicaSet>,
         )),
@@ -883,8 +714,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             replication_controller_item,
             namespaced_api::<ReplicationController>,
         )),
@@ -894,8 +723,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             daemon_set_item,
             namespaced_api::<DaemonSet>,
         )),
@@ -905,8 +732,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             job_item,
             namespaced_api::<Job>,
         )),
@@ -916,8 +741,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             cron_job_item,
             namespaced_api::<CronJob>,
         )),
@@ -927,8 +750,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             horizontal_pod_autoscaler_item,
             namespaced_api::<HorizontalPodAutoscaler>,
         )),
@@ -938,8 +759,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             pod_disruption_budget_item,
             namespaced_api::<PodDisruptionBudget>,
         )),
@@ -949,8 +768,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             service_item,
             namespaced_api::<Service>,
         )),
@@ -960,8 +777,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             ingress_item,
             namespaced_api::<Ingress>,
         )),
@@ -971,8 +786,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             endpoints_item,
             namespaced_api::<Endpoints>,
         )),
@@ -982,8 +795,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             endpoint_slice_item,
             namespaced_api::<EndpointSlice>,
         )),
@@ -993,8 +804,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             network_policy_item,
             namespaced_api::<NetworkPolicy>,
         )),
@@ -1004,8 +813,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             pvc_item,
             namespaced_api::<PersistentVolumeClaim>,
         )),
@@ -1015,8 +822,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             storage_class_item,
             cluster_api::<StorageClass>,
         )),
@@ -1026,8 +831,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             config_map_item,
             namespaced_api::<ConfigMap>,
         )),
@@ -1037,8 +840,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             secret_item,
             namespaced_api::<Secret>,
         )),
@@ -1048,8 +849,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             service_account_item,
             namespaced_api::<ServiceAccount>,
         )),
@@ -1059,8 +858,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             pv_item,
             cluster_api::<PersistentVolume>,
         )),
@@ -1070,8 +867,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             namespace_item,
             cluster_api::<Namespace>,
         )),
@@ -1081,8 +876,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             node_item,
             cluster_api::<Node>,
         )),
@@ -1092,8 +885,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             lease_item,
             namespaced_api::<Lease>,
         )),
@@ -1103,8 +894,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             event_item,
             namespaced_api::<Event>,
         )),
@@ -1114,8 +903,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             cluster_role_item,
             cluster_api::<ClusterRole>,
         )),
@@ -1125,8 +912,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             role_item,
             namespaced_api::<Role>,
         )),
@@ -1136,8 +921,6 @@ pub(crate) fn spawn(
             tokio,
             epoch,
             global_watch,
-            global_list,
-            prefs,
             role_binding_item,
             namespaced_api::<RoleBinding>,
         )),
@@ -1159,8 +942,6 @@ pub(crate) fn spawn(
                 tokio,
                 epoch,
                 global_watch,
-                global_list,
-                prefs,
                 custom_item,
                 make_api,
             ))
@@ -1175,8 +956,6 @@ fn spawn_typed<K, F, M>(
     tokio: tokio::runtime::Handle,
     epoch: u64,
     global_watch: bool,
-    global_list: bool,
-    prefs: WatchPrefs,
     map: F,
     make_api: M,
 ) -> Arc<KubeObjectStoreHandle>
@@ -1211,7 +990,6 @@ where
         epoch,
         kind,
         global_watch,
-        global_list,
         data,
         scopes: HashMap::new(),
         plan: None,
@@ -1221,12 +999,6 @@ where
         command_rx,
         snapshots,
         phase: SnapshotPhase::Loading,
-        mode: match prefs.mode {
-            WatchPreference::Watch => WatchMode::Watch,
-            WatchPreference::Poll => WatchMode::Poll(prefs.rate),
-        },
-        prefs,
-        watch_denied: false,
         map,
         make_api: Arc::new(make_api),
     };
