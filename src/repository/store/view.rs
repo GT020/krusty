@@ -4,6 +4,7 @@
 //! rows for one screen scope and rebuilds them only when the store flush is
 //! relevant to that scope.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use crate::models::{Item, NamespaceScope, ResourceSnapshot, SnapshotPhase, WatchMode};
@@ -17,7 +18,7 @@ pub struct StoreView {
     phase: SnapshotPhase,
     mode: WatchMode,
     last_revision: u64,
-    last_namespace_revision: Option<u64>,
+    last_namespace_revisions: BTreeMap<String, Option<u64>>,
     initialized: bool,
 }
 
@@ -29,9 +30,18 @@ impl StoreView {
             phase: SnapshotPhase::Loading,
             mode: WatchMode::Watch,
             last_revision: 0,
-            last_namespace_revision: None,
+            last_namespace_revisions: BTreeMap::new(),
             initialized: false,
         }
+    }
+
+    fn namespace_revision_changed(&self, snapshot: &StoreSnapshot, namespace: &str) -> bool {
+        snapshot.namespace_revision(namespace)
+            != self
+                .last_namespace_revisions
+                .get(namespace)
+                .copied()
+                .flatten()
     }
 
     #[cfg(test)]
@@ -65,45 +75,58 @@ impl StoreView {
 
         let namespace_changed = match &self.scope {
             NamespaceScope::All => self.last_revision != snapshot.revision(),
-            NamespaceScope::One(namespace) => {
-                snapshot.namespace_revision(namespace) != self.last_namespace_revision
-            }
+            NamespaceScope::One(namespace) => self.namespace_revision_changed(snapshot, namespace),
+            NamespaceScope::Many(namespaces) => namespaces
+                .iter()
+                .any(|namespace| self.namespace_revision_changed(snapshot, namespace)),
         };
 
         if self.initialized && !phase_changed && !mode_changed && !namespace_changed {
             return None;
         }
 
-        let objects = visible_objects(snapshot.objects(), &self.scope);
-        self.items = objects
-            .iter()
-            .map(|record| record.summary.clone())
-            .collect();
+        let objects = snapshot.objects();
+        self.items = match &self.scope {
+            NamespaceScope::All => objects
+                .iter()
+                .map(|record| record.summary.clone())
+                .collect(),
+            NamespaceScope::One(namespace) => namespace_objects(objects, namespace)
+                .iter()
+                .map(|record| record.summary.clone())
+                .collect(),
+            NamespaceScope::Many(namespaces) => namespaces
+                .iter()
+                .flat_map(|namespace| namespace_objects(objects, namespace))
+                .map(|record| record.summary.clone())
+                .collect(),
+        };
         self.phase = snapshot.phase().clone();
         self.mode = snapshot.mode();
         self.last_revision = snapshot.revision();
-        self.last_namespace_revision = match &self.scope {
-            NamespaceScope::All => None,
-            NamespaceScope::One(namespace) => snapshot.namespace_revision(namespace),
-        };
+        self.last_namespace_revisions = self
+            .scope
+            .namespaces()
+            .map(|namespace| {
+                (
+                    namespace.to_string(),
+                    snapshot.namespace_revision(namespace),
+                )
+            })
+            .collect();
         self.initialized = true;
 
         Some(self.snapshot())
     }
 }
 
-fn visible_objects<'a>(
+fn namespace_objects<'a>(
     objects: &'a [Arc<KubeObjectRecord>],
-    scope: &NamespaceScope,
+    namespace: &str,
 ) -> &'a [Arc<KubeObjectRecord>] {
-    match scope {
-        NamespaceScope::All => objects,
-        NamespaceScope::One(namespace) => {
-            let start = objects.partition_point(|record| record.key.namespace < *namespace);
-            let end = objects.partition_point(|record| record.key.namespace <= *namespace);
-            &objects[start..end]
-        }
-    }
+    let start = objects.partition_point(|record| record.key.namespace.as_str() < namespace);
+    let end = objects.partition_point(|record| record.key.namespace.as_str() <= namespace);
+    &objects[start..end]
 }
 
 #[cfg(test)]
@@ -148,6 +171,44 @@ mod tests {
         let view = view_for(NamespaceScope::One("ns-2".into()), &snapshot);
         assert_eq!(view.len(), 1);
         assert_eq!(view.items()[0].name, "b");
+    }
+
+    #[test]
+    fn multi_namespace_scope_includes_only_the_selected_namespaces() {
+        let mut data = super::super::data::StoreData::new();
+        data.upsert(test_record("a", "ns-1", "uid-a", "1"));
+        data.upsert(test_record("b", "ns-2", "uid-b", "1"));
+        data.upsert(test_record("c", "ns-3", "uid-c", "1"));
+        let snapshot = data.snapshot(SnapshotPhase::Ready, WatchMode::Watch);
+
+        let view = view_for(
+            NamespaceScope::Many(vec!["ns-1".into(), "ns-3".into()]),
+            &snapshot,
+        );
+        assert_eq!(view.len(), 2);
+        assert_eq!(view.items()[0].name, "a");
+        assert_eq!(view.items()[1].name, "c");
+    }
+
+    #[test]
+    fn multi_namespace_scope_ignores_unrelated_namespace_changes() {
+        let mut data = super::super::data::StoreData::new();
+        data.upsert(test_record("a", "ns-1", "uid-a", "1"));
+        data.upsert(test_record("b", "ns-2", "uid-b", "1"));
+        let first = data.snapshot(SnapshotPhase::Ready, WatchMode::Watch);
+        let mut view = view_for(
+            NamespaceScope::Many(vec!["ns-1".into(), "ns-2".into()]),
+            &first,
+        );
+
+        data.upsert(test_record("c", "ns-3", "uid-c", "1"));
+        let second = data.snapshot(SnapshotPhase::Ready, WatchMode::Watch);
+        assert!(view.apply(&second).is_none());
+
+        data.upsert(test_record("d", "ns-2", "uid-d", "1"));
+        let third = data.snapshot(SnapshotPhase::Ready, WatchMode::Watch);
+        assert!(view.apply(&third).is_some());
+        assert_eq!(view.len(), 3);
     }
 
     #[test]

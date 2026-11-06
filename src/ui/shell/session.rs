@@ -15,7 +15,7 @@ use crate::models::{NamespaceScope, ResourceKind};
 use crate::view_models::shell::NavTarget;
 
 const SESSION_FILE: &str = "session.json";
-const SESSION_VERSION: u32 = 2;
+const SESSION_VERSION: u32 = 3;
 const MIN_SPLIT: f32 = 0.2;
 const MAX_SPLIT: f32 = 0.8;
 
@@ -74,6 +74,8 @@ struct StoredTab {
     target: StoredTarget,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    namespaces: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -194,16 +196,22 @@ fn encode(session: &WorkspaceSession) -> StoredWorkspace {
             let Some(target) = StoredTarget::from_nav(tab.target) else {
                 continue;
             };
-            let namespace = match tab.target {
-                NavTarget::Resource(kind) if kind.is_namespaced() => {
-                    tab.scope.namespace().map(str::to_string)
-                }
-                _ => None,
+            let (namespace, namespaces) = match tab.target {
+                NavTarget::Resource(kind) if kind.is_namespaced() => match &tab.scope {
+                    NamespaceScope::All => (None, Vec::new()),
+                    NamespaceScope::One(namespace) => (Some(namespace.clone()), Vec::new()),
+                    NamespaceScope::Many(namespaces) => (None, namespaces.clone()),
+                },
+                _ => (None, Vec::new()),
             };
             if pane.active == Some(index) {
                 active = Some(tabs.len());
             }
-            tabs.push(StoredTab { target, namespace });
+            tabs.push(StoredTab {
+                target,
+                namespace,
+                namespaces,
+            });
         }
         if tabs.is_empty() {
             continue;
@@ -264,7 +272,7 @@ fn decode(stored: StoredWorkspace) -> WorkspaceSession {
             }
             tabs.push(SessionTab {
                 target,
-                scope: restore_scope(target, tab.namespace),
+                scope: restore_scope(target, tab.namespace, tab.namespaces),
             });
         }
         if tabs.is_empty() {
@@ -303,12 +311,22 @@ fn clamp_split(value: f32) -> f32 {
     }
 }
 
-fn restore_scope(target: NavTarget, namespace: Option<String>) -> NamespaceScope {
+fn restore_scope(
+    target: NavTarget,
+    namespace: Option<String>,
+    namespaces: Vec<String>,
+) -> NamespaceScope {
     match target {
-        NavTarget::Resource(kind) if kind.is_namespaced() => namespace
-            .filter(|namespace| !namespace.is_empty())
-            .map(NamespaceScope::One)
-            .unwrap_or(NamespaceScope::All),
+        NavTarget::Resource(kind) if kind.is_namespaced() => {
+            if !namespaces.is_empty() {
+                NamespaceScope::from_namespaces(namespaces)
+            } else {
+                namespace
+                    .filter(|namespace| !namespace.is_empty())
+                    .map(NamespaceScope::One)
+                    .unwrap_or(NamespaceScope::All)
+            }
+        }
         _ => NamespaceScope::All,
     }
 }
@@ -367,10 +385,12 @@ mod tests {
                 StoredTab {
                     target: StoredTarget::Overview,
                     namespace: None,
+                    namespaces: Vec::new(),
                 },
                 StoredTab {
                     target: StoredTarget::Resource("Pods".to_string()),
                     namespace: Some("kube-system".to_string()),
+                    namespaces: Vec::new(),
                 },
             ],
             active: Some(1),
@@ -420,10 +440,12 @@ mod tests {
                         StoredTab {
                             target: StoredTarget::Resource("NotAKind".to_string()),
                             namespace: None,
+                            namespaces: Vec::new(),
                         },
                         StoredTab {
                             target: StoredTarget::Resource("Pods".to_string()),
                             namespace: None,
+                            namespaces: Vec::new(),
                         },
                     ],
                     active: Some(0),
@@ -432,6 +454,7 @@ mod tests {
                     tabs: vec![StoredTab {
                         target: StoredTarget::Resource("Services".to_string()),
                         namespace: None,
+                        namespaces: Vec::new(),
                     }],
                     active: Some(1),
                 },
@@ -467,6 +490,7 @@ mod tests {
                     tabs: vec![StoredTab {
                         target: StoredTarget::Resource("Pods".to_string()),
                         namespace: None,
+                        namespaces: Vec::new(),
                     }],
                     active: Some(0),
                 },
@@ -493,6 +517,7 @@ mod tests {
                     tabs: vec![StoredTab {
                         target: StoredTarget::Resource("Pods".to_string()),
                         namespace: None,
+                        namespaces: Vec::new(),
                     }],
                     active: Some(0),
                 },
@@ -500,6 +525,7 @@ mod tests {
                     tabs: vec![StoredTab {
                         target: StoredTarget::Resource("Services".to_string()),
                         namespace: None,
+                        namespaces: Vec::new(),
                     }],
                     active: Some(0),
                 },
@@ -519,6 +545,7 @@ mod tests {
             tabs: vec![StoredTab {
                 target: StoredTarget::Resource("Pods".to_string()),
                 namespace: None,
+                namespaces: Vec::new(),
             }],
             active: Some(0),
         };
@@ -554,7 +581,26 @@ mod tests {
     }
 
     #[test]
-    fn version_two_files_do_not_write_legacy_fields() {
+    fn multi_namespace_scopes_round_trip() {
+        let session = WorkspaceSession {
+            panes: vec![SessionPane {
+                tabs: vec![tab(
+                    resource(ResourceKind::Pods),
+                    NamespaceScope::Many(vec!["default".to_string(), "kube-system".to_string()]),
+                )],
+                active: Some(0),
+            }],
+            focused: Some(0),
+            split: None,
+        };
+
+        let decoded = decode(encode(&session));
+
+        assert_eq!(decoded, session);
+    }
+
+    #[test]
+    fn version_three_files_do_not_write_legacy_fields() {
         let session = WorkspaceSession {
             panes: vec![SessionPane {
                 tabs: vec![tab(resource(ResourceKind::Pods), NamespaceScope::All)],
@@ -566,7 +612,7 @@ mod tests {
 
         let stored = encode(&session);
 
-        assert_eq!(stored.version, 2);
+        assert_eq!(stored.version, 3);
         assert!(stored.tabs.is_empty());
         assert_eq!(stored.active, None);
     }

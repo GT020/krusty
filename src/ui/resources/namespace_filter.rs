@@ -2,15 +2,20 @@
 
 use crate::cluster::ClusterState;
 use crate::models::NamespaceScope;
+use gpui_kit::base::h_flex;
 use gpui_kit::component::Sizable as _;
-use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectItem, SelectState};
+use gpui_kit::component::combobox::{Combobox, ComboboxEvent, ComboboxState};
+use gpui_kit::component::select::{SearchableVec, SelectDelegate, SelectItem};
+use gpui_kit::component::{ActiveTheme as _, Icon, IconName, IndexPath};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    App, AppContext as _, Context, Entity, EventEmitter, SharedString, Styled as _, Subscription,
-    Window, px,
+    AnyElement, App, AppContext as _, Context, Entity, EventEmitter, InteractiveElement as _,
+    IntoElement, ParentElement as _, SharedString, StatefulInteractiveElement as _, Styled as _,
+    Subscription, Task, WeakEntity, Window, div, px,
 };
 
 /// One row in the namespace selector. `name` is empty for the "All namespaces"
-/// sentinel; `value()` distinguishes the scope.
+/// row, which has no checkbox.
 #[derive(Clone, Debug)]
 pub struct NamespaceItem {
     name: String,
@@ -48,7 +53,6 @@ impl SelectItem for NamespaceItem {
     }
 }
 
-/// Build the select items: an "All namespaces" sentinel first, then namespaces.
 fn namespace_items(namespaces: &[String]) -> SearchableVec<NamespaceItem> {
     let mut items = Vec::with_capacity(namespaces.len() + 1);
     items.push(NamespaceItem::all());
@@ -56,9 +60,132 @@ fn namespace_items(namespaces: &[String]) -> SearchableVec<NamespaceItem> {
     SearchableVec::new(items)
 }
 
-pub type NamespaceSelect = SelectState<SearchableVec<NamespaceItem>>;
+/// Combobox delegate that draws a checkbox before every namespace name. The
+/// checkbox toggles the namespace in place and keeps the menu open; clicking
+/// the name itself selects just that namespace and closes the menu.
+#[derive(Clone)]
+pub(crate) struct NamespaceItems {
+    items: SearchableVec<NamespaceItem>,
+    filter: WeakEntity<NamespaceFilter>,
+}
 
-/// Emitted when the user picks a namespace, or when the selected namespace
+impl NamespaceItems {
+    fn new(items: SearchableVec<NamespaceItem>, filter: WeakEntity<NamespaceFilter>) -> Self {
+        Self { items, filter }
+    }
+}
+
+impl SelectDelegate for NamespaceItems {
+    type Item = NamespaceItem;
+
+    fn items_count(&self, section: usize) -> usize {
+        self.items.items_count(section)
+    }
+
+    fn item(&self, ix: IndexPath) -> Option<&Self::Item> {
+        self.items.item(ix)
+    }
+
+    fn position<V>(&self, value: &V) -> Option<IndexPath>
+    where
+        Self::Item: SelectItem<Value = V>,
+        V: PartialEq,
+    {
+        self.items.position(value)
+    }
+
+    fn perform_search(&mut self, query: &str, window: &mut Window, cx: &mut App) -> Task<()> {
+        self.items.perform_search(query, window, cx)
+    }
+
+    fn is_item_checked(
+        &self,
+        _ix: IndexPath,
+        item: &Self::Item,
+        current_selection: &[(IndexPath, Self::Item)],
+        _cx: &App,
+    ) -> bool {
+        if item.is_all() {
+            current_selection.is_empty()
+                || current_selection
+                    .iter()
+                    .all(|(_, selected)| selected.is_all())
+        } else {
+            current_selection
+                .iter()
+                .any(|(_, selected)| selected.value() == item.value())
+        }
+    }
+
+    fn render_item(
+        &self,
+        _ix: IndexPath,
+        item: &Self::Item,
+        checked: bool,
+        _window: &mut Window,
+        cx: &mut App,
+    ) -> Option<AnyElement> {
+        if item.is_all() {
+            return Some(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .gap_2()
+                    .child(div().size(px(14.)).flex_shrink_0())
+                    .child(div().flex_1().min_w_0().truncate().child(item.title()))
+                    .when(checked, |this| {
+                        this.child(Icon::new(IconName::Check).text_color(cx.theme().primary))
+                    })
+                    .into_any_element(),
+            );
+        }
+
+        let name = item.name.clone();
+        let filter = self.filter.clone();
+        Some(
+            h_flex()
+                .w_full()
+                .items_center()
+                .gap_2()
+                .child(
+                    div()
+                        .id(SharedString::from(format!("namespace-check-{name}")))
+                        .flex()
+                        .size(px(14.))
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(3.))
+                        .border_1()
+                        .cursor_pointer()
+                        .when(checked, |this| {
+                            this.border_color(cx.theme().primary)
+                                .bg(cx.theme().primary)
+                                .child(
+                                    Icon::new(IconName::Check)
+                                        .size(px(10.))
+                                        .text_color(cx.theme().primary_foreground),
+                                )
+                        })
+                        .when(!checked, |this| this.border_color(cx.theme().input))
+                        .on_click(move |_, window, cx| {
+                            cx.stop_propagation();
+                            let Some(filter) = filter.upgrade() else {
+                                return;
+                            };
+                            filter.update(cx, |filter, cx| {
+                                filter.toggle_namespace(name.clone(), window, cx);
+                            });
+                        }),
+                )
+                .child(div().flex_1().min_w_0().truncate().child(item.title()))
+                .into_any_element(),
+        )
+    }
+}
+
+pub type NamespaceSelect = ComboboxState<NamespaceItems>;
+
+/// Emitted when the user picks namespaces, or when a selected namespace
 /// disappears from the cluster.
 #[derive(Clone, Debug)]
 pub enum NamespaceFilterEvent {
@@ -83,18 +210,26 @@ impl NamespaceFilter {
     /// Create a filter that starts on `scope`, used when restoring a saved tab.
     pub fn with_scope(scope: NamespaceScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let namespaces = cx.global::<ClusterState>().namespaces().to_vec();
-        let selected_value = scope.namespace().unwrap_or_default().to_string();
+        let selected_values = scope.selected_namespaces();
+        let filter = cx.entity().downgrade();
+        let items = NamespaceItems::new(namespace_items(&namespaces), filter);
         let select = cx.new(|cx| {
-            let mut select =
-                SelectState::new(namespace_items(&namespaces), None, window, cx).searchable(true);
-            select.set_selected_value(&selected_value, window, cx);
+            let mut select = ComboboxState::new(items, Vec::new(), window, cx).searchable(true);
+            select.set_selected_values(&selected_values, window, cx);
             select
         });
         let select_sub = cx.subscribe(
             &select,
-            |this, _, event: &SelectEvent<SearchableVec<NamespaceItem>>, cx| {
-                let SelectEvent::Confirm(value) = event;
-                this.apply_scope(scope_from_value(value.as_deref()), cx);
+            |this, _, event: &ComboboxEvent<NamespaceItems>, cx| match event {
+                // The clear button emits Change without a following Confirm, so
+                // handle an empty selection immediately.
+                ComboboxEvent::Change(values) if values.is_empty() => {
+                    this.apply_scope(NamespaceScope::All, cx);
+                }
+                ComboboxEvent::Confirm(values) => {
+                    this.apply_scope(NamespaceScope::from_namespaces(values.clone()), cx);
+                }
+                _ => {}
             },
         );
         let cluster_sub = cx.observe_global_in::<ClusterState>(window, |this, window, cx| {
@@ -120,10 +255,31 @@ impl NamespaceFilter {
         if self.scope == scope {
             return;
         }
-        let value = scope.namespace().unwrap_or_default().to_string();
+        let values = scope.selected_namespaces();
         self.apply_scope(scope, cx);
         self.select.update(cx, |select, cx| {
-            select.set_selected_value(&value, window, cx);
+            select.set_selected_values(&values, window, cx);
+        });
+    }
+
+    fn toggle_namespace(&mut self, namespace: String, window: &mut Window, cx: &mut Context<Self>) {
+        let mut namespaces = self.scope.selected_namespaces();
+        if let Some(index) = namespaces
+            .iter()
+            .position(|selected| selected == &namespace)
+        {
+            namespaces.remove(index);
+        } else {
+            namespaces.push(namespace);
+        }
+
+        let scope = NamespaceScope::from_namespaces(namespaces);
+        let values = scope.selected_namespaces();
+        if self.scope != scope {
+            self.apply_scope(scope, cx);
+        }
+        self.select.update(cx, |select, cx| {
+            select.set_selected_values(&values, window, cx);
         });
     }
 
@@ -150,25 +306,35 @@ impl NamespaceFilter {
                 self.apply_scope(NamespaceScope::All, cx);
                 true
             }
+            NamespaceScope::Many(selected) if !namespaces.is_empty() => {
+                let retained: Vec<String> = selected
+                    .iter()
+                    .filter(|namespace| namespaces.contains(namespace))
+                    .cloned()
+                    .collect();
+                if retained.len() == selected.len() {
+                    false
+                } else {
+                    self.apply_scope(NamespaceScope::from_namespaces(retained), cx);
+                    true
+                }
+            }
             _ => false,
         };
 
         if namespaces_changed {
             self.synced_namespaces = namespaces.clone();
+            let items = NamespaceItems::new(namespace_items(&namespaces), cx.entity().downgrade());
             self.select.update(cx, |select, cx| {
-                select.set_items(namespace_items(&namespaces), window, cx);
+                select.set_items(items, window, cx);
             });
         }
 
-        let value = self
-            .scope
-            .namespace()
-            .map(str::to_string)
-            .unwrap_or_default();
-        let value_changed = self.select.read(cx).selected_value() != Some(&value);
-        if value_changed {
+        let values = self.scope.selected_namespaces();
+        let value_changed = self.select.read(cx).selected_values() != values;
+        if namespaces_changed || value_changed {
             self.select.update(cx, |select, cx| {
-                select.set_selected_value(&value, window, cx);
+                select.set_selected_values(&values, window, cx);
             });
         }
 
@@ -178,26 +344,29 @@ impl NamespaceFilter {
     }
 }
 
-fn scope_from_value(value: Option<&str>) -> NamespaceScope {
-    match value {
-        Some(namespace) if !namespace.is_empty() => NamespaceScope::One(namespace.to_string()),
-        _ => NamespaceScope::All,
-    }
-}
-
 /// Render the tab-local namespace selector.
 pub fn render(filter: &Entity<NamespaceFilter>, cx: &App) -> impl gpui_kit::IntoElement + use<> {
     let filter = filter.read(cx);
-    Select::new(&filter.select)
-        .id(SharedString::from(format!(
-            "namespace-filter-{}",
-            filter.select.entity_id()
-        )))
+    Combobox::new(&filter.select)
         .small()
-        .w(px(180.))
+        .w(px(240.))
         .menu_max_h(px(320.))
         .placeholder("All namespaces")
         .search_placeholder("Search namespaces")
+        .render_trigger(|trigger, _window, _cx| {
+            let names: Vec<String> = trigger
+                .selection()
+                .iter()
+                .filter(|(_, item)| !item.is_all())
+                .map(|(_, item)| item.title().to_string())
+                .collect();
+            let label = if names.is_empty() {
+                "All namespaces".to_string()
+            } else {
+                names.join(", ")
+            };
+            div().truncate().child(label)
+        })
 }
 
 #[cfg(test)]
@@ -205,16 +374,26 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_all_sentinel_clears_the_namespace_filter() {
-        assert_eq!(scope_from_value(None), NamespaceScope::All);
-        assert_eq!(scope_from_value(Some("")), NamespaceScope::All);
+    fn an_empty_selection_selects_all_namespaces() {
+        assert_eq!(
+            NamespaceScope::from_namespaces(Vec::new()),
+            NamespaceScope::All
+        );
     }
 
     #[test]
-    fn a_named_selection_filters_to_that_namespace() {
+    fn one_selection_is_a_single_namespace_scope() {
         assert_eq!(
-            scope_from_value(Some("kube-system")),
+            NamespaceScope::from_namespaces(["kube-system".to_string()]),
             NamespaceScope::One("kube-system".to_string())
+        );
+    }
+
+    #[test]
+    fn several_selections_become_a_multi_namespace_scope() {
+        assert_eq!(
+            NamespaceScope::from_namespaces(["kube-system".to_string(), "default".to_string()]),
+            NamespaceScope::Many(vec!["default".to_string(), "kube-system".to_string()])
         );
     }
 }

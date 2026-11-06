@@ -245,6 +245,15 @@ where
                     NamespaceScope::One(namespace) => {
                         self.data.replace_namespace(namespace, records)
                     }
+                    // Watches are always started per namespace, so a
+                    // multi-namespace scope never identifies a single list.
+                    NamespaceScope::Many(_) => {
+                        tracing::warn!(
+                            kind = ?self.kind,
+                            "store: ignoring list for a multi-namespace scope"
+                        );
+                        false
+                    }
                 };
                 let trimmed = self.data.trim_oldest(STORE_ITEM_CAP);
                 tracing::trace!(
@@ -931,6 +940,13 @@ pub(crate) fn spawn(
                 NamespaceScope::One(namespace) => {
                     Api::<DynamicObject>::namespaced_with(client.clone(), namespace, &resource)
                 }
+                // The store starts one watch per namespace for multi-namespace
+                // scopes, so this arm is only a compile-time fallback.
+                NamespaceScope::Many(namespaces) => Api::<DynamicObject>::namespaced_with(
+                    client.clone(),
+                    namespaces.first().map(String::as_str).unwrap_or_default(),
+                    &resource,
+                ),
             };
             Some(spawn_typed(
                 kind,
@@ -1015,6 +1031,12 @@ where
     match scope {
         NamespaceScope::All => Api::<K>::all(client.clone()),
         NamespaceScope::One(namespace) => Api::<K>::namespaced(client.clone(), namespace),
+        // The store starts one watch per namespace for multi-namespace scopes,
+        // so this arm is only a compile-time fallback.
+        NamespaceScope::Many(namespaces) => Api::<K>::namespaced(
+            client.clone(),
+            namespaces.first().map(String::as_str).unwrap_or_default(),
+        ),
     }
 }
 
