@@ -17,14 +17,23 @@ pub enum PodHealth {
 }
 
 impl PodHealth {
+    /// Case-insensitive without allocating: this runs for every pod on every
+    /// overview refresh, so a `to_ascii_lowercase` allocation per pod adds up
+    /// quickly on large clusters.
+    #[inline]
     pub fn from_status(status: &str) -> Self {
-        match status.to_ascii_lowercase().as_str() {
-            "running" => Self::Running,
-            "pending" => Self::Pending,
-            "succeeded" => Self::Succeeded,
-            "failed" => Self::Failed,
-            "crashloopbackoff" => Self::CrashLoopBackOff,
-            _ => Self::Unknown,
+        if status.eq_ignore_ascii_case("running") {
+            Self::Running
+        } else if status.eq_ignore_ascii_case("pending") {
+            Self::Pending
+        } else if status.eq_ignore_ascii_case("succeeded") {
+            Self::Succeeded
+        } else if status.eq_ignore_ascii_case("failed") {
+            Self::Failed
+        } else if status.eq_ignore_ascii_case("crashloopbackoff") {
+            Self::CrashLoopBackOff
+        } else {
+            Self::Unknown
         }
     }
 
@@ -76,7 +85,13 @@ impl ClusterOverviewStats {
         for pod in pods {
             stats.pod_restarts += pod.restarts;
             if !pod.node.is_empty() {
-                *stats.pods_by_node.entry(pod.node.clone()).or_default() += 1;
+                // Only clone the node name when a new node appears; a cluster
+                // with 10k pods schedules most of them on a few hundred nodes.
+                if let Some(count) = stats.pods_by_node.get_mut(&pod.node) {
+                    *count += 1;
+                } else {
+                    stats.pods_by_node.insert(pod.node.clone(), 1);
+                }
             }
             match PodHealth::from_status(&pod.status) {
                 PodHealth::Running => stats.pods_running += 1,
@@ -116,6 +131,19 @@ mod tests {
         let mut item = Item::new(name.to_string(), Some("default".to_string()));
         item.status = status.to_string();
         Arc::new(item)
+    }
+
+    #[test]
+    fn normalizes_pod_status_without_allocating() {
+        assert_eq!(PodHealth::from_status("Running"), PodHealth::Running);
+        assert_eq!(
+            PodHealth::from_status("CrashLoopBackOff"),
+            PodHealth::CrashLoopBackOff
+        );
+        assert_eq!(
+            PodHealth::from_status("containercreating"),
+            PodHealth::Unknown
+        );
     }
 
     #[test]

@@ -163,8 +163,9 @@ impl HorizontalPodAutoscalersViewModel {
 
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
-        let subscription = match repository::resources::horizontal_pod_autoscalers::subscribe(
+        let subscription = match repository::subscribe(
             cx,
+            ResourceKind::HorizontalPodAutoscalers,
             self.scope.clone(),
         ) {
             Ok(s) => s,

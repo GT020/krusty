@@ -163,8 +163,9 @@ impl PersistentVolumeClaimsViewModel {
 
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
-        let subscription = match repository::resources::persistent_volume_claims::subscribe(
+        let subscription = match repository::subscribe(
             cx,
+            ResourceKind::PersistentVolumeClaims,
             self.scope.clone(),
         ) {
             Ok(s) => s,

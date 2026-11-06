@@ -68,4 +68,4 @@ pub use service_accounts::ServiceAccountsModel;
 pub use services::ServicesModel;
 pub use stateful_sets::StatefulSetsModel;
 pub use storage_classes::StorageClassesModel;
-pub use store::{ObjectKey, PollRate, ResourceSnapshot, ResourceStore, SnapshotPhase, WatchMode};
+pub use store::{ObjectKey, ResourceSnapshot, SnapshotPhase, WatchMode};

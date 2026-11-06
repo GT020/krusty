@@ -160,7 +160,7 @@ impl DaemonSetsViewModel {
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
         let subscription =
-            match repository::resources::daemon_sets::subscribe(cx, self.scope.clone()) {
+            match repository::subscribe(cx, ResourceKind::DaemonSets, self.scope.clone()) {
                 Ok(s) => s,
                 Err(error) => {
                     use crate::models::ResourceSnapshot;
