@@ -15,6 +15,9 @@ use gpui_kit::{
 };
 
 use crate::models::{NamespaceScope, SnapshotPhase};
+use crate::ui::resources::search_filter::{
+    SearchFilter, SearchFilterEvent, render as render_search_filter,
+};
 use crate::view_models::resources::node::NodesViewModel;
 
 const LIST_MIN_WIDTH: Pixels = px(320.);
@@ -34,18 +37,30 @@ fn list_default_width(viewport_width: f32) -> Pixels {
 
 pub struct NodesView {
     vm: gpui_kit::Entity<NodesViewModel>,
+    search_filter: gpui_kit::Entity<SearchFilter>,
     width_share: f32,
     _vm_sub: Subscription,
+    _search_sub: Subscription,
 }
 
 impl NodesView {
     pub fn new(scope: NamespaceScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let vm = cx.new(|cx| NodesViewModel::new(scope, window, cx));
         let sub = cx.observe(&vm, |_, _, cx| cx.notify());
+        let search_filter = cx.new(|cx| SearchFilter::new(window, cx));
+        let search_sub = cx.subscribe(&search_filter, |this, _, event: &SearchFilterEvent, cx| {
+            let SearchFilterEvent::Changed(filter) = event;
+            this.vm.update(cx, |vm, cx| {
+                vm.set_filter(filter.clone(), cx);
+                vm.close_detail(cx);
+            });
+        });
         Self {
             vm,
+            search_filter,
             width_share: 1.0,
             _vm_sub: sub,
+            _search_sub: search_sub,
         }
     }
 
@@ -112,6 +127,7 @@ impl NodesView {
                             .font_weight(FontWeight::MEDIUM)
                             .child(SharedString::from("Nodes")),
                     )
+                    .child(render_search_filter(&self.search_filter, cx))
                     .child(status)
                     .child(super::watch_mode::render(
                         mode,

@@ -13,12 +13,13 @@ use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
 use crate::models::resources::persistent_volume_claims::PersistentVolumeClaimsModel;
-use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase, WatchMode};
+use crate::models::{Item, NamespaceScope, ResourceFilter, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository;
 
 pub struct PersistentVolumeClaimsViewModel {
     active: Arc<AtomicBool>,
     scope: NamespaceScope,
+    filter: ResourceFilter,
     epoch: u64,
     model: Entity<PersistentVolumeClaimsModel>,
     table: Entity<TableState<PersistentVolumeClaimsViewModelTable>>,
@@ -58,6 +59,7 @@ impl PersistentVolumeClaimsViewModel {
         let mut this = Self {
             active,
             scope,
+            filter: ResourceFilter::default(),
             epoch,
             model,
             table,
@@ -84,6 +86,18 @@ impl PersistentVolumeClaimsViewModel {
         }
         self.scope = scope;
         self.subscribe(cx);
+        cx.notify();
+    }
+
+    /// Replace the text filter applied to this tab's rows.
+    pub fn set_filter(&mut self, filter: ResourceFilter, cx: &mut Context<Self>) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter = filter.clone();
+        if let Some(subscription) = &self.subscription {
+            subscription.set_filter(filter);
+        }
         cx.notify();
     }
 
@@ -167,6 +181,7 @@ impl PersistentVolumeClaimsViewModel {
             cx,
             ResourceKind::PersistentVolumeClaims,
             self.scope.clone(),
+            self.filter.clone(),
         ) {
             Ok(s) => s,
             Err(error) => {

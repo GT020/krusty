@@ -14,7 +14,7 @@ pub use resources::{
     StatefulSetsViewModel, StorageClassesViewModel,
 };
 
-use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
+use crate::models::{NamespaceScope, ResourceFilter, ResourceKind, SnapshotPhase};
 use gpui_kit::component::table::{DataTable, TableEvent};
 use gpui_kit::{App, AppContext as _, Context, Entity, IntoElement, Subscription, Window};
 
@@ -542,6 +542,50 @@ impl ResourceViewModel {
             Self::RoleBindings(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
             Self::Roles(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
             Self::Custom(vm) => vm.update(cx, |vm, cx| vm.set_scope(scope.clone(), cx)),
+        }
+    }
+
+    pub fn set_filter<V: 'static>(&self, filter: ResourceFilter, cx: &mut Context<V>) {
+        match self {
+            Self::Pods(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Deployments(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::StatefulSets(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::ReplicaSets(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::CronJobs(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::ServiceAccounts(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::StorageClasses(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Namespaces(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::DaemonSets(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Jobs(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Services(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Ingresses(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::PersistentVolumes(vm) => {
+                vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx))
+            }
+            Self::PersistentVolumeClaims(vm) => {
+                vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx))
+            }
+            Self::ConfigMaps(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Secrets(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Nodes(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::ClusterRoles(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::EndpointSlices(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Endpoints(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Events(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::HorizontalPodAutoscalers(vm) => {
+                vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx))
+            }
+            Self::Leases(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::NetworkPolicies(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::PodDisruptionBudgets(vm) => {
+                vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx))
+            }
+            Self::ReplicationControllers(vm) => {
+                vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx))
+            }
+            Self::RoleBindings(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Roles(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
+            Self::Custom(vm) => vm.update(cx, |vm, cx| vm.set_filter(filter.clone(), cx)),
         }
     }
 

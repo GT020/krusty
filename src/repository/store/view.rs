@@ -7,32 +7,70 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use crate::models::{Item, NamespaceScope, ResourceSnapshot, SnapshotPhase, WatchMode};
+use crate::models::{
+    Item, NamespaceScope, ResourceFilter, ResourceSnapshot, SnapshotPhase, WatchMode,
+};
 
 use super::data::StoreSnapshot;
 use super::record::KubeObjectRecord;
 
 pub struct StoreView {
     scope: NamespaceScope,
+    filter: ResourceFilter,
     items: Arc<[Arc<Item>]>,
     phase: SnapshotPhase,
     mode: WatchMode,
+    last_snapshot: Option<StoreSnapshot>,
     last_revision: u64,
     last_namespace_revisions: BTreeMap<String, Option<u64>>,
     initialized: bool,
 }
 
 impl StoreView {
-    pub fn new(scope: NamespaceScope) -> Self {
+    pub fn new(scope: NamespaceScope, filter: ResourceFilter) -> Self {
         Self {
             scope,
+            filter,
             items: Arc::from(Vec::<Arc<Item>>::new()),
             phase: SnapshotPhase::Loading,
             mode: WatchMode::Watch,
+            last_snapshot: None,
             last_revision: 0,
             last_namespace_revisions: BTreeMap::new(),
             initialized: false,
         }
+    }
+
+    /// Replace the row filter without changing the watched namespace scope.
+    /// Returns the new snapshot when the filter actually changed.
+    pub fn set_filter(&mut self, filter: ResourceFilter) -> Option<Arc<ResourceSnapshot>> {
+        if self.filter == filter {
+            return None;
+        }
+        self.filter = filter;
+        let snapshot = self.last_snapshot.clone()?;
+        self.items = self.items_for(&snapshot);
+        Some(self.snapshot())
+    }
+
+    fn items_for(&self, snapshot: &StoreSnapshot) -> Arc<[Arc<Item>]> {
+        let objects = snapshot.objects();
+        let items = match &self.scope {
+            NamespaceScope::All => objects
+                .iter()
+                .map(|record| record.summary.clone())
+                .collect::<Vec<_>>(),
+            NamespaceScope::One(namespace) => namespace_objects(objects, namespace)
+                .iter()
+                .map(|record| record.summary.clone())
+                .collect(),
+            NamespaceScope::Many(namespaces) => namespaces
+                .iter()
+                .flat_map(|namespace| namespace_objects(objects, namespace))
+                .map(|record| record.summary.clone())
+                .collect(),
+        };
+        self.filter.apply(&items)
     }
 
     fn namespace_revision_changed(&self, snapshot: &StoreSnapshot, namespace: &str) -> bool {
@@ -85,24 +123,10 @@ impl StoreView {
             return None;
         }
 
-        let objects = snapshot.objects();
-        self.items = match &self.scope {
-            NamespaceScope::All => objects
-                .iter()
-                .map(|record| record.summary.clone())
-                .collect(),
-            NamespaceScope::One(namespace) => namespace_objects(objects, namespace)
-                .iter()
-                .map(|record| record.summary.clone())
-                .collect(),
-            NamespaceScope::Many(namespaces) => namespaces
-                .iter()
-                .flat_map(|namespace| namespace_objects(objects, namespace))
-                .map(|record| record.summary.clone())
-                .collect(),
-        };
+        self.items = self.items_for(snapshot);
         self.phase = snapshot.phase().clone();
         self.mode = snapshot.mode();
+        self.last_snapshot = Some(snapshot.clone());
         self.last_revision = snapshot.revision();
         self.last_namespace_revisions = self
             .scope
@@ -135,14 +159,14 @@ mod tests {
     use crate::models::{NamespaceScope, ResourceSnapshot, SnapshotPhase, WatchMode};
 
     fn view_for(scope: NamespaceScope, snapshot: &StoreSnapshot) -> StoreView {
-        let mut view = StoreView::new(scope);
+        let mut view = StoreView::new(scope, ResourceFilter::default());
         view.apply(snapshot).expect("initial apply always emits");
         view
     }
 
     #[test]
     fn starts_loading_until_a_snapshot_arrives() {
-        let view = StoreView::new(NamespaceScope::All);
+        let view = StoreView::new(NamespaceScope::All, ResourceFilter::default());
         assert!(matches!(view.phase(), SnapshotPhase::Loading));
         assert_eq!(view.len(), 0);
         assert_eq!(view.snapshot().mode(), WatchMode::Watch);
@@ -212,6 +236,42 @@ mod tests {
     }
 
     #[test]
+    fn filter_narrows_the_visible_rows() {
+        let mut data = super::super::data::StoreData::new();
+        data.upsert(test_record("api-a", "ns-1", "uid-a", "1"));
+        data.upsert(test_record("worker-b", "ns-1", "uid-b", "1"));
+        let snapshot = data.snapshot(SnapshotPhase::Ready, WatchMode::Watch);
+
+        let mut view = view_for(NamespaceScope::All, &snapshot);
+        assert_eq!(view.len(), 2);
+
+        let updated = view
+            .set_filter(ResourceFilter::new("api", false, false))
+            .expect("filter changes emit a snapshot");
+        assert_eq!(updated.items().len(), 1);
+        assert_eq!(updated.items()[0].name, "api-a");
+
+        view.set_filter(ResourceFilter::new("^worker-", false, true))
+            .expect("regex filter emits a snapshot");
+        assert_eq!(view.len(), 1);
+        assert_eq!(view.items()[0].name, "worker-b");
+    }
+
+    #[test]
+    fn unchanged_filter_does_not_emit() {
+        let mut data = super::super::data::StoreData::new();
+        data.upsert(test_record("api-a", "ns-1", "uid-a", "1"));
+        let snapshot = data.snapshot(SnapshotPhase::Ready, WatchMode::Watch);
+        let mut view = view_for(NamespaceScope::All, &snapshot);
+
+        view.set_filter(ResourceFilter::new("api", false, false));
+        assert!(
+            view.set_filter(ResourceFilter::new("api", false, false))
+                .is_none()
+        );
+    }
+
+    #[test]
     fn unchanged_global_revision_does_not_emit() {
         let mut data = super::super::data::StoreData::new();
         data.upsert(test_record("a", "ns-1", "uid-a", "1"));
@@ -244,7 +304,7 @@ mod tests {
     #[test]
     fn phase_changes_always_emit() {
         let mut data = super::super::data::StoreData::new();
-        let mut view = StoreView::new(NamespaceScope::All);
+        let mut view = StoreView::new(NamespaceScope::All, ResourceFilter::default());
         let ready = data.snapshot(SnapshotPhase::Ready, WatchMode::Watch);
         let first = view.apply(&ready).expect("initial emit");
         assert_eq!(first.mode(), WatchMode::Watch);

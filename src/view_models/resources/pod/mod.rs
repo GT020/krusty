@@ -17,12 +17,13 @@ use tokio::sync::watch;
 use crate::cluster::ClusterState;
 use crate::models::resources::pod::PodsModel;
 use crate::models::resources::pod::detail::{PodDetailState, PodDetailUpdate, UsageHistory};
-use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase, WatchMode};
+use crate::models::{Item, NamespaceScope, ResourceFilter, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository;
 
 pub struct PodsViewModel {
     active: Arc<AtomicBool>,
     scope: NamespaceScope,
+    filter: ResourceFilter,
     epoch: u64,
     model: Entity<PodsModel>,
     table: Entity<TableState<PodsViewModelTable>>,
@@ -68,6 +69,7 @@ impl PodsViewModel {
         let mut this = Self {
             active,
             scope,
+            filter: ResourceFilter::default(),
             epoch,
             model,
             table,
@@ -96,6 +98,18 @@ impl PodsViewModel {
         }
         self.scope = scope;
         self.subscribe(cx);
+        cx.notify();
+    }
+
+    /// Replace the text filter applied to this tab's rows.
+    pub fn set_filter(&mut self, filter: ResourceFilter, cx: &mut Context<Self>) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter = filter.clone();
+        if let Some(subscription) = &self.subscription {
+            subscription.set_filter(filter);
+        }
         cx.notify();
     }
 
@@ -289,7 +303,11 @@ impl PodsViewModel {
         self.cancel_pump();
         self.cancel_detail();
         self.model.update(cx, |model, _| model.close_detail());
-        let subscription = match repository::resources::pods::subscribe(cx, self.scope.clone()) {
+        let subscription = match repository::resources::pods::subscribe(
+            cx,
+            self.scope.clone(),
+            self.filter.clone(),
+        ) {
             Ok(s) => s,
             Err(error) => {
                 use crate::models::ResourceSnapshot;

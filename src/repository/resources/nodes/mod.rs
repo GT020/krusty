@@ -15,7 +15,7 @@ use crate::models::resources::node::detail::{
     NodeAddress, NodeCondition, NodeDetail, NodeDetailUpdate, NodeImage, NodeSystemInfo, NodeTaint,
     NodeUsage,
 };
-use crate::models::{NamespaceScope, ObjectKey, ResourceKind, SnapshotPhase};
+use crate::models::{NamespaceScope, ObjectKey, ResourceFilter, ResourceKind, SnapshotPhase};
 use gpui_kit::App;
 
 use crate::repository::{Subscription, subscribe_kind};
@@ -24,8 +24,8 @@ const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Subscribe to the live Nodes stream.
 /// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
-pub fn subscribe(cx: &mut App) -> Result<Subscription, String> {
-    subscribe_kind(cx, ResourceKind::Nodes, NamespaceScope::All)
+pub fn subscribe(cx: &mut App, filter: ResourceFilter) -> Result<Subscription, String> {
+    subscribe_kind(cx, ResourceKind::Nodes, NamespaceScope::All, filter)
 }
 
 /// A live detail stream for one node. Dropping it cancels the background task.

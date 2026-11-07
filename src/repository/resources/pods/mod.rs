@@ -18,7 +18,7 @@ use crate::models::resources::pod::detail::{
     PodCondition, PodContainer, PodDetail, PodDetailUpdate, PodOwner, PodToleration, PodUsage,
     PodVolume,
 };
-use crate::models::{NamespaceScope, ObjectKey, ResourceKind, SnapshotPhase};
+use crate::models::{NamespaceScope, ObjectKey, ResourceFilter, ResourceKind, SnapshotPhase};
 use gpui_kit::App;
 
 use crate::repository::retry::{Retry, RetryAction};
@@ -28,8 +28,12 @@ const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
 /// Subscribe to the live Pods stream.
 /// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
-pub fn subscribe(cx: &mut App, scope: NamespaceScope) -> Result<Subscription, String> {
-    subscribe_kind(cx, ResourceKind::Pods, scope)
+pub fn subscribe(
+    cx: &mut App,
+    scope: NamespaceScope,
+    filter: ResourceFilter,
+) -> Result<Subscription, String> {
+    subscribe_kind(cx, ResourceKind::Pods, scope, filter)
 }
 
 /// A live detail stream for one pod. Dropping it cancels the background task.

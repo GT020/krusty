@@ -3548,6 +3548,7 @@ dependencies = [
  "jiff",
  "k8s-openapi",
  "kube",
+ "regex",
  "serde",
  "serde-saphyr 2.0.0",
  "serde_json",
