@@ -13,12 +13,13 @@ use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
 use crate::models::resources::cron_jobs::CronJobsModel;
-use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase, WatchMode};
+use crate::models::{Item, NamespaceScope, ResourceFilter, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository;
 
 pub struct CronJobsViewModel {
     active: Arc<AtomicBool>,
     scope: NamespaceScope,
+    filter: ResourceFilter,
     epoch: u64,
     model: Entity<CronJobsModel>,
     table: Entity<TableState<CronJobsViewModelTable>>,
@@ -53,6 +54,7 @@ impl CronJobsViewModel {
         let mut this = Self {
             active,
             scope,
+            filter: ResourceFilter::default(),
             epoch,
             model,
             table,
@@ -79,6 +81,18 @@ impl CronJobsViewModel {
         }
         self.scope = scope;
         self.subscribe(cx);
+        cx.notify();
+    }
+
+    /// Replace the text filter applied to this tab's rows.
+    pub fn set_filter(&mut self, filter: ResourceFilter, cx: &mut Context<Self>) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter = filter.clone();
+        if let Some(subscription) = &self.subscription {
+            subscription.set_filter(filter);
+        }
         cx.notify();
     }
 
@@ -158,18 +172,22 @@ impl CronJobsViewModel {
 
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
-        let subscription =
-            match repository::subscribe(cx, ResourceKind::CronJobs, self.scope.clone()) {
-                Ok(s) => s,
-                Err(error) => {
-                    use crate::models::ResourceSnapshot;
-                    self.model.update(cx, |model, cx| {
-                        model.apply_snapshot(Arc::new(ResourceSnapshot::failed(error)));
-                        cx.notify();
-                    });
-                    return;
-                }
-            };
+        let subscription = match repository::subscribe(
+            cx,
+            ResourceKind::CronJobs,
+            self.scope.clone(),
+            self.filter.clone(),
+        ) {
+            Ok(s) => s,
+            Err(error) => {
+                use crate::models::ResourceSnapshot;
+                self.model.update(cx, |model, cx| {
+                    model.apply_snapshot(Arc::new(ResourceSnapshot::failed(error)));
+                    cx.notify();
+                });
+                return;
+            }
+        };
         subscription.set_paused(!self.is_active());
         let initial = subscription.snapshot();
         let notify_now = self.is_active();

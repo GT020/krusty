@@ -22,6 +22,7 @@ pub mod persistent_volume_claims;
 pub mod persistent_volumes;
 pub mod pod;
 pub mod replica_sets;
+pub mod search_filter;
 pub mod secrets;
 pub mod service_accounts;
 pub mod services;

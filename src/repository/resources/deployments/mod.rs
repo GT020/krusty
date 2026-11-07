@@ -5,14 +5,18 @@ use kube::Client;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use serde_json::json;
 
-use crate::models::{NamespaceScope, ResourceKind};
+use crate::models::{NamespaceScope, ResourceFilter, ResourceKind};
 use crate::repository::{Subscription, subscribe_kind};
 use gpui_kit::App;
 
 /// Subscribe to the live Deployments stream.
 /// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
-pub fn subscribe(cx: &mut App, scope: NamespaceScope) -> Result<Subscription, String> {
-    subscribe_kind(cx, ResourceKind::Deployments, scope)
+pub fn subscribe(
+    cx: &mut App,
+    scope: NamespaceScope,
+    filter: ResourceFilter,
+) -> Result<Subscription, String> {
+    subscribe_kind(cx, ResourceKind::Deployments, scope, filter)
 }
 
 fn api(client: Client, namespace: &str) -> Api<Deployment> {

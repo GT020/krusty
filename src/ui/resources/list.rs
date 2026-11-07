@@ -4,6 +4,9 @@ use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
 use crate::ui::resources::namespace_filter::{
     NamespaceFilter, NamespaceFilterEvent, render as render_namespace_filter,
 };
+use crate::ui::resources::search_filter::{
+    SearchFilter, SearchFilterEvent, render as render_search_filter,
+};
 use crate::view_models::ResourceViewModel;
 use crate::view_models::resources::deployments::DeploymentsDetailViewModel;
 use crate::view_models::resources::detail::ResourceDetailViewModel;
@@ -38,11 +41,13 @@ pub struct ResourceListView {
     title: SharedString,
     vm: ResourceViewModel,
     namespace_filter: gpui_kit::Entity<NamespaceFilter>,
+    search_filter: gpui_kit::Entity<SearchFilter>,
     detail: gpui_kit::Entity<ResourceDetailViewModel>,
     deployment_actions: gpui_kit::Entity<DeploymentsDetailViewModel>,
     width_share: f32,
     _vm_sub: Subscription,
     _namespace_sub: Subscription,
+    _search_sub: Subscription,
     _detail_sub: Subscription,
     _row_sub: Subscription,
 }
@@ -65,6 +70,12 @@ impl ResourceListView {
                 this.close_detail(cx);
             },
         );
+        let search_filter = cx.new(|cx| SearchFilter::new(window, cx));
+        let search_sub = cx.subscribe(&search_filter, |this, _, event: &SearchFilterEvent, cx| {
+            let SearchFilterEvent::Changed(filter) = event;
+            this.vm.set_filter(filter.clone(), cx);
+            this.close_detail(cx);
+        });
         let detail = cx.new(ResourceDetailViewModel::new);
         let deployment_actions = cx.new(|_| DeploymentsDetailViewModel::new(detail.downgrade()));
         let detail_sub = cx.observe(&detail, |_, _, cx| cx.notify());
@@ -82,11 +93,13 @@ impl ResourceListView {
             title: kind.label().into(),
             vm,
             namespace_filter,
+            search_filter,
             detail,
             deployment_actions,
             width_share: 1.0,
             _vm_sub: vm_sub,
             _namespace_sub: namespace_sub,
+            _search_sub: search_sub,
             _detail_sub: detail_sub,
             _row_sub: row_sub,
         }
@@ -171,6 +184,7 @@ impl ResourceListView {
             header_left = header_left.child(render_namespace_filter(&self.namespace_filter, cx));
         }
         let header_left = header_left
+            .child(render_search_filter(&self.search_filter, cx))
             .child(status)
             .child(super::watch_mode::render(mode, self.kind, cx));
 

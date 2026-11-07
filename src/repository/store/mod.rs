@@ -18,7 +18,7 @@ use gpui_kit::{App, BorrowAppContext as _};
 use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
-use crate::models::{NamespaceScope, ObjectKey, ResourceKind};
+use crate::models::{NamespaceScope, ObjectKey, ResourceFilter, ResourceKind};
 use crate::repository::{Repository, StoreEntry, Subscription};
 
 /// Subscribe a view to the shared store for `kind`.
@@ -26,6 +26,7 @@ pub(crate) fn subscribe(
     cx: &mut App,
     kind: ResourceKind,
     scope: NamespaceScope,
+    filter: ResourceFilter,
 ) -> Result<Subscription, String> {
     let (store, tokio) = ensure_store(cx, kind)?;
     let scope = if kind.is_namespaced() {
@@ -33,7 +34,7 @@ pub(crate) fn subscribe(
     } else {
         NamespaceScope::All
     };
-    Ok(store.subscribe(scope, &tokio))
+    Ok(store.subscribe(scope, filter, &tokio))
 }
 
 /// Read a cached full object without creating a store or a network request.

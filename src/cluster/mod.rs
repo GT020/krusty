@@ -10,7 +10,7 @@ use kube::api::{Api, PostParams};
 use kube::{Client, Config};
 use tokio::sync::watch;
 
-use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
+use crate::models::{NamespaceScope, ResourceFilter, ResourceKind, SnapshotPhase};
 
 /// One selectable cluster context: a kubectl context or a cluster added to krusty.
 #[derive(Clone)]
@@ -205,14 +205,18 @@ pub fn refresh_namespaces(cx: &mut App) {
         let _ = cancel.send(true);
     }
 
-    let subscription =
-        match crate::repository::subscribe(cx, ResourceKind::Namespaces, NamespaceScope::All) {
-            Ok(subscription) => subscription,
-            Err(error) => {
-                tracing::debug!(%error, "cluster: namespace subscription unavailable");
-                return;
-            }
-        };
+    let subscription = match crate::repository::subscribe(
+        cx,
+        ResourceKind::Namespaces,
+        NamespaceScope::All,
+        ResourceFilter::default(),
+    ) {
+        Ok(subscription) => subscription,
+        Err(error) => {
+            tracing::debug!(%error, "cluster: namespace subscription unavailable");
+            return;
+        }
+    };
 
     let (cancel_tx, mut cancel_rx) = watch::channel(false);
     cx.update_global::<ClusterState, _>(|state, _| {

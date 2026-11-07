@@ -28,6 +28,9 @@ use crate::ui::resources::namespace_filter::{
 use crate::ui::resources::pod::exec::PodExecView;
 use crate::ui::resources::pod::logs::PodLogsView;
 use crate::ui::resources::pod::sessions::{PodSession, PodSessions, SessionKey};
+use crate::ui::resources::search_filter::{
+    SearchFilter, SearchFilterEvent, render as render_search_filter,
+};
 use crate::view_models::resources::pod::PodsViewModel;
 use crate::view_models::resources::pod::exec::PodExecViewModel;
 use crate::view_models::resources::pod::logs::PodLogsViewModel;
@@ -54,10 +57,12 @@ fn list_default_width(viewport_width: f32) -> Pixels {
 pub struct PodsView {
     vm: gpui_kit::Entity<PodsViewModel>,
     namespace_filter: gpui_kit::Entity<NamespaceFilter>,
+    search_filter: gpui_kit::Entity<SearchFilter>,
     sessions: PodSessions,
     width_share: f32,
     _vm_sub: Subscription,
     _namespace_sub: Subscription,
+    _search_sub: Subscription,
 }
 
 impl PodsView {
@@ -75,13 +80,23 @@ impl PodsView {
                 });
             },
         );
+        let search_filter = cx.new(|cx| SearchFilter::new(window, cx));
+        let search_sub = cx.subscribe(&search_filter, |this, _, event: &SearchFilterEvent, cx| {
+            let SearchFilterEvent::Changed(filter) = event;
+            this.vm.update(cx, |vm, cx| {
+                vm.set_filter(filter.clone(), cx);
+                vm.close_detail(cx);
+            });
+        });
         Self {
             vm,
             namespace_filter,
+            search_filter,
             sessions: PodSessions::default(),
             width_share: 1.0,
             _vm_sub: vm_sub,
             _namespace_sub: namespace_sub,
+            _search_sub: search_sub,
         }
     }
     pub fn scope_label(&self, cx: &App) -> String {
@@ -319,6 +334,7 @@ impl PodsView {
                             .child(SharedString::from("Pods")),
                     )
                     .child(render_namespace_filter(&self.namespace_filter, cx))
+                    .child(render_search_filter(&self.search_filter, cx))
                     .child(status)
                     .child(super::watch_mode::render(mode, ResourceKind::Pods, cx)),
             )

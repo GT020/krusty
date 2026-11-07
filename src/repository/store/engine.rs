@@ -25,7 +25,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::{mpsc, watch};
 
-use crate::models::{Item, NamespaceScope, ObjectKey, ResourceKind, SnapshotPhase, WatchMode};
+use crate::models::{
+    Item, NamespaceScope, ObjectKey, ResourceFilter, ResourceKind, SnapshotPhase, WatchMode,
+};
 use crate::repository::Subscription;
 use crate::repository::store::mapping::{
     cluster_role_item, config_map_item, cron_job_item, custom_item, daemon_set_item,
@@ -68,11 +70,12 @@ impl KubeObjectStoreHandle {
     pub(crate) fn subscribe(
         &self,
         scope: NamespaceScope,
+        filter: ResourceFilter,
         tokio: &tokio::runtime::Handle,
     ) -> Subscription {
         let _ = self.commands.send(Command::Subscribe(scope.clone()));
 
-        let mut view = StoreView::new(scope.clone());
+        let mut view = StoreView::new(scope.clone(), filter.clone());
         let current = self.snapshots.borrow().clone();
         let initial = match view.apply(&current) {
             Some(snapshot) => snapshot,
@@ -80,6 +83,7 @@ impl KubeObjectStoreHandle {
         };
         let (view_tx, view_rx) = watch::channel(initial);
         let mut store_rx = self.snapshots.subscribe();
+        let (filter_tx, mut filter_rx) = watch::channel(filter);
         let (cancel, mut cancel_rx) = watch::channel(false);
 
         let lease = Arc::new(StoreLease {
@@ -97,6 +101,15 @@ impl KubeObjectStoreHandle {
             loop {
                 tokio::select! {
                     _ = cancel_rx.changed() => break,
+                    result = filter_rx.changed() => {
+                        if result.is_err() {
+                            break;
+                        }
+                        let filter = filter_rx.borrow_and_update().clone();
+                        if let Some(next) = view.set_filter(filter) {
+                            view_tx.send_replace(next);
+                        }
+                    }
                     result = store_rx.changed() => {
                         if result.is_err() {
                             break;
@@ -110,7 +123,7 @@ impl KubeObjectStoreHandle {
             }
         });
 
-        Subscription::new(view_rx, paused, paused_rx, refresh, lease)
+        Subscription::new(view_rx, paused, paused_rx, filter_tx, refresh, lease)
     }
 }
 

@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use crate::cluster::ClusterState;
 use crate::models::resources::node::detail::NodeUsage;
 use crate::models::resources::overview::{ClusterOverviewStats, is_unhealthy_pod};
-use crate::models::{Item, NamespaceScope, ResourceKind, ResourceSnapshot};
+use crate::models::{Item, NamespaceScope, ResourceFilter, ResourceKind, ResourceSnapshot};
 use crate::repository;
 
 /// Pods change constantly on a busy cluster. The overview only shows
@@ -160,14 +160,24 @@ impl ClusterOverviewViewModel {
     /// Subscribe to the Nodes and Pods streams and pump both into one summary.
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
-        self.nodes = match repository::subscribe(cx, ResourceKind::Nodes, NamespaceScope::All) {
+        self.nodes = match repository::subscribe(
+            cx,
+            ResourceKind::Nodes,
+            NamespaceScope::All,
+            ResourceFilter::default(),
+        ) {
             Ok(subscription) => Some(subscription),
             Err(error) => {
                 self.node_snapshot = Arc::new(ResourceSnapshot::failed(error));
                 None
             }
         };
-        self.pods = match repository::subscribe(cx, ResourceKind::Pods, NamespaceScope::All) {
+        self.pods = match repository::subscribe(
+            cx,
+            ResourceKind::Pods,
+            NamespaceScope::All,
+            ResourceFilter::default(),
+        ) {
             Ok(subscription) => Some(subscription),
             Err(error) => {
                 self.pod_snapshot = Arc::new(ResourceSnapshot::failed(error));

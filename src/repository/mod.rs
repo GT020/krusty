@@ -14,7 +14,7 @@ use std::sync::Arc;
 use gpui_kit::{App, Global};
 use tokio::sync::watch;
 
-use crate::models::{NamespaceScope, ResourceKind, ResourceSnapshot};
+use crate::models::{NamespaceScope, ResourceFilter, ResourceKind, ResourceSnapshot};
 
 pub(crate) struct StoreEntry {
     pub epoch: u64,
@@ -47,6 +47,7 @@ pub struct Subscription {
     rx: watch::Receiver<Arc<ResourceSnapshot>>,
     paused: watch::Sender<bool>,
     paused_rx: watch::Receiver<bool>,
+    filter: watch::Sender<ResourceFilter>,
     refresh: Arc<dyn Fn() + Send + Sync>,
     _keep_alive: Arc<dyn Any + Send + Sync>,
 }
@@ -56,6 +57,7 @@ impl Subscription {
         rx: watch::Receiver<Arc<ResourceSnapshot>>,
         paused: watch::Sender<bool>,
         paused_rx: watch::Receiver<bool>,
+        filter: watch::Sender<ResourceFilter>,
         refresh: Arc<dyn Fn() + Send + Sync>,
         keep_alive: Arc<dyn Any + Send + Sync>,
     ) -> Self {
@@ -63,6 +65,7 @@ impl Subscription {
             rx,
             paused,
             paused_rx,
+            filter,
             refresh,
             _keep_alive: keep_alive,
         }
@@ -77,6 +80,11 @@ impl Subscription {
     /// as the subscription is resumed.
     pub fn set_paused(&self, paused: bool) {
         self.paused.send_replace(paused);
+    }
+
+    /// Replace the row filter applied to this subscription's snapshots.
+    pub fn set_filter(&self, filter: ResourceFilter) {
+        self.filter.send_replace(filter);
     }
 
     /// Wait for the next snapshot relevant to this subscriber. `None` means the
@@ -130,16 +138,18 @@ pub fn subscribe(
     cx: &mut App,
     kind: ResourceKind,
     scope: NamespaceScope,
+    filter: ResourceFilter,
 ) -> Result<Subscription, String> {
-    subscribe_kind(cx, kind, scope)
+    subscribe_kind(cx, kind, scope, filter)
 }
 
 pub(crate) fn subscribe_kind(
     cx: &mut App,
     kind: ResourceKind,
     scope: NamespaceScope,
+    filter: ResourceFilter,
 ) -> Result<Subscription, String> {
-    store::subscribe(cx, kind, scope)
+    store::subscribe(cx, kind, scope, filter)
 }
 
 #[cfg(test)]
@@ -153,8 +163,10 @@ mod tests {
     async fn a_paused_subscription_coalesces_until_resumed() {
         let (snapshots, rx) = watch::channel(Arc::new(ResourceSnapshot::loading()));
         let (paused, paused_rx) = watch::channel(false);
+        let (filter, _) = watch::channel(ResourceFilter::default());
         let refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(|| {});
-        let mut subscription = Subscription::new(rx, paused, paused_rx, refresh, Arc::new(()));
+        let mut subscription =
+            Subscription::new(rx, paused, paused_rx, filter, refresh, Arc::new(()));
 
         subscription.set_paused(true);
         snapshots.send_replace(Arc::new(ResourceSnapshot::failed("offline")));

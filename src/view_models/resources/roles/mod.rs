@@ -13,12 +13,13 @@ use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
 use crate::models::resources::roles::RolesModel;
-use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase, WatchMode};
+use crate::models::{Item, NamespaceScope, ResourceFilter, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository;
 
 pub struct RolesViewModel {
     active: Arc<AtomicBool>,
     scope: NamespaceScope,
+    filter: ResourceFilter,
     epoch: u64,
     model: Entity<RolesModel>,
     table: Entity<TableState<RolesViewModelTable>>,
@@ -53,6 +54,7 @@ impl RolesViewModel {
         let mut this = Self {
             active,
             scope,
+            filter: ResourceFilter::default(),
             epoch,
             model,
             table,
@@ -79,6 +81,18 @@ impl RolesViewModel {
         }
         self.scope = scope;
         self.subscribe(cx);
+        cx.notify();
+    }
+
+    /// Replace the text filter applied to this tab's rows.
+    pub fn set_filter(&mut self, filter: ResourceFilter, cx: &mut Context<Self>) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter = filter.clone();
+        if let Some(subscription) = &self.subscription {
+            subscription.set_filter(filter);
+        }
         cx.notify();
     }
 
@@ -158,8 +172,12 @@ impl RolesViewModel {
 
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
-        let subscription = match repository::subscribe(cx, ResourceKind::Roles, self.scope.clone())
-        {
+        let subscription = match repository::subscribe(
+            cx,
+            ResourceKind::Roles,
+            self.scope.clone(),
+            self.filter.clone(),
+        ) {
             Ok(s) => s,
             Err(error) => {
                 use crate::models::ResourceSnapshot;

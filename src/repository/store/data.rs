@@ -278,7 +278,7 @@ mod tests {
 
     use super::*;
     use crate::models::Item;
-    use crate::models::{NamespaceScope, WatchMode};
+    use crate::models::{NamespaceScope, ResourceFilter, WatchMode};
     use crate::repository::store::StoreView;
 
     fn record(name: &str, namespace: &str, uid: &str, version: &str) -> KubeObjectRecord {
@@ -402,7 +402,10 @@ mod tests {
         assert_eq!(snapshot.namespace_revision("ns-a"), Some(1));
         assert_eq!(snapshot.namespace_revision("ns-b"), Some(1));
 
-        let mut ns_a = crate::repository::store::StoreView::new(NamespaceScope::One("ns-a".into()));
+        let mut ns_a = crate::repository::store::StoreView::new(
+            NamespaceScope::One("ns-a".into()),
+            ResourceFilter::default(),
+        );
         assert!(ns_a.apply(&snapshot).is_some());
         assert_eq!(ns_a.len(), 1);
     }
@@ -521,8 +524,11 @@ mod tests {
         data.upsert(record("b", "ns-2", "uid-2", "1"));
         let snapshot = data.snapshot(SnapshotPhase::Ready, WatchMode::Watch);
 
-        let mut all = StoreView::new(NamespaceScope::All);
-        let mut one = StoreView::new(NamespaceScope::One("ns-2".into()));
+        let mut all = StoreView::new(NamespaceScope::All, ResourceFilter::default());
+        let mut one = StoreView::new(
+            NamespaceScope::One("ns-2".into()),
+            ResourceFilter::default(),
+        );
         let all = all.apply(&snapshot).unwrap();
         let one = one.apply(&snapshot).unwrap();
         assert_eq!(all.items().len(), 2);

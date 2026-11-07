@@ -15,7 +15,7 @@ use tokio::sync::watch;
 use crate::cluster::ClusterState;
 use crate::models::resources::node::NodesModel;
 use crate::models::resources::node::detail::{NodeDetailState, UsageHistory};
-use crate::models::{Item, NamespaceScope, ResourceKind, SnapshotPhase, WatchMode};
+use crate::models::{Item, NamespaceScope, ResourceFilter, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository;
 
 /// Large clusters emit node updates continuously. Repainting the table for
@@ -25,6 +25,7 @@ const NODES_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 pub struct NodesViewModel {
     active: Arc<AtomicBool>,
     scope: NamespaceScope,
+    filter: ResourceFilter,
     epoch: u64,
     model: Entity<NodesModel>,
     table: Entity<TableState<NodesViewModelTable>>,
@@ -70,6 +71,7 @@ impl NodesViewModel {
         let mut this = Self {
             active,
             scope,
+            filter: ResourceFilter::default(),
             epoch,
             model,
             table,
@@ -98,6 +100,18 @@ impl NodesViewModel {
         }
         self.scope = scope;
         self.subscribe(cx);
+        cx.notify();
+    }
+
+    /// Replace the text filter applied to this tab's rows.
+    pub fn set_filter(&mut self, filter: ResourceFilter, cx: &mut Context<Self>) {
+        if self.filter == filter {
+            return;
+        }
+        self.filter = filter.clone();
+        if let Some(subscription) = &self.subscription {
+            subscription.set_filter(filter);
+        }
         cx.notify();
     }
 
@@ -285,7 +299,7 @@ impl NodesViewModel {
         self.cancel_pump();
         self.cancel_detail();
         self.model.update(cx, |model, _| model.close_detail());
-        let subscription = match repository::resources::nodes::subscribe(cx) {
+        let subscription = match repository::resources::nodes::subscribe(cx, self.filter.clone()) {
             Ok(s) => s,
             Err(error) => {
                 use crate::models::ResourceSnapshot;
