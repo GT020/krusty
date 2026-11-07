@@ -17,8 +17,8 @@ use gpui_kit::component::{
     h_resizable, resizable_panel,
 };
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, FontWeight, IntoElement, ParentElement as _, Pixels,
-    Render, SharedString, Styled as _, Subscription, Window, div, px,
+    AnyElement, App, AppContext as _, Context, IntoElement, ParentElement as _, Pixels, Render,
+    Styled as _, Subscription, Window, div, px,
 };
 
 const LIST_MIN_WIDTH: Pixels = px(340.);
@@ -38,7 +38,6 @@ fn list_default_width(viewport_width: f32) -> Pixels {
 
 pub struct ResourceListView {
     kind: ResourceKind,
-    title: SharedString,
     vm: ResourceViewModel,
     namespace_filter: gpui_kit::Entity<NamespaceFilter>,
     search_filter: gpui_kit::Entity<SearchFilter>,
@@ -90,7 +89,6 @@ impl ResourceListView {
         });
         Self {
             kind,
-            title: kind.label().into(),
             vm,
             namespace_filter,
             search_filter,
@@ -174,12 +172,7 @@ impl ResourceListView {
                 .into_any_element(),
         };
 
-        let mut header_left = h_flex().gap_3().items_center().child(
-            div()
-                .text_size(px(15.))
-                .font_weight(FontWeight::MEDIUM)
-                .child(self.title.clone()),
-        );
+        let mut header_left = h_flex().gap_3().items_center();
         if self.kind.is_namespaced() {
             header_left = header_left.child(render_namespace_filter(&self.namespace_filter, cx));
         }

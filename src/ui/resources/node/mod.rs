@@ -10,8 +10,8 @@ use gpui_kit::component::{
     table::DataTable,
 };
 use gpui_kit::{
-    AppContext as _, Context, FontWeight, IntoElement, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, Subscription, Window, div, px,
+    AppContext as _, Context, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
+    Subscription, Window, div, px,
 };
 
 use crate::models::{NamespaceScope, SnapshotPhase};
@@ -121,12 +121,6 @@ impl NodesView {
                 h_flex()
                     .gap_3()
                     .items_center()
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(SharedString::from("Nodes")),
-                    )
                     .child(render_search_filter(&self.search_filter, cx))
                     .child(status)
                     .child(super::watch_mode::render(

@@ -14,9 +14,10 @@ use gpui_kit::component::{
     table::DataTable,
     v_resizable,
 };
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, FontWeight, IntoElement, ParentElement as _, Pixels,
-    Render, SharedString, Styled as _, Subscription, Window, div, px,
+    AnyElement, App, AppContext as _, Context, IntoElement, ParentElement as _, Pixels, Render,
+    SharedString, Styled as _, Subscription, Window, div, px,
 };
 
 use crate::models::resources::pod::detail::PodDetailUpdate;
@@ -327,12 +328,6 @@ impl PodsView {
                 h_flex()
                     .gap_3()
                     .items_center()
-                    .child(
-                        div()
-                            .text_size(px(15.))
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(SharedString::from("Pods")),
-                    )
                     .child(render_namespace_filter(&self.namespace_filter, cx))
                     .child(render_search_filter(&self.search_filter, cx))
                     .child(status)
@@ -426,6 +421,7 @@ impl PodsView {
         let view = cx.entity();
         let mut bar = TabBar::new(("pod-sessions", view.entity_id()))
             .small()
+            .bg(cx.theme().tokens.tab_bar)
             .menu(true)
             .max_width(px(300.))
             .selected_index(active)
@@ -434,21 +430,27 @@ impl PodsView {
                 cx.notify();
             }));
 
-        for session in self.sessions.iter() {
+        for (index, session) in self.sessions.iter().enumerate() {
             let key = session.key().clone();
             let close_view = view.clone();
             bar = bar.child(
-                Tab::new().label(session.title()).suffix(
-                    Button::new(SharedString::from(format!("close-session-{}", key.id())))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Close)
-                        .tooltip("Close session")
-                        .on_click(move |_, _, cx| {
-                            cx.stop_propagation();
-                            close_view.update(cx, |this, cx| this.close_session(&key, cx));
-                        }),
-                ),
+                Tab::new()
+                    .label(session.title())
+                    .when(index != active, |tab| tab.bg(cx.theme().secondary))
+                    .when(index > 0, |tab| {
+                        tab.prefix(div().w(px(1.)).h(px(16.)).bg(cx.theme().border))
+                    })
+                    .suffix(
+                        Button::new(SharedString::from(format!("close-session-{}", key.id())))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Close)
+                            .tooltip("Close session")
+                            .on_click(move |_, _, cx| {
+                                cx.stop_propagation();
+                                close_view.update(cx, |this, cx| this.close_session(&key, cx));
+                            }),
+                    ),
             );
         }
 
