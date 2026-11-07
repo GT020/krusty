@@ -26,13 +26,13 @@ use crate::view_models::shell::{
     CloseOutcome, PaneId, PaneInfo, ShellViewModel, TabColor, TabId, TabInfo,
 };
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{h_flex, v_flex};
+use gpui_kit::base::{InteractiveElementExt as _, h_flex, v_flex};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::menu::{DropdownMenu as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::resizable::{
     ResizablePanelEvent, ResizableState, h_resizable, resizable_panel,
 };
-use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::component::scroll::ScrollableMask;
 use gpui_kit::component::{
     ActiveTheme, Disableable as _, Icon, Sizable as _, TitleBar,
     button::{Button, ButtonVariants as _},
@@ -41,9 +41,13 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
     AnyElement, AnyWindowHandle, App, AppContext as _, Context, Entity, FontWeight,
     InteractiveElement as _, IntoElement, MouseButton, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, Subscription, Window, div, px,
+    ScrollHandle, SharedString, StatefulInteractiveElement as _, Styled as _, Subscription, Window,
+    div, px,
 };
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+
+use crate::ui::components::tabs;
 
 const MIN_SPLIT_VIEWPORT_WIDTH: f32 = 1080.;
 const PANE_MIN_WIDTH: Pixels = px(360.);
@@ -154,6 +158,7 @@ pub struct Workspace {
     panes: BTreeMap<TabId, WorkspacePane>,
     pane_subs: BTreeMap<TabId, Subscription>,
     tab_scopes: BTreeMap<TabId, NamespaceScope>,
+    tab_scrolls: RefCell<BTreeMap<PaneId, ScrollHandle>>,
     split_state: Entity<ResizableState>,
     split_fraction: f32,
     pending_split_restore: bool,
@@ -292,6 +297,7 @@ impl Workspace {
             panes: BTreeMap::new(),
             pane_subs: BTreeMap::new(),
             tab_scopes,
+            tab_scrolls: RefCell::new(BTreeMap::new()),
             split_state,
             split_fraction,
             pending_split_restore,
@@ -731,27 +737,23 @@ impl Workspace {
         let tabs = pane.tabs().to_vec();
         let active = pane.active();
         let focused_pane = self.shell.read(cx).focused_pane() == Some(pane_id);
-        let selected_index = active
-            .and_then(|id| tabs.iter().position(|tab| tab.id() == id))
-            .unwrap_or(0);
         let workspace = cx.entity();
         let is_split = self.shell.read(cx).is_split();
+        let scroll_handle = self
+            .tab_scrolls
+            .borrow_mut()
+            .entry(pane_id)
+            .or_default()
+            .clone();
+        let mut strip = h_flex()
+            .id(("workspace-tab-strip", pane_id.get()))
+            .w_full()
+            .items_center()
+            .overflow_x_scroll()
+            .lock_scroll_axis()
+            .track_scroll(&scroll_handle);
 
-        let mut bar = TabBar::new(("workspace-tabs", pane_id.get()))
-            .small()
-            .menu(true)
-            .max_width(px(240.))
-            .selected_index(selected_index)
-            .on_click(cx.listener(move |this, index, window, cx| {
-                let pane = this.shell.read(cx).pane(pane_id);
-                let id =
-                    pane.and_then(|pane| pane.tabs().get(*index).map(|tab: &TabInfo| tab.id()));
-                if let Some(id) = id {
-                    this.focus_tab(id, window, cx);
-                }
-            }));
-
-        for tab in &tabs {
+        for (index, tab) in tabs.iter().enumerate() {
             let id = tab.id();
             let target = tab.target();
             let color = tab.color();
@@ -800,24 +802,36 @@ impl Workspace {
                         close_workspace.update(cx, |this, cx| this.close_tab(id, window, cx));
                     })
             });
-            bar = bar.child(
-                Tab::new()
-                    .label(tab_label)
-                    .prefix(
-                        div().pl(px(6.)).child(
-                            Icon::new(target.icon())
-                                .when_some(color.map(|color| color.color(cx)), |this, color| {
-                                    this.text_color(color)
-                                }),
-                        ),
-                    )
-                    .suffix(
-                        h_flex()
-                            .items_center()
-                            .gap_0p5()
-                            .child(lock_button)
-                            .when_some(close_button, |this, close| this.child(close)),
-                    ),
+            let tab_scroll = scroll_handle.clone();
+            strip = strip.child(
+                tabs::tab(
+                    SharedString::from(format!("workspace-tab-{}", id.get())),
+                    tab_label,
+                    Some(id) == active,
+                    cx,
+                )
+                .icon(
+                    Icon::new(target.icon())
+                        .when_some(color.map(|color| color.color(cx)), |this, color| {
+                            this.text_color(color)
+                        }),
+                )
+                .max_w(px(240.))
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_0p5()
+                        .child(lock_button)
+                        .when_some(close_button, |this, close| this.child(close)),
+                )
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    let pane = this.shell.read(cx).pane(pane_id);
+                    let id = pane.and_then(|pane| pane.tabs().get(index).map(|tab| tab.id()));
+                    if let Some(id) = id {
+                        this.focus_tab(id, window, cx);
+                        tab_scroll.scroll_to_item(index);
+                    }
+                })),
             );
         }
 
@@ -921,8 +935,21 @@ impl Workspace {
                 .child(split_button)
         });
 
-        bar.when_some(tab_actions, |bar, actions| bar.suffix(actions))
-            .when(!focused_pane, |bar| bar.bg(cx.theme().muted))
+        h_flex()
+            .h(px(24.))
+            .items_center()
+            .gap_2()
+            .bg(cx.theme().tokens.tab_bar)
+            .when(!focused_pane, |this| this.bg(cx.theme().muted))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .child(strip)
+                    .child(ScrollableMask::vertical_wheel(&scroll_handle)),
+            )
+            .when_some(tab_actions, |this, actions| this.child(actions))
             .into_any_element()
     }
 

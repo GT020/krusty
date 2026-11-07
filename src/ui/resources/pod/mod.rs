@@ -5,8 +5,8 @@ mod exec;
 mod logs;
 mod sessions;
 
-use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::tab::{Tab, TabBar};
+use gpui_kit::base::{InteractiveElementExt as _, h_flex, v_flex};
+use gpui_kit::component::scroll::ScrollableMask;
 use gpui_kit::component::{
     ActiveTheme as _, IconName, Sizable as _,
     button::{Button, ButtonVariants as _},
@@ -14,11 +14,13 @@ use gpui_kit::component::{
     table::DataTable,
     v_resizable,
 };
-use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::{
-    AnyElement, App, AppContext as _, Context, IntoElement, ParentElement as _, Pixels, Render,
-    SharedString, Styled as _, Subscription, Window, div, px,
+    AnyElement, App, AppContext as _, Context, InteractiveElement as _, IntoElement,
+    ParentElement as _, Pixels, Render, ScrollHandle, SharedString,
+    StatefulInteractiveElement as _, Styled as _, Subscription, Window, div, px,
 };
+
+use crate::ui::components::tabs;
 
 use crate::models::resources::pod::detail::PodDetailUpdate;
 use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
@@ -60,6 +62,7 @@ pub struct PodsView {
     namespace_filter: gpui_kit::Entity<NamespaceFilter>,
     search_filter: gpui_kit::Entity<SearchFilter>,
     sessions: PodSessions,
+    sessions_scroll: ScrollHandle,
     width_share: f32,
     _vm_sub: Subscription,
     _namespace_sub: Subscription,
@@ -94,6 +97,7 @@ impl PodsView {
             namespace_filter,
             search_filter,
             sessions: PodSessions::default(),
+            sessions_scroll: ScrollHandle::new(),
             width_share: 1.0,
             _vm_sub: vm_sub,
             _namespace_sub: namespace_sub,
@@ -419,40 +423,54 @@ impl PodsView {
     fn sessions_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let active = self.sessions.active_index().unwrap_or(0);
         let view = cx.entity();
-        let mut bar = TabBar::new(("pod-sessions", view.entity_id()))
-            .small()
-            .bg(cx.theme().tokens.tab_bar)
-            .menu(true)
-            .max_width(px(300.))
-            .selected_index(active)
-            .on_click(cx.listener(|this, index, _, cx| {
-                this.sessions.set_active(*index);
-                cx.notify();
-            }));
+        let mut strip = h_flex()
+            .id(("pod-session-tabs", view.entity_id()))
+            .w_full()
+            .items_center()
+            .overflow_x_scroll()
+            .lock_scroll_axis()
+            .track_scroll(&self.sessions_scroll);
 
         for (index, session) in self.sessions.iter().enumerate() {
             let key = session.key().clone();
             let close_view = view.clone();
-            bar = bar.child(
-                Tab::new()
-                    .label(session.title())
-                    .when(index != active, |tab| tab.bg(cx.theme().secondary))
-                    .when(index > 0, |tab| {
-                        tab.prefix(div().w(px(1.)).h(px(16.)).bg(cx.theme().border))
-                    })
-                    .suffix(
-                        Button::new(SharedString::from(format!("close-session-{}", key.id())))
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::Close)
-                            .tooltip("Close session")
-                            .on_click(move |_, _, cx| {
-                                cx.stop_propagation();
-                                close_view.update(cx, |this, cx| this.close_session(&key, cx));
-                            }),
-                    ),
+            strip = strip.child(
+                tabs::tab(
+                    SharedString::from(format!("session-tab-{}", key.id())),
+                    session.title(),
+                    index == active,
+                    cx,
+                )
+                .child(
+                    Button::new(SharedString::from(format!("close-session-{}", key.id())))
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Close)
+                        .tooltip("Close session")
+                        .on_click(move |_, _, cx| {
+                            cx.stop_propagation();
+                            close_view.update(cx, |this, cx| this.close_session(&key, cx));
+                        }),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sessions.set_active(index);
+                    cx.notify();
+                })),
             );
         }
+
+        let bar = h_flex()
+            .h(px(24.))
+            .items_center()
+            .bg(cx.theme().tokens.tab_bar)
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .child(strip)
+                    .child(ScrollableMask::vertical_wheel(&self.sessions_scroll)),
+            );
 
         v_flex()
             .size_full()
