@@ -3,8 +3,10 @@
 pub mod exec;
 pub mod logs;
 
+use gpui_kit::component::WindowExt as _;
+use gpui_kit::component::button::ButtonVariant;
 use gpui_kit::component::table::{TableEvent, TableState};
-use gpui_kit::{App, AppContext as _, Context, Entity, Window};
+use gpui_kit::{App, AppContext as _, ClickEvent, Context, Entity, Window};
 use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
@@ -20,6 +22,7 @@ pub struct PodsViewModel {
     table: Entity<TableState<ResourceTable>>,
     detail_model: Entity<PodsModel>,
     detail_cancel: Option<watch::Sender<bool>>,
+    delete_error: Option<String>,
     epoch: u64,
     #[allow(dead_code)] // held for its Drop side-effect: unsubscribes the table events
     table_sub: gpui_kit::Subscription,
@@ -55,6 +58,7 @@ impl PodsViewModel {
             table,
             detail_model,
             detail_cancel: None,
+            delete_error: None,
             epoch,
             table_sub,
             cluster_sub,
@@ -103,6 +107,71 @@ impl PodsViewModel {
         self.detail_model.read(cx).usage_error().map(str::to_string)
     }
 
+    pub fn delete_error(&self) -> Option<&str> {
+        self.delete_error.as_deref()
+    }
+
+    /// Confirm and delete the pod. The detail pane closes on success and keeps
+    /// the error visible on failure.
+    pub fn delete_pod(
+        &mut self,
+        namespace: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |alert, _, _| {
+            let this = this.clone();
+            let namespace = namespace.clone();
+            let name = name.clone();
+            alert
+                .title(format!("Delete “{name}”?"))
+                .description("The pod will be deleted. This cannot be undone.")
+                .ok_text("Delete")
+                .ok_variant(ButtonVariant::Danger)
+                .show_cancel(true)
+                .on_ok(move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    if let Some(this) = this.upgrade() {
+                        this.update(cx, |this, cx| {
+                            this.perform_delete(namespace.clone(), name.clone(), cx)
+                        });
+                    }
+                    true
+                })
+        });
+    }
+
+    fn perform_delete(&mut self, namespace: String, name: String, cx: &mut Context<Self>) {
+        let Some(client) = cx.global::<ClusterState>().client() else {
+            self.delete_error = Some("Not connected to a cluster.".to_string());
+            cx.notify();
+            return;
+        };
+        let tokio = cx.global::<ClusterState>().tokio();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio.spawn(async move {
+            let _ = sender.send(repository::resources::pods::delete(client, namespace, name).await);
+        });
+        self.delete_error = None;
+        cx.notify();
+        let this = cx.entity().downgrade();
+        cx.spawn(async move |_, cx: &mut gpui_kit::AsyncApp| {
+            let result = match receiver.await {
+                Ok(result) => result,
+                Err(_) => Err("The cluster operation was cancelled.".to_string()),
+            };
+            let _ = this.update(cx, |this, cx| match result {
+                Ok(()) => this.close_detail(cx),
+                Err(message) => {
+                    this.delete_error = Some(message);
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
     pub fn item_at(&self, row: usize, cx: &App) -> Option<Item> {
         self.list.read(cx).item_at(row, cx)
     }
@@ -127,6 +196,7 @@ impl PodsViewModel {
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.cancel_detail();
+        self.delete_error = None;
         self.detail_model.update(cx, |model, cx| {
             model.close_detail();
             cx.notify();
@@ -167,6 +237,7 @@ impl PodsViewModel {
 
     fn start_detail(&mut self, namespace: String, name: String, cx: &mut Context<Self>) {
         self.cancel_detail();
+        self.delete_error = None;
         self.detail_model.update(cx, |model, cx| {
             model.begin_detail(namespace.clone(), name.clone());
             cx.notify();

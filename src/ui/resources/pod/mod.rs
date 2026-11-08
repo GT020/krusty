@@ -145,6 +145,17 @@ impl PodsView {
             .update(cx, |vm, cx| vm.open_detail(namespace, name, cx));
     }
 
+    pub fn delete_pod(
+        &mut self,
+        namespace: String,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.vm
+            .update(cx, |vm, cx| vm.delete_pod(namespace, name, window, cx));
+    }
+
     /// Resolve a pod's containers and then open its log panel.
     pub fn open_logs_for_pod(
         &mut self,
@@ -348,10 +359,12 @@ impl PodsView {
         let split = viewport_width >= SPLIT_MIN_VIEWPORT_WIDTH;
         let usage = self.vm.read(cx).usage(cx);
         let usage_error = self.vm.read(cx).usage_error(cx);
+        let delete_error = self.vm.read(cx).delete_error().map(str::to_string);
         let detail = detail::render_detail(
             detail_state,
             usage,
             usage_error,
+            delete_error,
             cx.entity().clone(),
             !split,
             cx,

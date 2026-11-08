@@ -8,7 +8,7 @@ use futures::{AsyncBufReadExt, TryStreamExt};
 use k8s_openapi::api::core::v1::{
     Container, ContainerState, ContainerStatus, EnvVar, Pod, PodStatus, Toleration, Volume,
 };
-use kube::api::{Api, DynamicObject, LogParams};
+use kube::api::{Api, DeleteParams, DynamicObject, LogParams};
 use kube::core::{ApiResource, GroupVersionKind};
 use kube::{Client, ResourceExt};
 use tokio::sync::{mpsc, watch};
@@ -189,6 +189,15 @@ pub fn cached_containers(cx: &App, namespace: &str, name: &str) -> Option<Vec<St
             .map(|container| container.name.clone())
             .collect(),
     )
+}
+
+/// Delete a pod.
+pub async fn delete(client: Client, namespace: String, name: String) -> Result<(), String> {
+    let api: Api<Pod> = Api::namespaced(client, &namespace);
+    api.delete(&name, &DeleteParams::default())
+        .await
+        .map(|_| ())
+        .map_err(|error| format!("Could not delete pod “{name}”: {error}"))
 }
 
 /// Start loading a pod's full description from the shared store, with one

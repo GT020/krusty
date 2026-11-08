@@ -4,7 +4,10 @@ use std::collections::BTreeMap;
 
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::{ActiveTheme as _, Sizable as _, button::Button};
+use gpui_kit::component::{
+    ActiveTheme as _, Sizable as _,
+    button::{Button, ButtonVariants as _},
+};
 use gpui_kit::{
     AnyElement, Context, Entity, FontWeight, IntoElement, ParentElement as _, Styled as _, div,
 };
@@ -22,6 +25,7 @@ pub fn render_detail(
     state: PodDetailState,
     usage: UsageHistory,
     usage_error: Option<String>,
+    delete_error: Option<String>,
     view: Entity<PodsView>,
     compact: bool,
     cx: &mut Context<PodsView>,
@@ -64,10 +68,12 @@ pub fn render_detail(
             error_body("Could not load this pod", &message, cx)
         }
         PodDetailState::Ready(detail) => {
-            let mut body = v_flex()
-                .gap_6()
-                .p_4()
-                .child(actions(&detail, actions_view))
+            let mut body = v_flex().gap_6().p_4();
+            if let Some(error) = &delete_error {
+                body = body.child(delete_banner(error, cx));
+            }
+            body = body
+                .child(actions(&detail, actions_view, cx))
                 .child(overview(&detail, cx))
                 .child(usage_section(&usage, usage_error.as_deref(), "", cx))
                 .child(containers("Containers", &detail.containers, cx))
@@ -89,7 +95,7 @@ pub fn render_detail(
     detail_shell(header, body, compact, cx)
 }
 
-fn actions(detail: &PodDetail, view: Entity<PodsView>) -> AnyElement {
+fn actions(detail: &PodDetail, view: Entity<PodsView>, cx: &mut Context<PodsView>) -> AnyElement {
     let containers: Vec<String> = detail
         .containers
         .iter()
@@ -121,9 +127,9 @@ fn actions(detail: &PodDetail, view: Entity<PodsView>) -> AnyElement {
             });
         });
 
-    let exec_view = view;
-    let exec_namespace = namespace;
-    let exec_name = name;
+    let exec_view = view.clone();
+    let exec_namespace = namespace.clone();
+    let exec_name = name.clone();
     let exec_containers = containers;
     let exec = Button::new("pod-open-exec")
         .outline()
@@ -145,11 +151,44 @@ fn actions(detail: &PodDetail, view: Entity<PodsView>) -> AnyElement {
             });
         });
 
+    let delete_view = view;
+    let delete_namespace = namespace;
+    let delete_name = name;
+    let delete = Button::new("pod-delete")
+        .ghost()
+        .small()
+        .text_color(cx.theme().danger)
+        .icon(IconName::Trash)
+        .label("Delete")
+        .tooltip("Delete pod")
+        .on_click(move |_, window, cx| {
+            delete_view.update(cx, |view, cx| {
+                view.delete_pod(delete_namespace.clone(), delete_name.clone(), window, cx);
+            });
+        });
+
     h_flex()
         .gap_2()
         .items_center()
         .child(logs)
         .child(exec)
+        .child(delete)
+        .into_any_element()
+}
+
+fn delete_banner(message: &str, cx: &mut Context<PodsView>) -> AnyElement {
+    div()
+        .w_full()
+        .min_w_0()
+        .rounded(cx.theme().radius)
+        .border_1()
+        .border_color(cx.theme().danger)
+        .px_3()
+        .py_2()
+        .text_xs()
+        .whitespace_normal()
+        .text_color(cx.theme().danger)
+        .child(message.to_string())
         .into_any_element()
 }
 
