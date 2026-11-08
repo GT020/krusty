@@ -1,48 +1,57 @@
-//! ViewModel for NetworkPolicies: subscription pump + column definitions.
+//! ViewModel shared by every resource kind without a dedicated view.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
-use gpui_kit::component::table::{Column, TableDelegate, TableState};
-use gpui_kit::px;
-use gpui_kit::{
-    App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Styled as _, Window,
-    div,
-};
+use gpui_kit::component::table::TableState;
+use gpui_kit::{App, AppContext as _, Context, Entity, Window};
 use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
-use crate::models::resources::network_policies::NetworkPoliciesModel;
+use crate::models::resources::resource::ResourceModel;
 use crate::models::{Item, NamespaceScope, ResourceFilter, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository;
+use crate::view_models::resources::table::ResourceTable;
 
-pub struct NetworkPoliciesViewModel {
+pub struct ResourceListViewModel {
+    kind: ResourceKind,
     active: Arc<AtomicBool>,
     scope: NamespaceScope,
     filter: ResourceFilter,
     epoch: u64,
-    model: Entity<NetworkPoliciesModel>,
-    table: Entity<TableState<NetworkPoliciesViewModelTable>>,
+    refresh_interval: Option<Duration>,
+    model: Entity<ResourceModel>,
+    table: Entity<TableState<ResourceTable>>,
     subscription: Option<repository::Subscription>,
     pump_cancel: Option<watch::Sender<()>>,
     #[allow(dead_code)] // held for its Drop side-effect: cancels the GPUI observer
     cluster_sub: gpui_kit::Subscription,
 }
 
-impl NetworkPoliciesViewModel {
-    pub fn new(scope: NamespaceScope, _window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let state = cx.global::<ClusterState>();
-        let epoch = state.context_epoch();
+impl ResourceListViewModel {
+    pub fn new(
+        kind: ResourceKind,
+        scope: NamespaceScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::with_interval(kind, scope, window, cx, None)
+    }
+
+    /// Build a list whose snapshots are coalesced to `interval`, used by data
+    /// that changes faster than the UI should repaint.
+    pub fn with_interval(
+        kind: ResourceKind,
+        scope: NamespaceScope,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        refresh_interval: Option<Duration>,
+    ) -> Self {
+        let epoch = cx.global::<ClusterState>().context_epoch();
         let active = Arc::new(AtomicBool::new(true));
-        let model = cx.new(|_| NetworkPoliciesModel::new());
-        let table_model = model.clone();
-        let table = cx.new(|cx| {
-            TableState::new(
-                NetworkPoliciesViewModelTable { model: table_model },
-                _window,
-                cx,
-            )
-        });
+        let model = cx.new(|_| ResourceModel::new());
+        let table = ResourceTable::new_state(model.clone(), kind, window, cx);
         let cluster_sub = cx.observe_global::<ClusterState>(|this, cx| {
             let epoch = cx.global::<ClusterState>().context_epoch();
             if epoch == this.epoch {
@@ -57,10 +66,12 @@ impl NetworkPoliciesViewModel {
             cx.notify();
         });
         let mut this = Self {
+            kind,
             active,
             scope,
             filter: ResourceFilter::default(),
             epoch,
+            refresh_interval,
             model,
             table,
             subscription: None,
@@ -71,7 +82,7 @@ impl NetworkPoliciesViewModel {
         this
     }
 
-    pub fn table(&self) -> &Entity<TableState<NetworkPoliciesViewModelTable>> {
+    pub fn table(&self) -> &Entity<TableState<ResourceTable>> {
         &self.table
     }
 
@@ -89,7 +100,6 @@ impl NetworkPoliciesViewModel {
         cx.notify();
     }
 
-    /// Replace the text filter applied to this tab's rows.
     pub fn set_filter(&mut self, filter: ResourceFilter, cx: &mut Context<Self>) {
         if self.filter == filter {
             return;
@@ -99,11 +109,6 @@ impl NetworkPoliciesViewModel {
             subscription.set_filter(filter);
         }
         cx.notify();
-    }
-
-    #[allow(dead_code)]
-    pub fn kind(&self) -> ResourceKind {
-        ResourceKind::NetworkPolicies
     }
 
     pub fn phase(&self, cx: &App) -> SnapshotPhase {
@@ -118,7 +123,7 @@ impl NetworkPoliciesViewModel {
         self.model.read(cx).item_count()
     }
 
-    pub fn item_at(&self, row: usize, cx: &App) -> Option<crate::models::Item> {
+    pub fn item_at(&self, row: usize, cx: &App) -> Option<Item> {
         self.model
             .read(cx)
             .snapshot()
@@ -140,11 +145,7 @@ impl NetworkPoliciesViewModel {
                 self.subscribe(cx);
                 return;
             }
-            let snapshot = self
-                .subscription
-                .as_ref()
-                .map(|subscription| subscription.snapshot());
-            if let Some(snapshot) = snapshot {
+            if let Some(snapshot) = self.subscription.as_ref().map(|s| s.snapshot()) {
                 self.model.update(cx, |model, cx| {
                     model.apply_snapshot(snapshot);
                     cx.notify();
@@ -177,22 +178,19 @@ impl NetworkPoliciesViewModel {
 
     fn subscribe(&mut self, cx: &mut Context<Self>) {
         self.cancel_pump();
-        let subscription = match repository::subscribe(
-            cx,
-            ResourceKind::NetworkPolicies,
-            self.scope.clone(),
-            self.filter.clone(),
-        ) {
-            Ok(s) => s,
-            Err(error) => {
-                use crate::models::ResourceSnapshot;
-                self.model.update(cx, |model, cx| {
-                    model.apply_snapshot(Arc::new(ResourceSnapshot::failed(error)));
-                    cx.notify();
-                });
-                return;
-            }
-        };
+        let subscription =
+            match repository::subscribe(cx, self.kind, self.scope.clone(), self.filter.clone()) {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    self.model.update(cx, |model, cx| {
+                        model.apply_snapshot(Arc::new(crate::models::ResourceSnapshot::failed(
+                            error,
+                        )));
+                        cx.notify();
+                    });
+                    return;
+                }
+            };
         subscription.set_paused(!self.is_active());
         let initial = subscription.snapshot();
         let notify_now = self.is_active();
@@ -206,7 +204,9 @@ impl NetworkPoliciesViewModel {
         self.pump_cancel = Some(cancel);
         let model = self.model.downgrade();
         let mut pump = subscription.clone();
+        let refresh_interval = self.refresh_interval;
         cx.spawn(async move |_, cx: &mut gpui_kit::AsyncApp| {
+            let mut last_refresh: Option<Instant> = None;
             loop {
                 let snapshot = tokio::select! {
                     _ = cancel_rx.changed() => break,
@@ -215,6 +215,18 @@ impl NetworkPoliciesViewModel {
                 let Some(snapshot) = snapshot else {
                     break;
                 };
+                if let Some(interval) = refresh_interval
+                    && let Some(last) = last_refresh
+                {
+                    let elapsed = last.elapsed();
+                    if elapsed < interval {
+                        tokio::select! {
+                            _ = cancel_rx.changed() => break,
+                            _ = cx.background_executor().timer(interval - elapsed) => {}
+                        }
+                    }
+                }
+                last_refresh = Some(Instant::now());
                 let applied = model.update(cx, |model, cx| {
                     model.apply_snapshot(snapshot);
                     cx.notify();
@@ -226,92 +238,5 @@ impl NetworkPoliciesViewModel {
         })
         .detach();
         self.subscription = Some(subscription);
-    }
-}
-
-// ─── Table delegate ───────────────────────────────────────────────────────────
-
-pub struct NetworkPoliciesViewModelTable {
-    model: Entity<NetworkPoliciesModel>,
-}
-
-fn columns() -> Vec<Column> {
-    vec![
-        Column::new("name", "Name").width(px(280.)),
-        Column::new("namespace", "Namespace").width(px(150.)),
-        Column::new("capacity", "Policy Types").width(px(180.)),
-        Column::new("status", "Status").width(px(100.)),
-        Column::new("age", "Age").width(px(90.)).text_right(),
-    ]
-}
-
-fn column_key(col_ix: usize) -> gpui_kit::SharedString {
-    columns()
-        .get(col_ix)
-        .map(|c| c.key.clone())
-        .unwrap_or_default()
-}
-
-fn cell(item: &Item, key: &str) -> String {
-    match key {
-        "name" => item.name.clone(),
-        "namespace" => item.namespace.clone(),
-        "ready" => item.ready.clone(),
-        "restarts" => item.restarts.to_string(),
-        "capacity" => item.capacity.clone(),
-        "version" => item.version.clone(),
-        "status" => item.status.clone(),
-        "age" => item.age(),
-        _ => String::new(),
-    }
-}
-
-impl TableDelegate for NetworkPoliciesViewModelTable {
-    fn columns_count(&self, _cx: &App) -> usize {
-        columns().len()
-    }
-
-    fn rows_count(&self, cx: &App) -> usize {
-        self.model.read(cx).item_count()
-    }
-
-    fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        columns()
-            .get(col_ix)
-            .cloned()
-            .unwrap_or_else(|| Column::new("empty", ""))
-    }
-
-    fn render_td(
-        &mut self,
-        row: usize,
-        col_ix: usize,
-        _window: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) -> impl gpui_kit::IntoElement {
-        use gpui_kit::component::ActiveTheme as _;
-        let model = self.model.read(cx);
-        let Some(item) = model.snapshot().items().get(row) else {
-            return div().into_any_element();
-        };
-        let key = column_key(col_ix);
-        let text = cell(item, &key);
-        if col_ix == 0 {
-            return div().child(text).into_any_element();
-        }
-        let color = if key == "status" && !item.is_ok() {
-            cx.theme().danger
-        } else {
-            cx.theme().muted_foreground
-        };
-        div().text_color(color).child(text).into_any_element()
-    }
-
-    fn cell_text(&self, row: usize, col_ix: usize, cx: &App) -> String {
-        let model = self.model.read(cx);
-        let Some(item) = model.snapshot().items().get(row) else {
-            return String::new();
-        };
-        cell(item, &column_key(col_ix))
     }
 }

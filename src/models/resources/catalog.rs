@@ -353,6 +353,25 @@ mod tests {
     }
 
     #[test]
+    fn every_builtin_kind_appears_exactly_once_in_the_navigation() {
+        let mut seen = std::collections::BTreeSet::new();
+        for (_, kinds) in ResourceKind::nav_groups() {
+            for kind in kinds {
+                assert!(
+                    seen.insert(kind),
+                    "{kind:?} appears twice in the navigation"
+                );
+            }
+        }
+        for kind in BUILTIN_KINDS {
+            assert!(
+                seen.contains(&kind),
+                "{kind:?} is missing from the navigation"
+            );
+        }
+    }
+
+    #[test]
     fn custom_kinds_have_no_stable_id() {
         assert_eq!(ResourceKind::Custom(0).stable_id(), None);
         assert_eq!(ResourceKind::from_stable_id("Custom"), None);

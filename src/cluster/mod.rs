@@ -507,61 +507,12 @@ pub fn switch_context(cx: &mut App, id: &str) -> Result<(), &'static str> {
     }
 }
 
-fn rebuild_contexts(state: &mut ClusterState) {
-    state.contexts = build_contexts(state.kubeconfig.as_ref(), &state.store);
-    if let Some(active) = &state.active
-        && !state.contexts.iter().any(|context| context.id == *active)
-    {
-        state.active = None;
-        state.client = None;
-        state.context_epoch = state.context_epoch.wrapping_add(1);
-    }
-}
-
 async fn load_inline(yaml: &str) -> Result<Config, &'static str> {
     let kubeconfig: kube::config::Kubeconfig =
         serde_saphyr::from_str(yaml).map_err(|_| "invalid kubeconfig")?;
     Config::from_custom_kubeconfig(kubeconfig, &kube::config::KubeConfigOptions::default())
         .await
         .map_err(|_| "invalid kubeconfig")
-}
-
-/// Cluster configs added directly to the app. Credentials are stored in the
-/// app config folder (`~/.config/krusty/clusters.json`).
-#[allow(dead_code)]
-pub mod store {
-    use super::*;
-
-    pub fn add(
-        cx: &mut App,
-        id: &str,
-        name: &str,
-        kubeconfig_yaml: &str,
-    ) -> Result<(), &'static str> {
-        cx.update_global::<ClusterState, _>(|state, _| {
-            state.store.upsert(id, name, kubeconfig_yaml);
-            state.store.save()?;
-            rebuild_contexts(state);
-            Ok(())
-        })
-    }
-
-    pub fn select(cx: &mut App, id: &str) -> Result<(), &'static str> {
-        switch_context(cx, &format!("app:{id}"))?;
-        cx.update_global::<ClusterState, _>(|state, _| {
-            state.store.set_default(Some(id));
-            state.store.save()
-        })
-    }
-
-    pub fn remove(cx: &mut App, id: &str) -> Result<(), &'static str> {
-        cx.update_global::<ClusterState, _>(|state, _| {
-            state.store.remove(id);
-            state.store.save()?;
-            rebuild_contexts(state);
-            Ok(())
-        })
-    }
 }
 
 /// Fetch real objects for a resource kind. Runs on the cluster runtime so the

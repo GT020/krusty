@@ -23,17 +23,13 @@ use gpui_kit::{
 use crate::ui::components::tabs;
 
 use crate::models::resources::pod::detail::PodDetailUpdate;
-use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
+use crate::models::{NamespaceScope, ResourceKind};
 use crate::repository;
-use crate::ui::resources::namespace_filter::{
-    NamespaceFilter, NamespaceFilterEvent, render as render_namespace_filter,
-};
+use crate::ui::resources::namespace_filter::{NamespaceFilter, NamespaceFilterEvent};
 use crate::ui::resources::pod::exec::PodExecView;
 use crate::ui::resources::pod::logs::PodLogsView;
 use crate::ui::resources::pod::sessions::{PodSession, PodSessions, SessionKey};
-use crate::ui::resources::search_filter::{
-    SearchFilter, SearchFilterEvent, render as render_search_filter,
-};
+use crate::ui::resources::search_filter::{SearchFilter, SearchFilterEvent};
 use crate::view_models::resources::pod::PodsViewModel;
 use crate::view_models::resources::pod::exec::PodExecViewModel;
 use crate::view_models::resources::pod::logs::PodLogsViewModel;
@@ -105,7 +101,7 @@ impl PodsView {
         }
     }
     pub fn scope_label(&self, cx: &App) -> String {
-        self.vm.read(cx).scope().label()
+        self.vm.read(cx).scope(cx).label()
     }
 
     pub fn namespace_filter(&self) -> &gpui_kit::Entity<NamespaceFilter> {
@@ -298,56 +294,22 @@ impl PodsView {
         cx.notify();
     }
 
-    fn header(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn header(&self, cx: &Context<Self>) -> gpui_kit::AnyElement {
         let phase = self.vm.read(cx).phase(cx);
         let count = self.vm.read(cx).item_count(cx);
         let mode = self.vm.read(cx).mode(cx);
-
-        let status = match &phase {
-            SnapshotPhase::Loading => div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child("Loading…")
-                .into_any_element(),
-            SnapshotPhase::Ready => div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(format!("{count} objects"))
-                .into_any_element(),
-            SnapshotPhase::Error(message) => div()
-                .text_xs()
-                .text_color(cx.theme().danger)
-                .child(message.clone())
-                .into_any_element(),
-        };
-
-        let handle = cx.entity().clone();
-        h_flex()
-            .justify_between()
-            .py_2()
-            .px_4()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(render_namespace_filter(&self.namespace_filter, cx))
-                    .child(render_search_filter(&self.search_filter, cx))
-                    .child(status)
-                    .child(super::watch_mode::render(mode, ResourceKind::Pods, cx)),
-            )
-            .child(
-                Button::new("refresh-pods")
-                    .ghost()
-                    .small()
-                    .icon(IconName::RefreshCw)
-                    .on_click(move |_, _, cx| {
-                        handle.update(cx, |this, cx| {
-                            this.vm.update(cx, |vm, cx| vm.refresh(cx));
-                        });
-                    }),
-            )
+        super::list_header::render(
+            ResourceKind::Pods,
+            &phase,
+            count,
+            mode,
+            Some(&self.namespace_filter),
+            &self.search_filter,
+            |this, _window, cx| {
+                this.vm.update(cx, |vm, cx| vm.refresh(cx));
+            },
+            cx,
+        )
     }
 
     fn list(&self, cx: &Context<Self>) -> gpui_kit::AnyElement {

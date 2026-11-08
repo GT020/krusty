@@ -1,203 +1,135 @@
-//! ViewModel for Nodes: subscription pump, table columns, and detail selection.
+//! ViewModel for Nodes: the shared list feed plus the open node detail.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use gpui_kit::component::table::{Column, TableDelegate, TableEvent, TableState};
-use gpui_kit::px;
-use gpui_kit::{
-    App, AppContext as _, Context, Entity, IntoElement, ParentElement as _, Styled as _, Window,
-    div,
-};
+use gpui_kit::component::table::{TableEvent, TableState};
+use gpui_kit::{App, AppContext as _, Context, Entity, Window};
 use tokio::sync::watch;
 
 use crate::cluster::ClusterState;
 use crate::models::resources::node::NodesModel;
-use crate::models::resources::node::detail::{NodeDetailState, UsageHistory};
+use crate::models::resources::node::detail::{NodeDetailState, NodeDetailUpdate, UsageHistory};
 use crate::models::{Item, NamespaceScope, ResourceFilter, ResourceKind, SnapshotPhase, WatchMode};
 use crate::repository;
+use crate::view_models::resources::generic::ResourceListViewModel;
+use crate::view_models::resources::table::ResourceTable;
 
 /// Large clusters emit node updates continuously. Repainting the table for
 /// every repository flush makes it feel sluggish, so coalesce snapshots.
 const NODES_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
 pub struct NodesViewModel {
-    active: Arc<AtomicBool>,
-    scope: NamespaceScope,
-    filter: ResourceFilter,
-    epoch: u64,
-    model: Entity<NodesModel>,
-    table: Entity<TableState<NodesViewModelTable>>,
-    subscription: Option<repository::Subscription>,
-    pump_cancel: Option<watch::Sender<()>>,
+    list: Entity<ResourceListViewModel>,
+    table: Entity<TableState<ResourceTable>>,
+    detail_model: Entity<NodesModel>,
     detail_cancel: Option<watch::Sender<bool>>,
-    #[allow(dead_code)] // held for its Drop side-effect: cancels the GPUI observer
-    cluster_sub: gpui_kit::Subscription,
+    epoch: u64,
     #[allow(dead_code)] // held for its Drop side-effect: unsubscribes the table events
     table_sub: gpui_kit::Subscription,
+    #[allow(dead_code)] // held for its Drop side-effect: cancels the GPUI observer
+    cluster_sub: gpui_kit::Subscription,
 }
 
 impl NodesViewModel {
-    pub fn new(scope: NamespaceScope, _window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let state = cx.global::<ClusterState>();
-        let epoch = state.context_epoch();
-        let active = Arc::new(AtomicBool::new(true));
-        let model = cx.new(|_| NodesModel::new());
-        let table_model = model.clone();
-        let table = cx.new(|cx| {
-            TableState::new(NodesViewModelTable { model: table_model }, _window, cx)
-                .row_selectable(true)
+    pub fn new(scope: NamespaceScope, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let epoch = cx.global::<ClusterState>().context_epoch();
+        let list = cx.new(|cx| {
+            ResourceListViewModel::with_interval(
+                ResourceKind::Nodes,
+                scope,
+                window,
+                cx,
+                Some(NODES_REFRESH_INTERVAL),
+            )
         });
+        let table = list.read(cx).table().clone();
         let table_sub = cx.subscribe(&table, |this, _, event: &TableEvent, cx| {
             if let TableEvent::SelectRow(row) = event {
                 this.open_row(*row, cx);
             }
         });
+        let detail_model = cx.new(|_| NodesModel::new());
         let cluster_sub = cx.observe_global::<ClusterState>(|this, cx| {
             let epoch = cx.global::<ClusterState>().context_epoch();
             if epoch == this.epoch {
                 return;
             }
             this.epoch = epoch;
-            if !this.is_active() {
-                this.cancel_pump();
-                this.cancel_detail();
-                return;
-            }
-            this.subscribe(cx);
-            cx.notify();
+            this.cancel_detail();
+            this.detail_model.update(cx, |model, cx| {
+                model.close_detail();
+                cx.notify();
+            });
         });
-        let mut this = Self {
-            active,
-            scope,
-            filter: ResourceFilter::default(),
-            epoch,
-            model,
+        Self {
+            list,
             table,
-            subscription: None,
-            pump_cancel: None,
+            detail_model,
             detail_cancel: None,
-            cluster_sub,
+            epoch,
             table_sub,
-        };
-        this.subscribe(cx);
-        this
+            cluster_sub,
+        }
     }
 
-    pub fn table(&self) -> &Entity<TableState<NodesViewModelTable>> {
+    pub fn table(&self) -> &Entity<TableState<ResourceTable>> {
         &self.table
     }
 
-    pub fn scope(&self) -> &NamespaceScope {
-        &self.scope
+    pub fn scope(&self, cx: &App) -> NamespaceScope {
+        self.list.read(cx).scope().clone()
     }
 
-    /// Switch this tab's namespace filter and restart its watcher.
     pub fn set_scope(&mut self, scope: NamespaceScope, cx: &mut Context<Self>) {
-        if self.scope == scope {
-            return;
-        }
-        self.scope = scope;
-        self.subscribe(cx);
-        cx.notify();
+        self.list.update(cx, |list, cx| list.set_scope(scope, cx));
+        self.close_detail(cx);
     }
 
-    /// Replace the text filter applied to this tab's rows.
     pub fn set_filter(&mut self, filter: ResourceFilter, cx: &mut Context<Self>) {
-        if self.filter == filter {
-            return;
-        }
-        self.filter = filter.clone();
-        if let Some(subscription) = &self.subscription {
-            subscription.set_filter(filter);
-        }
-        cx.notify();
-    }
-
-    #[allow(dead_code)]
-    pub fn kind(&self) -> ResourceKind {
-        ResourceKind::Nodes
+        self.list.update(cx, |list, cx| list.set_filter(filter, cx));
     }
 
     pub fn phase(&self, cx: &App) -> SnapshotPhase {
-        self.model.read(cx).phase().clone()
+        self.list.read(cx).phase(cx)
     }
 
     pub fn mode(&self, cx: &App) -> WatchMode {
-        self.model.read(cx).snapshot().mode()
+        self.list.read(cx).mode(cx)
     }
 
     pub fn item_count(&self, cx: &App) -> usize {
-        self.model.read(cx).item_count()
+        self.list.read(cx).item_count(cx)
     }
 
     pub fn detail(&self, cx: &App) -> NodeDetailState {
-        self.model.read(cx).detail().clone()
+        self.detail_model.read(cx).detail().clone()
     }
 
     pub fn usage(&self, cx: &App) -> UsageHistory {
-        self.model.read(cx).usage().clone()
+        self.detail_model.read(cx).usage().clone()
     }
 
     pub fn usage_error(&self, cx: &App) -> Option<String> {
-        self.model.read(cx).usage_error().map(str::to_string)
+        self.detail_model.read(cx).usage_error().map(str::to_string)
     }
 
-    pub fn item_at(&self, row: usize, cx: &App) -> Option<crate::models::Item> {
-        self.model
-            .read(cx)
-            .snapshot()
-            .items()
-            .get(row)
-            .map(|item| (**item).clone())
+    pub fn item_at(&self, row: usize, cx: &App) -> Option<Item> {
+        self.list.read(cx).item_at(row, cx)
     }
 
     pub fn set_active(&mut self, active: bool, cx: &mut Context<Self>) {
-        let was_active = self.active.swap(active, Ordering::Relaxed);
-        if was_active == active {
-            return;
-        }
-        if let Some(subscription) = &self.subscription {
-            subscription.set_paused(!active);
-        }
+        self.list.update(cx, |list, cx| list.set_active(active, cx));
         if active {
-            if self.subscription.is_none() {
-                self.subscribe(cx);
-                return;
-            }
-            let snapshot = self
-                .subscription
-                .as_ref()
-                .map(|subscription| subscription.snapshot());
-            if let Some(snapshot) = snapshot {
-                self.model.update(cx, |model, cx| {
-                    model.apply_snapshot(snapshot);
-                    cx.notify();
-                });
-            }
             if let Some(node) = self.current_detail_node(cx) {
                 self.attach_detail(node, cx);
             }
-            cx.notify();
         } else {
             self.cancel_detail();
         }
     }
 
-    pub fn is_active(&self) -> bool {
-        self.active.load(Ordering::Relaxed)
-    }
-
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        if !self.is_active() {
-            return;
-        }
-        if let Some(sub) = &self.subscription {
-            sub.refresh();
-        } else {
-            self.subscribe(cx);
-        }
+        self.list.update(cx, |list, cx| list.refresh(cx));
         if let Some(node) = self.current_detail_node(cx) {
             self.start_detail(node, cx);
         }
@@ -205,7 +137,7 @@ impl NodesViewModel {
 
     pub fn close_detail(&mut self, cx: &mut Context<Self>) {
         self.cancel_detail();
-        self.model.update(cx, |model, cx| {
+        self.detail_model.update(cx, |model, cx| {
             model.close_detail();
             cx.notify();
         });
@@ -220,7 +152,11 @@ impl NodesViewModel {
     }
 
     fn current_detail_node(&self, cx: &App) -> Option<String> {
-        self.model.read(cx).detail().node().map(str::to_string)
+        self.detail_model
+            .read(cx)
+            .detail()
+            .node()
+            .map(str::to_string)
     }
 
     fn cancel_detail(&mut self) {
@@ -230,15 +166,9 @@ impl NodesViewModel {
     }
 
     fn open_row(&mut self, row: usize, cx: &mut Context<Self>) {
-        let name = {
-            let model = self.model.read(cx);
-            model
-                .snapshot()
-                .items()
-                .get(row)
-                .map(|item| item.name.clone())
+        let Some(name) = self.item_at(row, cx).map(|item| item.name) else {
+            return;
         };
-        let Some(name) = name else { return };
         if self.current_detail_node(cx).as_deref() == Some(name.as_str()) {
             return;
         }
@@ -247,7 +177,7 @@ impl NodesViewModel {
 
     fn start_detail(&mut self, node: String, cx: &mut Context<Self>) {
         self.cancel_detail();
-        self.model.update(cx, |model, cx| {
+        self.detail_model.update(cx, |model, cx| {
             model.begin_detail(node.clone());
             cx.notify();
         });
@@ -261,20 +191,18 @@ impl NodesViewModel {
         let mut detail_sub = match repository::resources::nodes::subscribe_detail(cx, &node) {
             Ok(subscription) => subscription,
             Err(error) => {
-                self.model.update(cx, |model, cx| {
-                    model.apply_update(
-                        crate::models::resources::node::detail::NodeDetailUpdate::Detail {
-                            node,
-                            result: Err(format!("Could not open node details: {error}")),
-                        },
-                    );
+                self.detail_model.update(cx, |model, cx| {
+                    model.apply_update(NodeDetailUpdate::Detail {
+                        node,
+                        result: Err(format!("Could not open node details: {error}")),
+                    });
                     cx.notify();
                 });
                 return;
             }
         };
         self.detail_cancel = Some(detail_sub.cancel_handle());
-        let model = self.model.downgrade();
+        let model = self.detail_model.downgrade();
         cx.spawn(async move |_, cx| {
             while let Some(update) = detail_sub.next().await {
                 let applied = model.update(cx, |model, cx| {
@@ -288,163 +216,5 @@ impl NodesViewModel {
             }
         })
         .detach();
-    }
-
-    fn cancel_pump(&mut self) {
-        self.subscription = None;
-        self.pump_cancel = None;
-    }
-
-    fn subscribe(&mut self, cx: &mut Context<Self>) {
-        self.cancel_pump();
-        self.cancel_detail();
-        self.model.update(cx, |model, _| model.close_detail());
-        let subscription = match repository::resources::nodes::subscribe(cx, self.filter.clone()) {
-            Ok(s) => s,
-            Err(error) => {
-                use crate::models::ResourceSnapshot;
-                self.model.update(cx, |model, cx| {
-                    model.apply_snapshot(Arc::new(ResourceSnapshot::failed(error)));
-                    cx.notify();
-                });
-                return;
-            }
-        };
-        subscription.set_paused(!self.is_active());
-        let initial = subscription.snapshot();
-        let notify_now = self.is_active();
-        self.model.update(cx, |model, cx| {
-            model.apply_snapshot(initial);
-            if notify_now {
-                cx.notify();
-            }
-        });
-        let (cancel, mut cancel_rx) = watch::channel(());
-        self.pump_cancel = Some(cancel);
-        let model = self.model.downgrade();
-        let mut pump = subscription.clone();
-        cx.spawn(async move |_, cx: &mut gpui_kit::AsyncApp| {
-            let mut last_refresh: Option<Instant> = None;
-            loop {
-                let snapshot = tokio::select! {
-                    _ = cancel_rx.changed() => break,
-                    snapshot = pump.next() => snapshot,
-                };
-                let Some(snapshot) = snapshot else {
-                    break;
-                };
-
-                // The watch channel keeps only the latest snapshot, so waiting
-                // here skips intermediate flushes instead of rendering them.
-                if let Some(last) = last_refresh {
-                    let elapsed = last.elapsed();
-                    if elapsed < NODES_REFRESH_INTERVAL {
-                        tokio::select! {
-                            _ = cancel_rx.changed() => break,
-                            _ = cx
-                                .background_executor()
-                                .timer(NODES_REFRESH_INTERVAL - elapsed) => {}
-                        }
-                    }
-                }
-                last_refresh = Some(Instant::now());
-                let applied = model.update(cx, |model, cx| {
-                    model.apply_snapshot(snapshot);
-                    cx.notify();
-                });
-                if applied.is_err() {
-                    break;
-                }
-            }
-        })
-        .detach();
-        self.subscription = Some(subscription);
-    }
-}
-
-// ─── Table delegate ───────────────────────────────────────────────────────────
-
-pub struct NodesViewModelTable {
-    model: Entity<NodesModel>,
-}
-
-fn columns() -> Vec<Column> {
-    vec![
-        Column::new("name", "Name").width(px(220.)),
-        Column::new("status", "Status").width(px(110.)),
-        Column::new("version", "Version").width(px(130.)),
-        Column::new("capacity", "CPU").width(px(90.)).text_right(),
-        Column::new("age", "Age").width(px(90.)).text_right(),
-    ]
-}
-
-fn column_key(col_ix: usize) -> gpui_kit::SharedString {
-    columns()
-        .get(col_ix)
-        .map(|c| c.key.clone())
-        .unwrap_or_default()
-}
-
-fn cell(item: &Item, key: &str) -> String {
-    match key {
-        "name" => item.name.clone(),
-        "namespace" => item.namespace.clone(),
-        "ready" => item.ready.clone(),
-        "restarts" => item.restarts.to_string(),
-        "capacity" => item.capacity.clone(),
-        "version" => item.version.clone(),
-        "status" => item.status.clone(),
-        "age" => item.age(),
-        _ => String::new(),
-    }
-}
-
-impl TableDelegate for NodesViewModelTable {
-    fn columns_count(&self, _cx: &App) -> usize {
-        columns().len()
-    }
-
-    fn rows_count(&self, cx: &App) -> usize {
-        self.model.read(cx).item_count()
-    }
-
-    fn column(&self, col_ix: usize, _cx: &App) -> Column {
-        columns()
-            .get(col_ix)
-            .cloned()
-            .unwrap_or_else(|| Column::new("empty", ""))
-    }
-
-    fn render_td(
-        &mut self,
-        row: usize,
-        col_ix: usize,
-        _window: &mut Window,
-        cx: &mut Context<TableState<Self>>,
-    ) -> impl gpui_kit::IntoElement {
-        use gpui_kit::component::ActiveTheme as _;
-        let model = self.model.read(cx);
-        let Some(item) = model.snapshot().items().get(row) else {
-            return div().into_any_element();
-        };
-        let key = column_key(col_ix);
-        let text = cell(item, &key);
-        if col_ix == 0 {
-            return div().child(text).into_any_element();
-        }
-        let color = if key == "status" && !item.is_ok() {
-            cx.theme().danger
-        } else {
-            cx.theme().muted_foreground
-        };
-        div().text_color(color).child(text).into_any_element()
-    }
-
-    fn cell_text(&self, row: usize, col_ix: usize, cx: &App) -> String {
-        let model = self.model.read(cx);
-        let Some(item) = model.snapshot().items().get(row) else {
-            return String::new();
-        };
-        cell(item, &column_key(col_ix))
     }
 }

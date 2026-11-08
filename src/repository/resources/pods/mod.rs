@@ -18,67 +18,20 @@ use crate::models::resources::pod::detail::{
     PodCondition, PodContainer, PodDetail, PodDetailUpdate, PodOwner, PodToleration, PodUsage,
     PodVolume,
 };
-use crate::models::{NamespaceScope, ObjectKey, ResourceFilter, ResourceKind, SnapshotPhase};
+use crate::models::{ObjectKey, ResourceKind, SnapshotPhase};
 use gpui_kit::App;
 
+use crate::repository::quantity::parse_quantity;
 use crate::repository::retry::{Retry, RetryAction};
-use crate::repository::{Subscription, subscribe_kind};
+use crate::repository::stream::CancelOnDrop;
 
 const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Subscribe to the live Pods stream.
-/// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
-pub fn subscribe(
-    cx: &mut App,
-    scope: NamespaceScope,
-    filter: ResourceFilter,
-) -> Result<Subscription, String> {
-    subscribe_kind(cx, ResourceKind::Pods, scope, filter)
-}
-
 /// A live detail stream for one pod. Dropping it cancels the background task.
-pub struct PodDetailSubscription {
-    updates: mpsc::UnboundedReceiver<PodDetailUpdate>,
-    cancel: watch::Sender<bool>,
-}
-
-impl PodDetailSubscription {
-    pub async fn next(&mut self) -> Option<PodDetailUpdate> {
-        self.updates.recv().await
-    }
-
-    pub fn cancel_handle(&self) -> watch::Sender<bool> {
-        self.cancel.clone()
-    }
-}
-
-impl Drop for PodDetailSubscription {
-    fn drop(&mut self) {
-        let _ = self.cancel.send(true);
-    }
-}
+pub type PodDetailSubscription = CancelOnDrop<PodDetailUpdate>;
 
 /// A live log stream for one pod container. Dropping it cancels the stream.
-pub struct PodLogStream {
-    updates: mpsc::UnboundedReceiver<Result<String, String>>,
-    cancel: watch::Sender<bool>,
-}
-
-impl PodLogStream {
-    pub async fn next(&mut self) -> Option<Result<String, String>> {
-        self.updates.recv().await
-    }
-
-    pub fn cancel_handle(&self) -> watch::Sender<bool> {
-        self.cancel.clone()
-    }
-}
-
-impl Drop for PodLogStream {
-    fn drop(&mut self) {
-        let _ = self.cancel.send(true);
-    }
-}
+pub type PodLogStream = CancelOnDrop<Result<String, String>>;
 
 /// Stream logs for a pod container. `follow` keeps streaming new lines.
 pub fn subscribe_logs(
@@ -105,7 +58,7 @@ pub fn subscribe_logs(
         updates_tx,
         cancel_rx,
     ));
-    Ok(PodLogStream { updates, cancel })
+    Ok(CancelOnDrop::new(updates, cancel))
 }
 
 async fn watch_logs(
@@ -264,7 +217,7 @@ pub fn subscribe_detail(
         updates_tx,
         cancel_rx,
     ));
-    Ok(PodDetailSubscription { updates, cancel })
+    Ok(CancelOnDrop::new(updates, cancel))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -860,70 +813,4 @@ fn quantities(
         .iter()
         .map(|(key, value)| (key.clone(), value.0.clone()))
         .collect()
-}
-
-/// Parse a Kubernetes resource quantity into a plain number.
-fn parse_quantity(value: &str) -> Option<f64> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let split = value
-        .find(|character: char| {
-            !(character.is_ascii_digit()
-                || character == '.'
-                || character == '-'
-                || character == '+')
-        })
-        .unwrap_or(value.len());
-    let (number, suffix) = value.split_at(split);
-    let number: f64 = number.parse().ok()?;
-    let multiplier = match suffix {
-        "" => 1.0,
-        "n" => 1e-9,
-        "u" => 1e-6,
-        "m" => 1e-3,
-        "k" => 1e3,
-        "M" => 1e6,
-        "G" => 1e9,
-        "T" => 1e12,
-        "P" => 1e15,
-        "E" => 1e18,
-        "Ki" => 1024.0,
-        "Mi" => 1024.0 * 1024.0,
-        "Gi" => 1024.0 * 1024.0 * 1024.0,
-        "Ti" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "Pi" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "Ei" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => {
-            let exponent = suffix
-                .strip_prefix('e')
-                .or_else(|| suffix.strip_prefix('E'))?;
-            let exponent: i32 = exponent.parse().ok()?;
-            10f64.powi(exponent)
-        }
-    };
-    Some(number * multiplier)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_quantity;
-
-    fn assert_quantity(value: &str, expected: f64) {
-        let parsed = parse_quantity(value).expect("quantity parses");
-        assert!(
-            (parsed - expected).abs() < f64::EPSILON * 8.0,
-            "{value} parsed as {parsed}, expected {expected}"
-        );
-    }
-
-    #[test]
-    fn parses_cpu_and_memory_quantities() {
-        assert_quantity("250m", 0.25);
-        assert_quantity("150000000n", 0.15);
-        assert_quantity("1Ki", 1024.0);
-        assert_quantity("2Gi", 2.0 * 1024.0 * 1024.0 * 1024.0);
-        assert_eq!(parse_quantity(""), None);
-    }
 }

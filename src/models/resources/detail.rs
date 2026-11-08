@@ -50,6 +50,10 @@ impl ResourceDetailState {
         }
     }
 
+    pub fn kind(&self) -> Option<ResourceKind> {
+        self.identity().map(|(kind, _, _)| kind)
+    }
+
     pub fn is_open(&self) -> bool {
         !matches!(self, Self::Closed)
     }

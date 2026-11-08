@@ -1,16 +1,12 @@
-//! Model for Nodes: holds the latest immutable snapshot and the open node detail.
+//! Model for the open node detail: detail state and live usage history.
 
 pub mod detail;
 
-use std::sync::Arc;
-
 use self::detail::{NodeDetailState, NodeDetailUpdate, UsageHistory};
-use crate::models::{ResourceKind, ResourceSnapshot, SnapshotPhase};
 
 const MAX_USAGE_SAMPLES: usize = 60;
 
 pub struct NodesModel {
-    snapshot: Arc<ResourceSnapshot>,
     detail: NodeDetailState,
     usage: UsageHistory,
     usage_error: Option<String>,
@@ -19,32 +15,10 @@ pub struct NodesModel {
 impl NodesModel {
     pub fn new() -> Self {
         Self {
-            snapshot: Arc::new(ResourceSnapshot::loading()),
             detail: NodeDetailState::Closed,
             usage: UsageHistory::new(MAX_USAGE_SAMPLES),
             usage_error: None,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn kind(&self) -> ResourceKind {
-        ResourceKind::Nodes
-    }
-
-    pub fn apply_snapshot(&mut self, snapshot: Arc<ResourceSnapshot>) {
-        self.snapshot = snapshot;
-    }
-
-    pub fn snapshot(&self) -> &Arc<ResourceSnapshot> {
-        &self.snapshot
-    }
-
-    pub fn phase(&self) -> &SnapshotPhase {
-        self.snapshot.phase()
-    }
-
-    pub fn item_count(&self) -> usize {
-        self.snapshot.items().len()
     }
 
     pub fn detail(&self) -> &NodeDetailState {

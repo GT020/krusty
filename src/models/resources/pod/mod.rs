@@ -1,16 +1,12 @@
-//! Model for Pods: holds the latest immutable snapshot and the open pod detail.
+//! Model for the open pod detail: detail state and live usage history.
 
 pub mod detail;
 
-use std::sync::Arc;
-
 use self::detail::{PodDetailState, PodDetailUpdate, UsageHistory};
-use crate::models::{ResourceKind, ResourceSnapshot, SnapshotPhase};
 
 const MAX_USAGE_SAMPLES: usize = 60;
 
 pub struct PodsModel {
-    snapshot: Arc<ResourceSnapshot>,
     detail: PodDetailState,
     usage: UsageHistory,
     usage_error: Option<String>,
@@ -19,32 +15,10 @@ pub struct PodsModel {
 impl PodsModel {
     pub fn new() -> Self {
         Self {
-            snapshot: Arc::new(ResourceSnapshot::loading()),
             detail: PodDetailState::Closed,
             usage: UsageHistory::new(MAX_USAGE_SAMPLES),
             usage_error: None,
         }
-    }
-
-    #[allow(dead_code)]
-    pub fn kind(&self) -> ResourceKind {
-        ResourceKind::Pods
-    }
-
-    pub fn apply_snapshot(&mut self, snapshot: Arc<ResourceSnapshot>) {
-        self.snapshot = snapshot;
-    }
-
-    pub fn snapshot(&self) -> &Arc<ResourceSnapshot> {
-        &self.snapshot
-    }
-
-    pub fn phase(&self) -> &SnapshotPhase {
-        self.snapshot.phase()
-    }
-
-    pub fn item_count(&self) -> usize {
-        self.snapshot.items().len()
     }
 
     pub fn detail(&self) -> &PodDetailState {

@@ -4,9 +4,9 @@ use gpui_kit::base::h_flex;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::{AnyElement, App, IntoElement, ParentElement as _, Styled as _, div, px};
 
-use crate::models::{ResourceKind, WatchMode};
+use crate::models::WatchMode;
 
-pub(crate) fn render(mode: WatchMode, _kind: ResourceKind, cx: &App) -> AnyElement {
+pub(crate) fn render(mode: WatchMode, cx: &App) -> AnyElement {
     let (color, label) = match mode {
         WatchMode::Watch => (cx.theme().success, "Live"),
     };

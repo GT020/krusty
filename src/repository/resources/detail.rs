@@ -444,6 +444,15 @@ mod tests {
     }
 
     #[test]
+    fn every_builtin_kind_has_an_api_resource() {
+        for kind in crate::models::resources::catalog::builtin_kinds() {
+            let resource = api_resource(*kind);
+            assert!(!resource.plural.is_empty(), "{kind:?}");
+            assert_ne!(resource.plural, "unknowns", "{kind:?}");
+        }
+    }
+
+    #[test]
     fn maps_ingresses_to_their_real_plural() {
         assert_eq!(api_resource(ResourceKind::Ingresses).plural, "ingresses");
         assert_eq!(

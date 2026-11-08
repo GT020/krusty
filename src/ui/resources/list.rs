@@ -1,21 +1,13 @@
 //! Generic resource list view: header, virtualized table, and detail pane.
 
-use crate::models::{NamespaceScope, ResourceKind, SnapshotPhase};
-use crate::ui::resources::namespace_filter::{
-    NamespaceFilter, NamespaceFilterEvent, render as render_namespace_filter,
-};
-use crate::ui::resources::search_filter::{
-    SearchFilter, SearchFilterEvent, render as render_search_filter,
-};
+use crate::models::{NamespaceScope, ResourceKind};
+use crate::ui::resources::namespace_filter::{NamespaceFilter, NamespaceFilterEvent};
+use crate::ui::resources::search_filter::{SearchFilter, SearchFilterEvent};
 use crate::view_models::ResourceViewModel;
 use crate::view_models::resources::deployments::DeploymentsDetailViewModel;
 use crate::view_models::resources::detail::ResourceDetailViewModel;
-use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::{
-    ActiveTheme as _, IconName, Sizable as _,
-    button::{Button, ButtonVariants as _},
-    h_resizable, resizable_panel,
-};
+use gpui_kit::base::v_flex;
+use gpui_kit::component::{h_resizable, resizable_panel};
 use gpui_kit::{
     AnyElement, App, AppContext as _, Context, IntoElement, ParentElement as _, Pixels, Render,
     Styled as _, Subscription, Window, div, px,
@@ -153,60 +145,23 @@ impl ResourceListView {
         let phase = self.vm.phase(cx);
         let count = self.vm.item_count(cx);
         let mode = self.vm.mode(cx);
-
-        let status = match &phase {
-            SnapshotPhase::Loading => div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child("Loading…")
-                .into_any_element(),
-            SnapshotPhase::Ready => div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(format!("{count} objects"))
-                .into_any_element(),
-            SnapshotPhase::Error(message) => div()
-                .text_xs()
-                .text_color(cx.theme().danger)
-                .child(message.clone())
-                .into_any_element(),
-        };
-
-        let mut header_left = h_flex().gap_3().items_center();
-        if self.kind.is_namespaced() {
-            header_left = header_left.child(render_namespace_filter(&self.namespace_filter, cx));
-        }
-        let header_left = header_left
-            .child(render_search_filter(&self.search_filter, cx))
-            .child(status)
-            .child(super::watch_mode::render(mode, self.kind, cx));
+        let header = super::list_header::render(
+            self.kind,
+            &phase,
+            count,
+            mode,
+            Some(&self.namespace_filter),
+            &self.search_filter,
+            |this, _window, cx| this.vm.refresh(cx),
+            cx,
+        );
 
         let table_el = self.vm.render_table(cx);
-        let handle = cx.entity().clone();
 
         v_flex()
             .size_full()
             .min_w_0()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .py_2()
-                    .px_4()
-                    .border_b_1()
-                    .border_color(cx.theme().border)
-                    .child(header_left)
-                    .child(
-                        Button::new("refresh")
-                            .ghost()
-                            .small()
-                            .icon(IconName::RefreshCw)
-                            .on_click(move |_, _, cx| {
-                                handle.update(cx, |this, cx| {
-                                    this.vm.refresh(cx);
-                                });
-                            }),
-                    ),
-            )
+            .child(header)
             .child(div().flex_1().min_h_0().px_4().py_3().child(table_el))
             .into_any_element()
     }

@@ -1,106 +1,45 @@
 //! Generic detail pane used by resource kinds without a dedicated view.
 
-use std::collections::BTreeMap;
-
 use gpui_kit::base::v_flex;
-use gpui_kit::{AnyElement, Context, Entity, IntoElement, ParentElement as _, Styled as _, div};
+use gpui_kit::{AnyElement, Context, Entity, ParentElement as _};
 
-use crate::models::ResourceKind;
 use crate::models::resources::detail::{ResourceDetail, ResourceDetailState};
-use crate::ui::components::detail::{
-    detail_header, detail_shell, error_body, field, key_values, loading_body, raw_manifest, section,
-};
+use crate::ui::components::detail::{field, section};
+use crate::ui::resources::detail_common::{flatten, render_resource_detail};
 use serde_json::Value;
 
 #[allow(clippy::too_many_arguments)]
 pub fn render_detail<T: 'static>(
-    kind: ResourceKind,
     state: ResourceDetailState,
     view: Entity<T>,
     compact: bool,
     close: fn(&mut T, &mut Context<T>),
     cx: &mut Context<T>,
 ) -> AnyElement {
-    let (title, subtitle) = match &state {
-        ResourceDetailState::Loading {
-            namespace, name, ..
-        } => (
-            name.clone(),
-            format!("{} · {}", kind.label(), namespace_label(namespace)),
-        ),
-        ResourceDetailState::Error {
-            namespace, name, ..
-        } => (
-            name.clone(),
-            format!("{} · {}", kind.label(), namespace_label(namespace)),
-        ),
-        ResourceDetailState::Ready(detail) => (
-            detail.name.clone(),
-            format!(
-                "{} · {}",
-                detail.kind.label(),
-                namespace_label(&detail.namespace)
-            ),
-        ),
-        ResourceDetailState::Closed => return div().into_any_element(),
-    };
-    let id_prefix = format!("resource-detail-{}", kind.label().to_lowercase());
-    let header = detail_header(
-        &title,
-        &subtitle,
-        compact,
-        "Back to list",
-        &id_prefix,
-        view,
-        close,
-        cx,
-    );
+    render_resource_detail(state, view, compact, close, cx, |detail, cx| {
+        let mut sections = vec![overview(detail, cx)];
 
-    let body: AnyElement = match state {
-        ResourceDetailState::Loading { .. } => loading_body(
-            "Loading resource…",
-            "Reading the object from the API server.",
-            cx,
-        ),
-        ResourceDetailState::Error { message, .. } => {
-            error_body("Could not load this resource", &message, cx)
+        let mut top_level: Vec<&String> = detail
+            .value
+            .as_object()
+            .map(|object| object.keys().collect())
+            .unwrap_or_default();
+        top_level.sort();
+        for key in top_level {
+            if matches!(key.as_str(), "apiVersion" | "kind" | "metadata") {
+                continue;
+            }
+            let Some(value) = detail.value.get(key) else {
+                continue;
+            };
+            if value.is_null() {
+                continue;
+            }
+            sections.push(json_section(&humanize(key), key, value, cx));
         }
-        ResourceDetailState::Ready(detail) => detail_body(&detail, cx),
-        ResourceDetailState::Closed => return div().into_any_element(),
-    };
 
-    detail_shell(header, body, compact, cx)
-}
-
-fn detail_body<T: 'static>(detail: &ResourceDetail, cx: &mut Context<T>) -> AnyElement {
-    let mut body = v_flex().gap_6().p_4().child(overview(detail, cx));
-
-    let mut top_level: Vec<&String> = detail
-        .value
-        .as_object()
-        .map(|object| object.keys().collect())
-        .unwrap_or_default();
-    top_level.sort();
-    for key in top_level {
-        if matches!(key.as_str(), "apiVersion" | "kind" | "metadata") {
-            continue;
-        }
-        let Some(value) = detail.value.get(key) else {
-            continue;
-        };
-        if value.is_null() {
-            continue;
-        }
-        body = body.child(json_section(&humanize(key), key, value, cx));
-    }
-
-    let metadata = detail.value.get("metadata");
-    let labels = string_map(metadata.and_then(|metadata| metadata.get("labels")));
-    let annotations = string_map(metadata.and_then(|metadata| metadata.get("annotations")));
-    body.child(key_values("Labels", &labels, cx))
-        .child(key_values("Annotations", &annotations, cx))
-        .child(raw_manifest(&detail.raw_json, cx))
-        .into_any_element()
+        sections
+    })
 }
 
 fn overview<T: 'static>(detail: &ResourceDetail, cx: &mut Context<T>) -> AnyElement {
@@ -165,34 +104,6 @@ fn json_section<T: 'static>(
     section(title, body, cx)
 }
 
-fn flatten(prefix: &str, value: &Value, out: &mut Vec<(String, String)>) {
-    match value {
-        Value::Object(map) => {
-            if map.is_empty() {
-                out.push((prefix.to_string(), "{}".to_string()));
-                return;
-            }
-            let mut keys: Vec<&String> = map.keys().collect();
-            keys.sort();
-            for key in keys {
-                if let Some(value) = map.get(key) {
-                    flatten(&format!("{prefix}.{key}"), value, out);
-                }
-            }
-        }
-        Value::Array(items) => {
-            if items.is_empty() {
-                out.push((prefix.to_string(), "[]".to_string()));
-                return;
-            }
-            for (index, item) in items.iter().enumerate() {
-                flatten(&format!("{prefix}[{index}]"), item, out);
-            }
-        }
-        _ => out.push((prefix.to_string(), scalar_text(Some(value)))),
-    }
-}
-
 fn scalar_text(value: Option<&Value>) -> String {
     match value {
         Some(Value::String(value)) => value.clone(),
@@ -200,25 +111,6 @@ fn scalar_text(value: Option<&Value>) -> String {
         Some(Value::Bool(value)) => value.to_string(),
         Some(Value::Null) | None => "—".to_string(),
         Some(value) => value.to_string(),
-    }
-}
-
-fn string_map(value: Option<&Value>) -> BTreeMap<String, String> {
-    value
-        .and_then(Value::as_object)
-        .map(|map| {
-            map.iter()
-                .map(|(key, value)| (key.clone(), scalar_text(Some(value))))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn namespace_label(namespace: &str) -> &str {
-    if namespace.is_empty() {
-        "Cluster-scoped"
-    } else {
-        namespace
     }
 }
 

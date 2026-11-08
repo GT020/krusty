@@ -2,9 +2,11 @@
 //! snapshots. UI threads never perform network I/O or mutate the store.
 
 pub mod custom_resources;
+pub mod quantity;
 pub mod resources;
 pub mod retry;
 pub mod store;
+pub mod stream;
 pub mod terminal;
 
 use std::any::Any;
@@ -135,15 +137,6 @@ impl Subscription {
 /// Subscribe to a kind in a namespace scope. Subscriptions with the same key
 /// share one list/watch task, so opening the same resource twice costs nothing.
 pub fn subscribe(
-    cx: &mut App,
-    kind: ResourceKind,
-    scope: NamespaceScope,
-    filter: ResourceFilter,
-) -> Result<Subscription, String> {
-    subscribe_kind(cx, kind, scope, filter)
-}
-
-pub(crate) fn subscribe_kind(
     cx: &mut App,
     kind: ResourceKind,
     scope: NamespaceScope,

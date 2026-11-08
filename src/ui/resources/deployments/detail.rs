@@ -11,7 +11,6 @@ use gpui_kit::component::{
 };
 use gpui_kit::{AnyElement, Context, Entity, IntoElement, ParentElement as _, Styled as _, div};
 
-use crate::models::ResourceKind;
 use crate::models::resources::detail::{ResourceDetail, ResourceDetailState};
 use crate::ui::resources::detail_common::{
     conditions_section, count, fields_section, json_section, map_section, path,
@@ -29,84 +28,76 @@ pub fn render<T: 'static>(
     close: fn(&mut T, &mut Context<T>),
     cx: &mut Context<T>,
 ) -> AnyElement {
-    render_resource_detail(
-        ResourceKind::Deployments,
-        state,
-        view,
-        compact,
-        close,
-        cx,
-        |detail, cx| {
-            let value = &detail.value;
-            let spec = path(value, &["spec"]);
-            let status = path(value, &["status"]);
-            let mut sections = Vec::new();
-            if let Some(feedback) = actions.read(cx).feedback().cloned() {
-                sections.push(feedback_banner(&feedback, cx));
-            }
-            sections.push(action_bar(actions.clone(), detail, cx));
-            sections.push(fields_section(
-                "Overview",
-                vec![
-                    ("Replicas", text(spec.and_then(|spec| spec.get("replicas")))),
-                    (
-                        "Ready",
-                        text(status.and_then(|status| status.get("readyReplicas"))),
-                    ),
-                    (
-                        "Updated",
-                        text(status.and_then(|status| status.get("updatedReplicas"))),
-                    ),
-                    (
-                        "Available",
-                        text(status.and_then(|status| status.get("availableReplicas"))),
-                    ),
-                    (
-                        "Unavailable",
-                        text(status.and_then(|status| status.get("unavailableReplicas"))),
-                    ),
-                    (
-                        "Observed generation",
-                        text(status.and_then(|status| status.get("observedGeneration"))),
-                    ),
-                    (
-                        "Min ready seconds",
-                        text(spec.and_then(|spec| spec.get("minReadySeconds"))),
-                    ),
-                    (
-                        "Revision history limit",
-                        text(spec.and_then(|spec| spec.get("revisionHistoryLimit"))),
-                    ),
-                    (
-                        "Progress deadline",
-                        text(spec.and_then(|spec| spec.get("progressDeadlineSeconds"))),
-                    ),
-                ],
-                cx,
-            ));
-            sections.push(json_section(
-                "Selector",
-                "selector",
-                spec.and_then(|spec| spec.get("selector")),
-                cx,
-            ));
-            sections.push(json_section(
-                "Strategy",
-                "strategy",
-                spec.and_then(|spec| spec.get("strategy")),
-                cx,
-            ));
-            sections.push(conditions_section(
-                status.and_then(|status| status.get("conditions")),
-                cx,
-            ));
-            sections.extend(pod_template_sections(
-                path(value, &["spec", "template", "spec"]),
-                cx,
-            ));
-            sections
-        },
-    )
+    render_resource_detail(state, view, compact, close, cx, |detail, cx| {
+        let value = &detail.value;
+        let spec = path(value, &["spec"]);
+        let status = path(value, &["status"]);
+        let mut sections = Vec::new();
+        if let Some(feedback) = actions.read(cx).feedback().cloned() {
+            sections.push(feedback_banner(&feedback, cx));
+        }
+        sections.push(action_bar(actions.clone(), detail, cx));
+        sections.push(fields_section(
+            "Overview",
+            vec![
+                ("Replicas", text(spec.and_then(|spec| spec.get("replicas")))),
+                (
+                    "Ready",
+                    text(status.and_then(|status| status.get("readyReplicas"))),
+                ),
+                (
+                    "Updated",
+                    text(status.and_then(|status| status.get("updatedReplicas"))),
+                ),
+                (
+                    "Available",
+                    text(status.and_then(|status| status.get("availableReplicas"))),
+                ),
+                (
+                    "Unavailable",
+                    text(status.and_then(|status| status.get("unavailableReplicas"))),
+                ),
+                (
+                    "Observed generation",
+                    text(status.and_then(|status| status.get("observedGeneration"))),
+                ),
+                (
+                    "Min ready seconds",
+                    text(spec.and_then(|spec| spec.get("minReadySeconds"))),
+                ),
+                (
+                    "Revision history limit",
+                    text(spec.and_then(|spec| spec.get("revisionHistoryLimit"))),
+                ),
+                (
+                    "Progress deadline",
+                    text(spec.and_then(|spec| spec.get("progressDeadlineSeconds"))),
+                ),
+            ],
+            cx,
+        ));
+        sections.push(json_section(
+            "Selector",
+            "selector",
+            spec.and_then(|spec| spec.get("selector")),
+            cx,
+        ));
+        sections.push(json_section(
+            "Strategy",
+            "strategy",
+            spec.and_then(|spec| spec.get("strategy")),
+            cx,
+        ));
+        sections.push(conditions_section(
+            status.and_then(|status| status.get("conditions")),
+            cx,
+        ));
+        sections.extend(pod_template_sections(
+            path(value, &["spec", "template", "spec"]),
+            cx,
+        ));
+        sections
+    })
 }
 
 fn pod_template_sections<T: 'static>(

@@ -122,6 +122,7 @@ impl ConfigStore {
         self.last_context = id.map(str::to_string);
     }
 
+    #[cfg(test)]
     pub fn upsert(&mut self, id: &str, name: &str, kubeconfig_yaml: &str) -> String {
         if let Some(existing) = self.entries.iter_mut().find(|e| e.id == id) {
             existing.name = name.to_string();
@@ -135,16 +136,5 @@ impl ConfigStore {
             kubeconfig_yaml: kubeconfig_yaml.to_string(),
         });
         id
-    }
-
-    pub fn set_default(&mut self, id: Option<&str>) {
-        self.default = id.map(str::to_string);
-    }
-
-    pub fn remove(&mut self, id: &str) {
-        self.entries.retain(|e| e.id != id);
-        if self.default.as_deref() == Some(id) {
-            self.default = None;
-        }
     }
 }

@@ -1,4 +1,3 @@
-#![allow(unused_imports)]
 //! Domain layer: plain structs + pure state transitions. No gpui types.
 
 pub mod cluster;
@@ -7,8 +6,5 @@ pub mod resources;
 
 pub use cluster::NamespaceScope;
 pub use resources::{
-    ConfigMapsModel, DaemonSetsModel, DeploymentsModel, IngressesModel, Item, JobsModel,
-    NodesModel, ObjectKey, PersistentVolumeClaimsModel, PersistentVolumesModel, PodsModel,
-    ResourceDetail, ResourceDetailState, ResourceDetailUpdate, ResourceFilter, ResourceKind,
-    ResourceSnapshot, SecretsModel, ServicesModel, SnapshotPhase, WatchMode,
+    Item, ObjectKey, ResourceFilter, ResourceKind, ResourceSnapshot, SnapshotPhase, WatchMode,
 };

@@ -73,7 +73,7 @@ impl Retry {
     }
 
     /// Decide what to do after a watch `Error` event carrying only a status.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn failed_status(&mut self, code: u16) -> RetryAction {
         self.fail(is_hard_status(code))
     }

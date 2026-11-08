@@ -570,7 +570,6 @@ impl Workspace {
         Some(id)
     }
 
-    /// Create the view for an open tab when it does not exist yet.
     fn ensure_pane(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         if self.panes.contains_key(&id) {
             return;

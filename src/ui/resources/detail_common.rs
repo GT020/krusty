@@ -18,7 +18,6 @@ use crate::ui::components::detail::{
 
 #[allow(clippy::too_many_arguments)]
 pub fn render_resource_detail<T: 'static>(
-    kind: ResourceKind,
     state: ResourceDetailState,
     view: Entity<T>,
     compact: bool,
@@ -26,40 +25,10 @@ pub fn render_resource_detail<T: 'static>(
     cx: &mut Context<T>,
     ready: impl FnOnce(&ResourceDetail, &mut Context<T>) -> Vec<AnyElement>,
 ) -> AnyElement {
-    let (title, subtitle) = match &state {
-        ResourceDetailState::Loading {
-            namespace, name, ..
-        } => (
-            name.clone(),
-            format!("{} · {}", kind.label(), namespace_label(namespace)),
-        ),
-        ResourceDetailState::Error {
-            namespace, name, ..
-        } => (
-            name.clone(),
-            format!("{} · {}", kind.label(), namespace_label(namespace)),
-        ),
-        ResourceDetailState::Ready(detail) => (
-            detail.name.clone(),
-            format!(
-                "{} · {}",
-                detail.kind.label(),
-                namespace_label(&detail.namespace)
-            ),
-        ),
-        ResourceDetailState::Closed => return div().into_any_element(),
+    let Some(kind) = state.kind() else {
+        return div().into_any_element();
     };
-    let id_prefix = format!("resource-detail-{}", kind.label().to_lowercase());
-    let header = detail_header(
-        &title,
-        &subtitle,
-        compact,
-        "Back to list",
-        &id_prefix,
-        view,
-        close,
-        cx,
-    );
+    let header = detail_header_for(kind, &state, compact, view, close, cx);
 
     let body: AnyElement = match state {
         ResourceDetailState::Loading { .. } => loading_body(
@@ -87,6 +56,49 @@ pub fn render_resource_detail<T: 'static>(
     };
 
     detail_shell(header, body, compact, cx)
+}
+
+/// Build the title, subtitle, close affordance and identity used by both detail
+/// frames.
+pub fn detail_header_for<T: 'static>(
+    kind: ResourceKind,
+    state: &ResourceDetailState,
+    compact: bool,
+    view: Entity<T>,
+    close: fn(&mut T, &mut Context<T>),
+    cx: &mut Context<T>,
+) -> AnyElement {
+    let (title, subtitle) = match state {
+        ResourceDetailState::Loading {
+            namespace, name, ..
+        }
+        | ResourceDetailState::Error {
+            namespace, name, ..
+        } => (
+            name.clone(),
+            format!("{} · {}", kind.label(), namespace_label(namespace)),
+        ),
+        ResourceDetailState::Ready(detail) => (
+            detail.name.clone(),
+            format!(
+                "{} · {}",
+                detail.kind.label(),
+                namespace_label(&detail.namespace)
+            ),
+        ),
+        ResourceDetailState::Closed => return div().into_any_element(),
+    };
+    let id_prefix = format!("resource-detail-{}", kind.label().to_lowercase());
+    detail_header(
+        &title,
+        &subtitle,
+        compact,
+        "Back to list",
+        &id_prefix,
+        view,
+        close,
+        cx,
+    )
 }
 
 pub fn path<'a>(value: &'a Value, path: &[&str]) -> Option<&'a Value> {
@@ -347,7 +359,7 @@ fn age_from_timestamp(value: Option<&Value>) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn namespace_label(namespace: &str) -> &str {
+pub fn namespace_label(namespace: &str) -> &str {
     if namespace.is_empty() {
         "Cluster-scoped"
     } else {

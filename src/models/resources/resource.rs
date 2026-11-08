@@ -1,13 +1,15 @@
-//! Model for user-defined custom resources: holds the latest immutable snapshot.
+//! Snapshot model shared by every built-in resource kind and custom resources.
 
-use crate::models::{ResourceSnapshot, SnapshotPhase};
 use std::sync::Arc;
 
-pub struct CustomResourceModel {
+use crate::models::{ResourceSnapshot, SnapshotPhase};
+
+/// Holds the latest immutable snapshot for one resource list.
+pub struct ResourceModel {
     snapshot: Arc<ResourceSnapshot>,
 }
 
-impl CustomResourceModel {
+impl ResourceModel {
     pub fn new() -> Self {
         Self {
             snapshot: Arc::new(ResourceSnapshot::loading()),
@@ -31,7 +33,7 @@ impl CustomResourceModel {
     }
 }
 
-impl Default for CustomResourceModel {
+impl Default for ResourceModel {
     fn default() -> Self {
         Self::new()
     }

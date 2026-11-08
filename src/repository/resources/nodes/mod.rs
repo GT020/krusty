@@ -15,63 +15,19 @@ use crate::models::resources::node::detail::{
     NodeAddress, NodeCondition, NodeDetail, NodeDetailUpdate, NodeImage, NodeSystemInfo, NodeTaint,
     NodeUsage,
 };
-use crate::models::{NamespaceScope, ObjectKey, ResourceFilter, ResourceKind, SnapshotPhase};
+use crate::models::{ObjectKey, ResourceKind, SnapshotPhase};
 use gpui_kit::App;
 
-use crate::repository::{Subscription, subscribe_kind};
+use crate::repository::quantity::parse_quantity;
+use crate::repository::stream::CancelOnDrop;
 
 const METRICS_POLL_INTERVAL: Duration = Duration::from_secs(10);
 
-/// Subscribe to the live Nodes stream.
-/// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
-pub fn subscribe(cx: &mut App, filter: ResourceFilter) -> Result<Subscription, String> {
-    subscribe_kind(cx, ResourceKind::Nodes, NamespaceScope::All, filter)
-}
-
 /// A live detail stream for one node. Dropping it cancels the background task.
-pub struct NodeDetailSubscription {
-    updates: mpsc::UnboundedReceiver<NodeDetailUpdate>,
-    cancel: watch::Sender<bool>,
-}
-
-impl NodeDetailSubscription {
-    pub async fn next(&mut self) -> Option<NodeDetailUpdate> {
-        self.updates.recv().await
-    }
-
-    /// A handle that stops this stream when sent `true`.
-    pub fn cancel_handle(&self) -> watch::Sender<bool> {
-        self.cancel.clone()
-    }
-}
-
-impl Drop for NodeDetailSubscription {
-    fn drop(&mut self) {
-        let _ = self.cancel.send(true);
-    }
-}
+pub type NodeDetailSubscription = CancelOnDrop<NodeDetailUpdate>;
 
 /// Live cluster-wide NodeMetrics samples, refreshed on the metrics cadence.
-pub struct NodeMetricsSubscription {
-    updates: mpsc::UnboundedReceiver<Result<BTreeMap<String, NodeUsage>, String>>,
-    cancel: watch::Sender<bool>,
-}
-
-impl NodeMetricsSubscription {
-    pub async fn next(&mut self) -> Option<Result<BTreeMap<String, NodeUsage>, String>> {
-        self.updates.recv().await
-    }
-
-    pub fn cancel_handle(&self) -> watch::Sender<bool> {
-        self.cancel.clone()
-    }
-}
-
-impl Drop for NodeMetricsSubscription {
-    fn drop(&mut self) {
-        let _ = self.cancel.send(true);
-    }
-}
+pub type NodeMetricsSubscription = CancelOnDrop<Result<BTreeMap<String, NodeUsage>, String>>;
 
 /// Poll all node usage from metrics-server. A missing metrics API is reported
 /// through the stream so the overview can explain why usage is unavailable.
@@ -82,7 +38,7 @@ pub fn subscribe_metrics(cx: &mut App) -> Result<NodeMetricsSubscription, String
     let (updates_tx, updates) = mpsc::unbounded_channel();
     let (cancel, cancel_rx) = watch::channel(false);
     tokio.spawn(watch_node_metrics(client, updates_tx, cancel_rx));
-    Ok(NodeMetricsSubscription { updates, cancel })
+    Ok(CancelOnDrop::new(updates, cancel))
 }
 
 async fn watch_node_metrics(
@@ -158,7 +114,7 @@ pub fn subscribe_detail(cx: &mut App, node: &str) -> Result<NodeDetailSubscripti
         updates_tx,
         cancel_rx,
     ));
-    Ok(NodeDetailSubscription { updates, cancel })
+    Ok(CancelOnDrop::new(updates, cancel))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -478,72 +434,4 @@ fn quantities(
                 .collect()
         })
         .unwrap_or_default()
-}
-
-/// Parse a Kubernetes resource quantity into a plain number.
-fn parse_quantity(value: &str) -> Option<f64> {
-    let value = value.trim();
-    if value.is_empty() {
-        return None;
-    }
-    let split = value
-        .find(|character: char| {
-            !(character.is_ascii_digit()
-                || character == '.'
-                || character == '-'
-                || character == '+')
-        })
-        .unwrap_or(value.len());
-    let (number, suffix) = value.split_at(split);
-    let number: f64 = number.parse().ok()?;
-    let multiplier = match suffix {
-        "" => 1.0,
-        "n" => 1e-9,
-        "u" => 1e-6,
-        "m" => 1e-3,
-        "k" => 1e3,
-        "M" => 1e6,
-        "G" => 1e9,
-        "T" => 1e12,
-        "P" => 1e15,
-        "E" => 1e18,
-        "Ki" => 1024.0,
-        "Mi" => 1024.0 * 1024.0,
-        "Gi" => 1024.0 * 1024.0 * 1024.0,
-        "Ti" => 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "Pi" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        "Ei" => 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0 * 1024.0,
-        _ => {
-            let exponent = suffix
-                .strip_prefix('e')
-                .or_else(|| suffix.strip_prefix('E'))?;
-            let exponent: i32 = exponent.parse().ok()?;
-            10f64.powi(exponent)
-        }
-    };
-    Some(number * multiplier)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::parse_quantity;
-
-    fn assert_quantity(value: &str, expected: f64) {
-        let parsed = parse_quantity(value).expect("quantity parses");
-        assert!(
-            (parsed - expected).abs() < f64::EPSILON * 8.0,
-            "{value} parsed as {parsed}, expected {expected}"
-        );
-    }
-
-    #[test]
-    fn parses_cpu_and_memory_quantities() {
-        assert_quantity("250m", 0.25);
-        assert_quantity("150000000n", 0.15);
-        assert_quantity("2", 2.0);
-        assert_quantity("1Ki", 1024.0);
-        assert_quantity("2Gi", 2.0 * 1024.0 * 1024.0 * 1024.0);
-        assert_quantity("1e3", 1000.0);
-        assert_eq!(parse_quantity(""), None);
-    }
 }

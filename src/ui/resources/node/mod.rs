@@ -2,22 +2,15 @@
 
 mod detail;
 
-use gpui_kit::base::{h_flex, v_flex};
-use gpui_kit::component::{
-    ActiveTheme as _, IconName, Sizable as _,
-    button::{Button, ButtonVariants as _},
-    h_resizable, resizable_panel,
-    table::DataTable,
-};
+use gpui_kit::base::v_flex;
+use gpui_kit::component::{h_resizable, resizable_panel, table::DataTable};
 use gpui_kit::{
     AppContext as _, Context, IntoElement, ParentElement as _, Pixels, Render, Styled as _,
     Subscription, Window, div, px,
 };
 
-use crate::models::{NamespaceScope, SnapshotPhase};
-use crate::ui::resources::search_filter::{
-    SearchFilter, SearchFilterEvent, render as render_search_filter,
-};
+use crate::models::NamespaceScope;
+use crate::ui::resources::search_filter::{SearchFilter, SearchFilterEvent};
 use crate::view_models::resources::node::NodesViewModel;
 
 const LIST_MIN_WIDTH: Pixels = px(320.);
@@ -87,59 +80,22 @@ impl NodesView {
         self.vm.update(cx, |vm, cx| vm.open_detail(name, cx));
     }
 
-    fn header(&self, cx: &Context<Self>) -> impl IntoElement {
+    fn header(&self, cx: &Context<Self>) -> gpui_kit::AnyElement {
         let phase = self.vm.read(cx).phase(cx);
         let count = self.vm.read(cx).item_count(cx);
         let mode = self.vm.read(cx).mode(cx);
-
-        let status = match &phase {
-            SnapshotPhase::Loading => div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child("Loading…")
-                .into_any_element(),
-            SnapshotPhase::Ready => div()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .child(format!("{count} objects"))
-                .into_any_element(),
-            SnapshotPhase::Error(message) => div()
-                .text_xs()
-                .text_color(cx.theme().danger)
-                .child(message.clone())
-                .into_any_element(),
-        };
-
-        let handle = cx.entity().clone();
-        h_flex()
-            .justify_between()
-            .py_2()
-            .px_4()
-            .border_b_1()
-            .border_color(cx.theme().border)
-            .child(
-                h_flex()
-                    .gap_3()
-                    .items_center()
-                    .child(render_search_filter(&self.search_filter, cx))
-                    .child(status)
-                    .child(super::watch_mode::render(
-                        mode,
-                        crate::models::ResourceKind::Nodes,
-                        cx,
-                    )),
-            )
-            .child(
-                Button::new("refresh-nodes")
-                    .ghost()
-                    .small()
-                    .icon(IconName::RefreshCw)
-                    .on_click(move |_, _, cx| {
-                        handle.update(cx, |this, cx| {
-                            this.vm.update(cx, |vm, cx| vm.refresh(cx));
-                        });
-                    }),
-            )
+        super::list_header::render(
+            crate::models::ResourceKind::Nodes,
+            &phase,
+            count,
+            mode,
+            None,
+            &self.search_filter,
+            |this, _window, cx| {
+                this.vm.update(cx, |vm, cx| vm.refresh(cx));
+            },
+            cx,
+        )
     }
 
     fn list(&self, cx: &Context<Self>) -> gpui_kit::AnyElement {

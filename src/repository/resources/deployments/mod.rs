@@ -5,25 +5,10 @@ use kube::Client;
 use kube::api::{Api, DeleteParams, Patch, PatchParams, PostParams};
 use serde_json::json;
 
-use crate::models::{NamespaceScope, ResourceFilter, ResourceKind};
-use crate::repository::{Subscription, subscribe_kind};
-use gpui_kit::App;
-
-/// Subscribe to the live Deployments stream.
-/// Returns a [`Subscription`] that delivers immutable snapshots as the cluster changes.
-pub fn subscribe(
-    cx: &mut App,
-    scope: NamespaceScope,
-    filter: ResourceFilter,
-) -> Result<Subscription, String> {
-    subscribe_kind(cx, ResourceKind::Deployments, scope, filter)
-}
-
 fn api(client: Client, namespace: &str) -> Api<Deployment> {
     Api::namespaced(client, namespace)
 }
 
-/// Set the desired replica count for a deployment.
 pub async fn scale(
     client: Client,
     namespace: String,
@@ -38,7 +23,6 @@ pub async fn scale(
         .map_err(|error| format!("Could not scale deployment “{name}”: {error}"))
 }
 
-/// Trigger a rolling restart by updating the pod template annotation.
 pub async fn restart(client: Client, namespace: String, name: String) -> Result<(), String> {
     let restarted_at = jiff::Timestamp::now().to_string();
     let patch = json!({
@@ -59,7 +43,6 @@ pub async fn restart(client: Client, namespace: String, name: String) -> Result<
         .map_err(|error| format!("Could not restart deployment “{name}”: {error}"))
 }
 
-/// Delete a deployment and the pods it manages.
 pub async fn delete(client: Client, namespace: String, name: String) -> Result<(), String> {
     api(client, &namespace)
         .delete(&name, &DeleteParams::default())
@@ -68,7 +51,6 @@ pub async fn delete(client: Client, namespace: String, name: String) -> Result<(
         .map_err(|error| format!("Could not delete deployment “{name}”: {error}"))
 }
 
-/// Replace a deployment with the supplied YAML manifest.
 pub async fn replace(
     client: Client,
     namespace: String,
