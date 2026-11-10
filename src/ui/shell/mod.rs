@@ -46,6 +46,7 @@ use gpui_kit::{
 };
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::time::Duration;
 
 use crate::ui::components::tabs;
 
@@ -53,6 +54,9 @@ const MIN_SPLIT_VIEWPORT_WIDTH: f32 = 1080.;
 const PANE_MIN_WIDTH: Pixels = px(360.);
 const SPLIT_MIN_FRACTION: f32 = 0.2;
 const SPLIT_MAX_FRACTION: f32 = 0.8;
+/// Workspace changes are kept in memory and written together, so opening or
+/// switching tabs never blocks the UI thread on a disk write.
+const SESSION_FLUSH_DELAY: Duration = Duration::from_secs(1);
 
 /// One tab's retained view. The entity is created with the tab and dropped
 /// when the tab closes, so two tabs of the same kind have separate state.
@@ -174,6 +178,12 @@ pub struct Workspace {
     _preference_subscription: Subscription,
     _custom_resources_subscription: Subscription,
     _split_subscription: Subscription,
+    _quit_subscription: Subscription,
+    _window_closed_subscription: Subscription,
+    /// Set when the in-memory workspace differs from the file on disk.
+    session_dirty: bool,
+    /// Whether a debounced flush is already scheduled.
+    session_flush_pending: bool,
 }
 
 impl Workspace {
@@ -291,6 +301,19 @@ impl Workspace {
                 }
             });
 
+        // Flush any pending workspace changes before the process exits or its
+        // last window goes away, so a debounced write is never lost.
+        let quit_subscription = cx.on_app_quit(|this, cx| {
+            this.flush_session(cx);
+            async {}
+        });
+        let workspace = cx.weak_entity();
+        let window_closed_subscription = cx.on_window_closed(move |cx, _window_id| {
+            if let Some(workspace) = workspace.upgrade() {
+                workspace.update(cx, |this, cx| this.flush_session(cx));
+            }
+        });
+
         let pending_split_restore = shell.read(cx).is_split();
         let mut this = Self {
             shell,
@@ -313,6 +336,10 @@ impl Workspace {
             _preference_subscription: preference_subscription,
             _custom_resources_subscription: custom_resources_subscription,
             _split_subscription: split_subscription,
+            _quit_subscription: quit_subscription,
+            _window_closed_subscription: window_closed_subscription,
+            session_dirty: false,
+            session_flush_pending: false,
         };
         this.ensure_active_panes(window, cx);
         this.sync_visibility(cx);
@@ -364,7 +391,7 @@ impl Workspace {
         self.ensure_pane(id, window, cx);
         self.sync_visibility(cx);
         self.sync_width_shares(cx);
-        self.save_session(cx);
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 
@@ -375,13 +402,13 @@ impl Workspace {
         self.ensure_pane(id, window, cx);
         self.sync_visibility(cx);
         self.apply_width_share(id, cx);
-        self.save_session(cx);
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 
     fn focus_pane(&mut self, id: PaneId, cx: &mut Context<Self>) {
         if self.shell.update(cx, |shell, cx| shell.focus_pane(id, cx)) {
-            self.save_session(cx);
+            self.mark_session_dirty(cx);
         }
     }
 
@@ -397,7 +424,7 @@ impl Workspace {
         self.ensure_active_panes(window, cx);
         self.sync_visibility(cx);
         self.sync_width_shares(cx);
-        self.save_session(cx);
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 
@@ -420,7 +447,7 @@ impl Workspace {
         self.sync_visibility(cx);
         self.sync_width_shares(cx);
         self.pending_split_restore = true;
-        self.save_session(cx);
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 
@@ -432,7 +459,7 @@ impl Workspace {
         self.pending_split_restore = false;
         self.sync_visibility(cx);
         self.sync_width_shares(cx);
-        self.save_session(cx);
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 
@@ -448,7 +475,7 @@ impl Workspace {
         self.ensure_active_panes(window, cx);
         self.sync_visibility(cx);
         self.sync_width_shares(cx);
-        self.save_session(cx);
+        self.mark_session_dirty(cx);
         cx.notify();
     }
 
@@ -565,7 +592,7 @@ impl Workspace {
         }
         self.sync_visibility(cx);
         self.sync_width_shares(cx);
-        self.save_session(cx);
+        self.mark_session_dirty(cx);
         cx.notify();
         Some(id)
     }
@@ -603,7 +630,7 @@ impl Workspace {
             let sub = cx.subscribe(&filter, move |this, _, event: &NamespaceFilterEvent, cx| {
                 let NamespaceFilterEvent::Changed(scope) = event;
                 this.tab_scopes.insert(id, scope.clone());
-                this.save_session(cx);
+                this.mark_session_dirty(cx);
                 cx.notify();
             });
             self.pane_subs.insert(id, sub);
@@ -691,9 +718,34 @@ impl Workspace {
         if (fraction - self.split_fraction).abs() > 0.001 {
             self.split_fraction = fraction;
             self.sync_width_shares(cx);
-            self.save_session(cx);
+            self.mark_session_dirty(cx);
             cx.notify();
         }
+    }
+
+    /// Mark the workspace session as changed. The write is debounced: a single
+    /// timer flushes the latest state, so bursts of tab changes cost one write.
+    fn mark_session_dirty(&mut self, cx: &mut Context<Self>) {
+        self.session_dirty = true;
+        if self.session_flush_pending {
+            return;
+        }
+        self.session_flush_pending = true;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(SESSION_FLUSH_DELAY).await;
+            this.update(cx, |this, cx| this.flush_session(cx)).ok();
+        })
+        .detach();
+    }
+
+    /// Write the in-memory session if it changed since the last flush.
+    fn flush_session(&mut self, cx: &mut Context<Self>) {
+        self.session_flush_pending = false;
+        if !self.session_dirty {
+            return;
+        }
+        self.session_dirty = false;
+        self.save_session(cx);
     }
 
     /// Persist the open groups, their active tabs, focus, scopes, and ratio.
@@ -1188,7 +1240,7 @@ impl Render for Workspace {
             }))
             .on_action(cx.listener(|this, _: &FocusNextGroup, _window, cx| {
                 if this.shell.update(cx, |shell, cx| shell.focus_next_pane(cx)) {
-                    this.save_session(cx);
+                    this.mark_session_dirty(cx);
                     cx.notify();
                 }
             }))
