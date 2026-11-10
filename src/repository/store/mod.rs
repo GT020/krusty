@@ -1,4 +1,3 @@
-
 mod data;
 mod engine;
 mod mapping;
@@ -73,7 +72,12 @@ fn ensure_store(
     kind: ResourceKind,
 ) -> Result<(Arc<KubeObjectStoreHandle>, tokio::runtime::Handle), String> {
     let state = cx.global::<ClusterState>();
-    let client = state.client().ok_or_else(|| "not connected".to_string())?;
+    let client = state.client().ok_or_else(|| {
+        state
+            .connection_error()
+            .map(str::to_string)
+            .unwrap_or_else(|| "not connected".to_string())
+    })?;
     let tokio = state.tokio();
     let epoch = state.context_epoch();
     let global_watch = state.global_watch();

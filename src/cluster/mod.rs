@@ -1,3 +1,4 @@
+mod exec;
 pub mod kubeconfig;
 
 use std::time::Duration;
@@ -47,6 +48,7 @@ pub struct ClusterState {
     active: Option<String>,
     store: kubeconfig::ConfigStore,
     reachable: Option<bool>,
+    connection_error: Option<String>,
     namespaces: Vec<String>,
     global_watch: bool,
     context_epoch: u64,
@@ -78,6 +80,10 @@ impl ClusterState {
     /// `None` until the first API call confirms the connection.
     pub fn reachable(&self) -> Option<bool> {
         self.reachable
+    }
+
+    pub fn connection_error(&self) -> Option<&str> {
+        self.connection_error.as_deref()
     }
 
     /// Bumped whenever the active connection changes. View-models watch this
@@ -175,6 +181,7 @@ pub fn init(cx: &mut App) {
         active: preferred,
         store,
         reachable: None,
+        connection_error: None,
         namespaces: Vec::new(),
         global_watch: true,
         context_epoch: 0,
@@ -298,7 +305,7 @@ async fn build_client(
     kubeconfig: Option<kube::config::Kubeconfig>,
     source: ContextSource,
     store: kubeconfig::ConfigStore,
-) -> Result<Client, &'static str> {
+) -> Result<Client, String> {
     let started = std::time::Instant::now();
     let source_label = match &source {
         ContextSource::Kubeconfig(name) => format!("kube:{name}"),
@@ -307,7 +314,11 @@ async fn build_client(
     tracing::debug!(context = %source_label, "cluster: building kube client");
     let mut config = match &source {
         ContextSource::Kubeconfig(name) => {
-            let kubeconfig = kubeconfig.ok_or("kubeconfig unavailable")?;
+            let mut kubeconfig = kubeconfig.ok_or_else(|| "kubeconfig unavailable".to_string())?;
+            exec::resolve_programs(&mut kubeconfig).await;
+            if let Some(hint) = exec::missing_plugin_hint(&kubeconfig, name) {
+                return Err(format!("could not load context `{name}`: {hint}"));
+            }
             let opts = kube::config::KubeConfigOptions {
                 context: Some(name.clone()),
                 cluster: None,
@@ -315,21 +326,22 @@ async fn build_client(
             };
             Config::from_custom_kubeconfig(kubeconfig, &opts)
                 .await
-                .map_err(|_| "invalid kubeconfig context")?
+                .map_err(|error| format!("could not load context `{name}`: {error}"))?
         }
         ContextSource::App(id) => {
             let entry = store
                 .entries()
                 .iter()
                 .find(|entry| entry.id == *id)
-                .ok_or("unknown cluster")?;
+                .ok_or_else(|| format!("unknown cluster `{id}`"))?;
             load_inline(&entry.kubeconfig_yaml).await?
         }
     };
     // kube defaults to 30s; fail dead endpoints faster and let the retry
     // policy back off instead of stalling the UI.
     config.connect_timeout = Some(Duration::from_secs(10));
-    let client = Client::try_from(config).map_err(|_| "connection failed")?;
+    let client = Client::try_from(config)
+        .map_err(|error| format!("could not connect to `{source_label}`: {error}"))?;
     tracing::debug!(
         context = %source_label,
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -431,18 +443,20 @@ fn spawn_client_build(cx: &mut App, context: ContextInfo) {
                     cx.update_global::<ClusterState, _>(|state, _| {
                         state.client = Some(client);
                         state.global_watch = global_watch;
+                        state.connection_error = None;
                         state.context_epoch = state.context_epoch.wrapping_add(1);
                     });
                     refresh_namespaces(cx);
                 }
                 Ok(Err(error)) => {
-                    tracing::warn!(%error, context = %context_id, "cluster: client build failed");
+                    tracing::error!(%error, context = %context_id, "cluster: client build failed");
                     cx.update_global::<ClusterState, _>(|state, _| {
                         // The active label now points at a context with no
                         // working client. Drop the old one and let every view
                         // resubscribe into the visible error state.
                         state.client = None;
                         state.reachable = Some(false);
+                        state.connection_error = Some(error);
                         state.namespaces.clear();
                         state.context_epoch = state.context_epoch.wrapping_add(1);
                     });
@@ -452,6 +466,8 @@ fn spawn_client_build(cx: &mut App, context: ContextInfo) {
                     cx.update_global::<ClusterState, _>(|state, _| {
                         state.client = None;
                         state.reachable = Some(false);
+                        state.connection_error =
+                            Some(format!("client build task failed: {error}"));
                         state.namespaces.clear();
                         state.context_epoch = state.context_epoch.wrapping_add(1);
                     });
@@ -479,6 +495,7 @@ pub fn switch_context(cx: &mut App, id: &str) -> Result<(), &'static str> {
         // client, publish an error, and resubscribe again on success.
         state.active = Some(context.id.clone());
         state.reachable = None;
+        state.connection_error = None;
         if let Some(cancel) = state.namespace_cancel.take() {
             let _ = cancel.send(true);
         }
@@ -507,12 +524,13 @@ pub fn switch_context(cx: &mut App, id: &str) -> Result<(), &'static str> {
     }
 }
 
-async fn load_inline(yaml: &str) -> Result<Config, &'static str> {
-    let kubeconfig: kube::config::Kubeconfig =
-        serde_saphyr::from_str(yaml).map_err(|_| "invalid kubeconfig")?;
+async fn load_inline(yaml: &str) -> Result<Config, String> {
+    let mut kubeconfig: kube::config::Kubeconfig =
+        serde_saphyr::from_str(yaml).map_err(|error| format!("invalid kubeconfig: {error}"))?;
+    exec::resolve_programs(&mut kubeconfig).await;
     Config::from_custom_kubeconfig(kubeconfig, &kube::config::KubeConfigOptions::default())
         .await
-        .map_err(|_| "invalid kubeconfig")
+        .map_err(|error| format!("invalid kubeconfig: {error}"))
 }
 
 /// Fetch real objects for a resource kind. Runs on the cluster runtime so the
